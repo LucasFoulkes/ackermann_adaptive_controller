@@ -23,7 +23,20 @@ Three phases:
 Two learned sub-models, both linear in their parameters so RLS applies:
 
     longitudinal   vdot      = b0*qd + b1 + b2*v*|v| + b3*sgn(v)
-    lateral        psidot/v  = a0*qs + a1 + a2*qs*v**2
+    lateral        psidot/v  = a0[cell]*qs + a1 + a2*qs*v**2
+
+The steering gain is learned PER CELL of (travel direction x steering side):
+a0l/a0r forward, a0l_rev/a0r_rev backward, the cell chosen by the signs of
+the delayed command and of v. Two measured facts force the split. Left vs
+right: the 08-23 logs measured 1.93 vs 1.29 curvature per unit command
+(linkage geometry); a single gain averaged them and the asymmetry leaked
+into the trim (a1 fit 0.139 while the car ran straight at zero wire).
+Forward vs reverse: fitting in curvature makes the KINEMATIC map
+direction-invariant (kappa = tan(delta)/L is the same circle backward,
+which is why the sign algebra needs no special casing), but the DYNAMICS
+are not -- caster works against a front-steered car in reverse -- and the
+same logs measured reverse-left at 0.73x its forward gain. Unexcited cells
+hold the prior (or their forward seed) until data separates them.
 
 b3 is Coulomb friction: without it, friction leaks into b0 and b1 and the
 longitudinal fit converges to nonsense on a real drivetrain (b0 < 0 was
@@ -73,6 +86,28 @@ def wrap(a):
 def sgn(x):
     """Sign, with an explicit zero."""
     return 0.0 if x == 0.0 else (1.0 if x > 0.0 else -1.0)
+
+
+def sane_gain_cells(cells, prior):
+    """Steering gain cells with any minority-SIGN cell replaced.
+
+    One rack and one servo drive all four (direction x side) cells, so a
+    single cell with the opposite sign is not a vehicle property -- it is a
+    poisoned fit (08-23: shuffle transients taught fwd-right -0.09 while
+    the other three sat at 1.4-1.9; the worst-cell envelope then quoted the
+    planner a 7 m turning radius and fwd-right steering INVERTED). The vote
+    is taken only among cells that have moved off the prior -- cells still
+    at their seed carry no evidence and must not outvote a learner that
+    legitimately discovered an inverted servo (all-negative is consistent
+    and believed). Ties or no voters: believe the fit as it stands.
+    """
+    voters = [c for c in cells if abs(c - prior) > 0.1 * abs(prior)]
+    pos = sum(1 for c in voters if c > 0.0)
+    neg = sum(1 for c in voters if c < 0.0)
+    if pos == neg:
+        return list(cells)
+    s = 1.0 if pos > neg else -1.0
+    return [c if c * s > 0.0 else s * abs(prior) for c in cells]
 
 
 @dataclass
@@ -181,6 +216,20 @@ class Policy:
     # climb, which at Nav2's approach speed was 5-8 s per launch and left a
     # third of the flight log "stalled". Zero disables it.
     launch_floor: float = 0.15
+    # Launch wire CAP, the floor's counterpart. While motion is commanded
+    # and the car has not broken free, the wire may not exceed the launch
+    # floor (the learned median breakaway) by more than the margin: the
+    # 08-23 flight log shows cusp launches climbing to 0.43-0.48 wire
+    # (integrator ramp + Coulomb feedforward, often with the wheels cranked
+    # at the standstill clamp) and then surging to 0.6-0.9 m/s against a
+    # 0.25-0.32 command when static friction let go -- the wire at release
+    # bounds the lunge, so bound the wire. The cap GROWS with time stuck, so
+    # a genuinely harder start (slope, carpet, cranked wheels) still
+    # escalates to full wire, and the blocked reflex -- which needs the
+    # integrator to pin -- is never starved. Both are risk constants, not
+    # vehicle properties: the base the cap rides on is learned.
+    launch_cap_margin: float = 0.10
+    launch_cap_rate: float = 0.10   # cap growth per second stuck
     # Only sized (and therefore only active) after the CAL wiggle has run.
     enable_dither: bool = True
 
@@ -279,7 +328,10 @@ class Policy:
 class Model:
     """A snapshot of what has been learned, for logging and diagnostics."""
 
-    a0: float = 0.0
+    a0l: float = 0.0        # steering gain, forward, left  (qs > 0)
+    a0r: float = 0.0        # steering gain, forward, right (qs < 0)
+    a0l_rev: float = 0.0    # steering gain, reverse, left
+    a0r_rev: float = 0.0    # steering gain, reverse, right
     a1: float = 0.0
     a2: float = 0.0
     b0: float = 0.0
@@ -288,6 +340,18 @@ class Model:
     b3: float = 0.0
     n_lat: int = 0
     n_lon: int = 0
+
+    @property
+    def a0(self):
+        """Symmetric-average FORWARD steering gain, for reporting only.
+        Control and the envelope always use the per-cell gains."""
+        return 0.5 * (self.a0l + self.a0r)
+
+    def a0_cell(self, qs, v):
+        """The gain for this steering side and travel direction."""
+        if v >= 0.0:
+            return self.a0l if qs >= 0.0 else self.a0r
+        return self.a0l_rev if qs >= 0.0 else self.a0r_rev
 
 
 class RLS:
@@ -542,7 +606,8 @@ class CurvatureEnvelope:
 
     @staticmethod
     def predict(model, qs, v):
-        return qs * (model.a0 + model.a2 * v * v) + model.a1
+        # v is SIGNED: the cell must match how the sample was driven.
+        return qs * (model.a0_cell(qs, v) + model.a2 * v * v) + model.a1
 
     def observe(self, qs, kappa, v, model):
         """Record how well the model predicted a near-lock steering sample."""
@@ -578,9 +643,21 @@ class CurvatureEnvelope:
         never lifts -- a loop the planner push (which stays derated) is not in.
         """
         v = self.p.env_speed if v is None else v
-        span = model.a0 + model.a2 * v * v
-        # Worst of the two directions: a trim term makes one side tighter.
-        extrapolated = min(abs(model.a1 + span), abs(model.a1 - span))
+        # Worst of ALL FOUR cells: Smac plans forward and reverse arcs with
+        # ONE minimum_turning_radius, so the quoted envelope must be
+        # feasible in whichever cell the maneuver lands in -- and on this
+        # car reverse-left is the weakest (0.73x forward, measured).
+        # SANITIZED cells: one poisoned near-zero cell once quoted the
+        # planner a 7 m radius and every path became a looping star.
+        a0l, a0r, a0l_rev, a0r_rev = sane_gain_cells(
+            (model.a0l, model.a0r, model.a0l_rev, model.a0r_rev),
+            self.p.prior_a0)
+        vv = model.a2 * v * v
+        extrapolated = min(
+            abs(model.a1 + a0l + vv),
+            abs(model.a1 - a0r - vv),
+            abs(model.a1 + a0l_rev + vv),
+            abs(model.a1 - a0r_rev - vv))
         if not finite(extrapolated):
             extrapolated = 0.0
 
@@ -733,7 +810,9 @@ class AdaptiveCore:
 
         def _delays(center):
             return (center / p.delay_spread, center, center * p.delay_spread)
-        self.lat_bank = DelayBank([p.prior_a0, 0.0, 0.0], p.p0, p.p_max,
+        # All four gain cells start at the same prior; the data splits them.
+        self.lat_bank = DelayBank([p.prior_a0] * 4 + [0.0, 0.0],
+                                  p.p0, p.p_max,
                                   _delays(p.lat_delay), p.delay_ew_tau,
                                   p.delay_switch_margin)
         self.lon_bank = DelayBank([p.prior_b0, 0.0, 0.0, 0.0], p.p0, p.p_max,
@@ -749,12 +828,15 @@ class AdaptiveCore:
         # through the slew just re-creates the stiction wait.
         self._floor = 0.0
         self._floor_dir = 0.0
+        self._cap = 0.0
         self.envelope = CurvatureEnvelope(p)
         self.deadband = DeadBand(p)
 
         # Launch/rolling latch for the breakaway kick, with hysteresis so
         # odometry noise cannot flicker it.
         self.rolling = False
+        self._roll_run = 0
+        self._roll_since = None
         self._still_since = None
         self.v_fast = 0.0
         self.qs = self.qd = 0.0
@@ -789,6 +871,31 @@ class AdaptiveCore:
         self.phase = phase
         self.phase_t0 = t
 
+    def start_cal(self):
+        """Begin the scripted calibration wiggle at the next odometry sample.
+
+        ``phase_t0`` is left unset so :meth:`step` stamps it from the next
+        odometry stamp — the clock this whole core runs on. Stamping it from
+        the caller's clock mixed timebases: under bag replay or sim time the
+        wiggle either ended instantly or never.
+        """
+        self._enter(CAL, None)
+
+    def _a_limit(self):
+        """Physics bound on plausible acceleration, from the learned model
+        but BOUNDED. The unbounded form was circular: the 02:15 session's
+        poisoned fit (b0 6.4, b3 -1.4) widened its own acceptance gate to
+        15.7 m/s^2 and the gate stopped rejecting anything. The learned
+        values may tighten the bound or stretch it moderately, never hold
+        the door open for their own poison."""
+        p = self.policy
+        b = self.rls_lon.theta
+        b0 = clamp(b[0], p.prior_b0, 2.0 * p.prior_b0)
+        # Friction stronger than the (bounded) drive gain would mean a car
+        # that cannot move at all; cap it at the prior.
+        b3 = min(abs(min(b[3], 0.0)), p.prior_b0)
+        return p.odom_glitch_margin * (b0 + b3)
+
     @property
     def rls_lat(self):
         return self.lat_bank.rls
@@ -801,8 +908,10 @@ class AdaptiveCore:
     def ready_lon(self):
         """Has the longitudinal model earned the right to be inverted?"""
         p = self.policy
+        # Both spans checked: a hand-edited state file can restore one span
+        # without the other (each degrades to None independently on load).
         return (self.rls_lon.count >= p.ready_lon_samples
-                and self.qd_lo is not None
+                and self.qd_lo is not None and self.vl_lo is not None
                 and self.qd_hi - self.qd_lo >= p.ready_lon_qd_span
                 and self.vl_hi - self.vl_lo >= p.ready_lon_v_span)
 
@@ -817,7 +926,8 @@ class AdaptiveCore:
     def model(self):
         a = self.rls_lat.theta
         b = self.rls_lon.theta
-        return Model(a0=a[0], a1=a[1], a2=a[2],
+        return Model(a0l=a[0], a0r=a[1], a0l_rev=a[2], a0r_rev=a[3],
+                     a1=a[4], a2=a[5],
                      b0=b[0], b1=b[1], b2=b[2], b3=b[3],
                      n_lat=self.rls_lat.count, n_lon=self.rls_lon.count)
 
@@ -862,9 +972,7 @@ class AdaptiveCore:
         # it cannot accelerate harder than full throttle plus friction says,
         # and cannot yaw faster than its envelope at this speed allows.
         if self.phase != SENSE:
-            b = self.rls_lon.theta
-            a_lim = self.policy.odom_glitch_margin * (
-                max(b[0], self.policy.prior_b0) + abs(min(b[3], 0.0)))
+            a_lim = self._a_limit()
             w_lim = max(
                 self.policy.odom_glitch_margin
                 * self.envelope.max_curvature(self.model, self.v_prev)
@@ -926,8 +1034,19 @@ class AdaptiveCore:
         # noise from flickering it, little enough lag to catch breakaway.
         self.v_fast += (v - self.v_fast) * (1.0 - math.exp(-dt / 0.08))
         if not self.rolling:
+            # Two consecutive ticks above the threshold, because a single
+            # odometry spike through the fast filter (0.71 weight per tick
+            # at 10 Hz) latched "rolling" on noise -- which suppressed the
+            # launch floor, silenced the stall detector, and left the robot
+            # shivering at a standstill it believed was motion.
             if abs(self.v_fast) > 0.6 * self.gate_d:
+                self._roll_run += 1
+            else:
+                self._roll_run = 0
+            if self._roll_run >= 2:
+                self._roll_run = 0
                 self.rolling = True
+                self._roll_since = self.now
                 self._still_since = None
                 # The wheels just broke free. Whatever throttle was on the
                 # wire lon_delay ago is what did it: a dead-band sample, in
@@ -1027,7 +1146,33 @@ class AdaptiveCore:
         # candidate builds its regressor from its own delayed command.
         # Moving samples only: a stuck robot teaches "high throttle, zero
         # acceleration", which is stiction, not gain.
-        if abs(self.vdot) < 12.0 and abs(v) > self.gate_d:
+        #
+        # The acceleration gate is the same physics bound as the odometry
+        # plausibility check: full throttle plus friction, times the risk
+        # margin. It used to be a fixed 12 m/s^2, which no wire command can
+        # produce -- every ICP jump that slipped past the per-tick glitch
+        # gate sailed under it and taught the fit (the 08-23 log has 34
+        # such ticks and a b2 of +1.07: drag that ACCELERATES the car).
+        a_gate = self._a_limit()
+        # `rolling` too, not just instantaneous |v|: a single odometry spike
+        # at standstill passes the |v| gate for one tick, and those ticks
+        # are what dragged a0l from 1.66 to 0.96 in the 02:04 stuck-shiver
+        # (steering was held left the whole time, so every garbage sample
+        # landed on one side). The latch demands SUSTAINED motion.
+        #
+        # And SETTLED motion, not merely sustained: for one learned delay
+        # plus the actuator constant after breakaway, the acceleration is
+        # stiction release -- energy the current throttle did not put in.
+        # Those ticks pair "wire ~0.2, vdot ~1.8" against cruise's "wire
+        # ~0.2, vdot ~0", a contradiction the linear fit resolves as a
+        # steep line pivoted at the dead-zone edge: the 02:15 session
+        # refit b0 1.95 -> 5.7 inside ONE MINUTE that way (b3/b0 landed
+        # exactly on the measured breakaway, 0.22 -- the fit had become
+        # the dead zone, not the vehicle). Same pattern as the iw freeze.
+        settled = (self.rolling and self._roll_since is not None
+                   and self.now - self._roll_since
+                   >= self.lon_bank.delay + self.policy.tau_d)
+        if settled and abs(self.vdot) < a_gate and abs(v) > self.gate_d:
             def phi_lon(delay):
                 d = self._delayed_cmd(delay)
                 if d is None:
@@ -1058,11 +1203,29 @@ class AdaptiveCore:
         # deliberately no lower gate on psidot: straight-line samples are what
         # identify the trim term a1, so excluding them would lose the
         # misalignment the trim exists to cancel.
-        if abs(v) > self.gate_s and abs(self.psidot) < 4.0:
+        # Settled, like the longitudinal learner: right after breakaway the
+        # yaw response belongs to commands from before the stop, and the
+        # 2 s legs of a cusp shuffle are mostly that transient -- which is
+        # how fwd-right was taught -0.09 on 08-23 while the robot shuffled
+        # with the steering hard over.
+        settled_lat = (self.rolling and self._roll_since is not None
+                       and self.now - self._roll_since
+                       >= self.lat_bank.delay + self.policy.tau_s)
+        if settled_lat and abs(v) > self.gate_s and abs(self.psidot) < 4.0:
             kappa = self.psidot / v
             def phi_lat(delay):
                 d = self._delayed_cmd(delay)
-                return None if d is None else [d[0], 1.0, d[0] * v * v]
+                if d is None:
+                    return None
+                # Split regressor: each (travel direction x steering side)
+                # cell sees only its own samples, so neither the linkage
+                # asymmetry nor the reverse-dynamics difference can leak
+                # into the trim. v is the SIGNED sample speed (|v| > gate_s
+                # here, so its sign is meaningful).
+                qsp, qsn = max(d[0], 0.0), min(d[0], 0.0)
+                if v >= 0.0:
+                    return [qsp, qsn, 0.0, 0.0, 1.0, d[0] * v * v]
+                return [0.0, 0.0, qsp, qsn, 1.0, d[0] * v * v]
             if self.lat_bank.update(phi_lat, kappa, self.lam, self.dt):
                 ok = True
                 self.qs_lo, self.qs_hi = _span(self.qs_lo, self.qs_hi,
@@ -1097,7 +1260,7 @@ class AdaptiveCore:
     def _run(self, v, cmd_v, cmd_w, dt):
         """Invert the learned model and add integral trim."""
         p = self.policy
-        a0, a1, a2 = self.rls_lat.theta
+        a0l, a0r, a0l_rev, a0r_rev, a1, a2 = self.rls_lat.theta
         b0, b1, b2, b3 = self.rls_lon.theta
 
         # --- steering -----------------------------------------------------
@@ -1164,16 +1327,32 @@ class AdaptiveCore:
         # prior gain instead of inverting it. The learner keeps running the
         # whole time; only the INVERSION waits for evidence.
         if not self.ready_lat:
-            a0, a1, a2 = p.prior_a0, 0.0, 0.0
+            a0l = a0r = a0l_rev = a0r_rev = p.prior_a0
+            a1 = a2 = 0.0
+        else:
+            # A minority-sign cell is a poisoned fit, not a vehicle (see
+            # sane_gain_cells): steer that quadrant through the prior.
+            a0l, a0r, a0l_rev, a0r_rev = sane_gain_cells(
+                (a0l, a0r, a0l_rev, a0r_rev), p.prior_a0)
 
-        span = a0 + a2 * v * v
-        if abs(a0) > p.den_min:
+        # The net curvature the wire must produce picks the steering side,
+        # and the direction the car is about to travel (v_eff's sign, which
+        # already resolved the standstill case above) picks forward or
+        # reverse gains: the same wire steers measurably differently
+        # backing up (reverse-left 0.73x forward, 08-23 logs).
+        knet = kappa_des + self.iw - a1
+        if v_eff >= 0.0:
+            a0_dir = a0l if knet >= 0.0 else a0r
+        else:
+            a0_dir = a0l_rev if knet >= 0.0 else a0r_rev
+        span = a0_dir + a2 * v * v
+        if abs(a0_dir) > p.den_min:
             self.steering_fault = False
             # Understeer may reduce the gain but not erase it, and certainly
             # not invert it -- an inverted denominator steers the wrong way.
-            floor = p.span_floor * abs(a0)
-            den = span if abs(span) >= floor and span * a0 > 0.0 \
-                else sgn(a0) * floor
+            floor = p.span_floor * abs(a0_dir)
+            den = span if abs(span) >= floor and span * a0_dir > 0.0 \
+                else sgn(a0_dir) * floor
         else:
             # The identified steering gain has collapsed. On a real vehicle
             # that is far more likely a stuck servo, a lost linkage or a dead
@@ -1189,7 +1368,7 @@ class AdaptiveCore:
             if not self.steering_fault:
                 self.get_fault_reset()
             self.steering_fault = True
-        us = clamp((kappa_des + self.iw - a1) / den, -1.0, 1.0)
+        us = clamp(knet / den, -1.0, 1.0)
         # No full lock while stationary. At standstill the curvature request
         # w/v blows up, the servo goes to lock before the car rolls, and a
         # car cannot START with its front wheels cranked: it sits, the
@@ -1254,10 +1433,31 @@ class AdaptiveCore:
             # exactly at v = cmd_v, and kp and the trim stay the only
             # feedback. Guards: sane b0 (above), and the quadratic is never
             # evaluated outside the speed range it was fitted on.
-            s_dir = sgn(v) or sgn(cmd_v)
+            # Coulomb direction from the measurement ONLY when the car is
+            # confidently moving. At standstill v is odometry noise, and
+            # sgn(noise) flapped the +-|b3|/b0 (~0.2 wire) feedforward at
+            # noise rate -- the 02:04 log shows 183 sign flips in 60 s with
+            # the wire shivering -0.17..+0.23 against a +0.25 command, and
+            # the robot never launching. Static friction opposes the
+            # INTENDED motion, so below the gate the command decides.
+            s_dir = sgn(v) if abs(v) > self.gate_d else (sgn(cmd_v) or sgn(v))
             v_ff = cmd_v if self.vl_lo is None else clamp(cmd_v, self.vl_lo,
                                                           self.vl_hi)
-            ud = (a_des - b1 - b2 * v_ff * abs(v_ff) - b3 * s_dir) / b0
+            # Two inversions, two denominators, deliberately. The STATIC
+            # part (-b1 - b2v^2 - b3)/b0 is inverted through the FITTED b0:
+            # b0..b3 are collinear at one cruise speed, only their sum is
+            # data-pinned, and dividing the fitted numerator by anything
+            # but the fitted denominator breaks the equilibrium the data
+            # actually showed (the b2-clamp lesson). The FEEDBACK part
+            # a_des/b0 is different: there b0 is a loop gain, and a drifted
+            # fit dilutes or triples it -- the 02:15 poisoned b0 of 6.4 cut
+            # kp's authority 3x and the overspeed ran away uncorrected,
+            # while the settling window's under-fit (0.7 in sim) would
+            # triple it. Bounded prior-relative, a risk constant on how far
+            # the learned value may scale the loop, not a vehicle property.
+            b0_fb = clamp(b0, 0.5 * p.prior_b0, 2.0 * p.prior_b0)
+            ud = a_des / b0_fb \
+                - (b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
         else:
             ud = 0.3 * sgn(err)
         if p.enable_dither and self.dither > 0.0:
@@ -1265,6 +1465,7 @@ class AdaptiveCore:
         ud = clamp(ud + self.iv, -1.0, 1.0)
         self._floor = 0.0
         self._floor_dir = 0.0
+        self._cap = 0.0
         if direction and not self.rolling and err * direction > 0.0:
             # Not rolling yet, motion is wanted AND the PI agrees it should
             # speed up that way (the last condition keeps this from ever
@@ -1279,6 +1480,14 @@ class AdaptiveCore:
             if floor > 0.0:
                 ud = direction * max(ud * direction, floor)
                 self._floor, self._floor_dir = floor, direction
+                # Cap rides launch_cap_rate above the floor per second
+                # stuck (see Policy). The integrator keeps winding under
+                # the cap on purpose: its pinning is what the blocked
+                # reflex detects.
+                stuck = (self.now - self._stall_since
+                         if self._stall_since is not None else 0.0)
+                self._cap = min(1.0, floor + p.launch_cap_margin
+                                + p.launch_cap_rate * stuck)
 
         # A zero speed command means stop, not "servo to zero speed".
         if cmd_v == 0.0 and cmd_w == 0.0:
@@ -1319,6 +1528,7 @@ class AdaptiveCore:
                 self.prev_ud = 0.0
                 self.iv = 0.0
                 self._floor = 0.0
+                self._cap = 0.0
                 return us, 0.0, True
 
         if want and not moving:
@@ -1341,6 +1551,7 @@ class AdaptiveCore:
                     self.iv = 0.0
                     self.prev_ud = 0.0
                     self._floor = 0.0
+                    self._cap = 0.0
                     return us, 0.0, True
             return us, ud, stalled
         if moving:
@@ -1369,6 +1580,10 @@ class AdaptiveCore:
         if self._floor > 0.0 and self._floor_dir:
             # the launch floor bypasses the slew: see reset() note
             ud = self._floor_dir * max(ud * self._floor_dir, self._floor)
+            if self._cap > 0.0:
+                # ...and the launch cap bounds it from above: the wire at
+                # the moment of breakaway is what sizes the lunge.
+                ud = clamp(ud, -self._cap, self._cap)
         self.prev_us, self.prev_ud = us, ud
         # The whole throttle path works in wire units (see _run); the dead-
         # band map is applied inside _run to the bootstrap path only.
@@ -1439,13 +1654,21 @@ class AdaptiveCore:
         wrong-signed b0 there must not block saving a good steering model.
         """
         m = self.model
-        span = abs(m.a0 + m.a2 * self.policy.env_speed ** 2)
+        v2 = self.policy.env_speed ** 2
+        raw = (m.a0l, m.a0r, m.a0l_rev, m.a0r_rev)
+        spans = [abs(gain + m.a2 * v2) for gain in raw]
         # Deliberately does NOT require a2 <= 0. That sign is enforced at the
         # inversion, and a poorly-excited run can leave it wrong while the
         # model is still perfectly usable -- demanding it here would mean
-        # almost nothing ever persists.
-        return (finite(span)
-                and span > self.policy.den_min
+        # almost nothing ever persists. ALL FOUR gain cells must be alive
+        # AND sign-consistent: one collapsed or flipped cell saved to disk
+        # is a permanent can't-turn-that-way car, and the 08-23 -0.09 cell
+        # was being re-saved every 30 s while it steered inverted.
+        consistent = list(sane_gain_cells(raw, self.policy.prior_a0)) \
+            == list(raw)
+        return (finite(*spans)
+                and min(spans) > self.policy.den_min
+                and consistent
                 and not self.steering_fault)
 
     def lon_plausible(self):
@@ -1469,7 +1692,10 @@ class AdaptiveCore:
         p = self.policy
         lon_ok = self.lon_plausible()
         return {
-            'version': 2,
+            # Version 4: the lateral fit is 6 parameters (a0 per travel
+            # direction x steering side, then a1, a2). Version 3 carried 4
+            # (left/right only); 1 and 2 a symmetric 3.
+            'version': 4,
             'lateral': list(self.rls_lat.theta),
             'longitudinal': (list(self.rls_lon.theta) if lon_ok
                              else [p.prior_b0, 0.0, 0.0, 0.0]),
@@ -1501,11 +1727,22 @@ class AdaptiveCore:
         than the delayed one the model is fit on, which made it systematically
         pessimistic, so it is discarded and re-learned.
         """
-        if not isinstance(d, dict) or d.get('version') not in (1, 2):
+        if not isinstance(d, dict) or d.get('version') not in (1, 2, 3, 4):
             return False
         lat, lon = d.get('lateral'), d.get('longitudinal')
-        if not isinstance(lat, list) or len(lat) != 3 or not finite(*lat):
+        # Older lateral layouts are expanded, never rejected: a symmetric
+        # 3-parameter fit seeds all four gain cells, a 4-parameter
+        # left/right fit seeds each reverse cell from its forward side. The
+        # envelope evidence is KEPT across these upgrades (unlike v1): it
+        # was measured against the gains the cells start as, so it stays
+        # consistent and simply ages out as the cells diverge.
+        if not isinstance(lat, list) or len(lat) not in (3, 4, 6) \
+                or not finite(*lat):
             return False
+        if len(lat) == 3:
+            lat = [lat[0]] * 4 + [lat[1], lat[2]]
+        elif len(lat) == 4:
+            lat = [lat[0], lat[1], lat[0], lat[1], lat[2], lat[3]]
         # Files from before the Coulomb term carry a 3-parameter fit.
         if not isinstance(lon, list) or len(lon) not in (3, 4) \
                 or not finite(*lon):

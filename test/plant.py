@@ -29,6 +29,8 @@ class Plant:
     kinetic = 0.0     # constant decel opposing motion while rolling
     delay = 0.0       # pure command-to-actuator delay, seconds
     deadband = 0.0    # dead zone OFFSET: torque ~ (|qd| - deadband), 0 below
+    a0_right = None   # steering gain for qs < 0; None means symmetric (a0)
+    rev_gain_scale = 1.0  # steering gain multiplier while v < 0 (caster)
 
     def step(self, us, ud, dt):
         if self.delay > 0.0:
@@ -55,7 +57,11 @@ class Plant:
             v_new = 0.0            # friction stops it, does not reverse it
         self.v = v_new
 
-        kappa = self.a0 * self.qs + self.a1 + self.a2 * self.qs * self.v ** 2
+        a_gain = self.a0 if self.qs >= 0.0 or self.a0_right is None \
+            else self.a0_right
+        if self.v < 0.0:
+            a_gain *= self.rev_gain_scale
+        kappa = a_gain * self.qs + self.a1 + self.a2 * self.qs * self.v ** 2
         psidot = self.v * kappa
         self.psi += psidot * dt
         self.x += self.v * math.cos(self.psi) * dt

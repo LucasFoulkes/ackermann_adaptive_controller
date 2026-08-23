@@ -15,12 +15,14 @@ would otherwise leave the actuators to time out between samples.
 
 Modes (service ``~/set_active``, ``std_srvs/SetBool``):
 
-* PASSIVE (default): learn from motion but publish nothing, so the DS4 teleop
+* PASSIVE: learn from motion but publish nothing, so the DS4 teleop
   mappers keep sole ownership of the actuator topics.
 * ACTIVE: turn Nav2 velocity commands into actuator commands.
 
-The node starts PASSIVE. A car that can drive away should not do so because a
-launch file came up.
+The PARAMETER default is PASSIVE, but this robot arms itself at launch:
+config/robot.yaml sets ``start_active: true``, which is safe on its own only
+because Nav2 emits no cmd_vel until a goal is accepted (see robot.launch.py's
+docstring for the reasoning and the stop procedure).
 """
 
 import math
@@ -56,7 +58,8 @@ POLICY_PARAMS = (
     'tau_s', 'tau_d', 'kp_v', 'ki_v', 'ki_w', 'prior_a0', 'prior_b0',
     'v_eff_floor', 'stall_cmd_min', 'iv_max', 'iw_max', 'v_fb_tau',
     'span_floor', 'steer_standstill', 'use_learned_lon', 'lat_delay',
-    'lon_delay', 'gate_s_max', 'launch_floor', 'max_steer_rate',
+    'lon_delay', 'gate_s_max', 'launch_floor', 'launch_cap_margin',
+    'launch_cap_rate', 'max_steer_rate',
     'max_drive_rate', 'blocked_after', 'blocked_release',
     'env_qs_threshold', 'env_evidence', 'env_derate', 'env_speed',
     'radius_floor', 'radius_ceiling',
@@ -107,19 +110,39 @@ class AckermannAdaptiveController(Node):
             ('controller_server', '/controller_server'),
             ('controller_radius_param',
              'FollowPath.regulated_linear_scaling_min_radius'),
+            # RPP's path-localization window, kept at HALF a cusp-leg of
+            # path (0.5 x the quoted turning radius): any window that
+            # reaches across a cusp lets the nearest-pose search hop
+            # between the overlapping fwd/rev legs, flipping the carrot's
+            # direction -- the forward/reverse shuffle. A FULL radius was
+            # still too long (16:19 log: legs ~0.8 m at radius 0.91). Half
+            # a radius stays several times the observed cross-track error.
+            # Pushed with the planner radius so it tracks the LEARNED leg
+            # scale. Empty server name disables.
+            ('search_dist_server', '/controller_server'),
+            ('search_dist_param', 'FollowPath.max_robot_pose_search_dist'),
             # Hysteresis: republishing on every wobble would make Smac rebuild
             # its primitive table continuously.
             ('radius_rel_change', 0.10),
             ('radius_abs_change', 0.05),
             ('radius_push_period', 5.0),
             ('radius_filter_alpha', 0.25),
+            # The planner is quoted radius * margin, not the raw learned
+            # limit. Pushed exactly the learned radius, planned arcs sit AT
+            # the car's limit, so any tracking error makes RPP's recovery
+            # chord tighter than the car can do -- the 08-23 log had 35% of
+            # turning ticks demanding curvature beyond the envelope, with the
+            # steering clamp saturated 17% of the time.
+            ('radius_push_margin', 1.2),
             ('state_file',
              os.path.expanduser('~/.ros/ackermann_adaptive_controller.yaml')),
             ('save_period', 30.0),
             # Flight recorder: one CSV row per odometry tick -- every input,
             # every internal state, every output. This is the ground truth
             # for "what did it see, what did it try, what did it learn".
-            # Empty string disables. ~40 bytes * 10 Hz: trivial.
+            # Empty string disables. ~180 bytes * 10 Hz: ~150 MB/day if left
+            # running, so mind the SD card on long soak tests. The file is
+            # rotated automatically when the column set changes.
             ('flight_log', os.path.expanduser('~/.ros/ackermann_flight.csv')),
         ])
         g = {d.name: d.value for d in p}
@@ -139,9 +162,13 @@ class AckermannAdaptiveController(Node):
         self.planner_param = str(g['planner_radius_param'])
         self.controller_server = str(g['controller_server'])
         self.controller_param = str(g['controller_radius_param'])
+        self.search_server = str(g['search_dist_server'])
+        self.search_param = str(g['search_dist_param'])
         self.radius_rel = float(g['radius_rel_change'])
         self.radius_abs = float(g['radius_abs_change'])
+        self.radius_margin = float(g['radius_push_margin'])
         self.pushed_radius = None
+        self._param_clients = {}
         self._push_warned = False
         self._warned_implausible = False
         self._warned_fault = False
@@ -152,16 +179,29 @@ class AckermannAdaptiveController(Node):
         self._flight = None
         path = str(g['flight_log'])
         if path:
+            header = ('stamp,phase,active,cmd_v,cmd_w,v,vdot,psidot,'
+                      'qs,qd,us,ud,iw,iv,a0l,a0r,a0lr,a0rr,a1,a2,'
+                      'b0,b1,b2,b3,breakaway,'
+                      'ready_lon,ready_lat,stalled,blocked,fault,'
+                      'x,y,yaw\n')
             try:
                 os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+                # Rotate a log whose columns no longer match, so one file
+                # never mixes two schemas (analysis reads the header once).
+                if os.path.exists(path):
+                    with open(path, errors='replace') as fh:
+                        old_header = fh.readline()
+                    if old_header != header:
+                        stamp = int(os.path.getmtime(path))
+                        rotated = f'{path}.{stamp}'
+                        os.replace(path, rotated)
+                        self.get_logger().info(
+                            f'flight log columns changed; '
+                            f'rotated old log to {rotated}')
                 new_file = not os.path.exists(path)
                 self._flight = open(path, 'a', buffering=1)
                 if new_file:
-                    self._flight.write(
-                        'stamp,phase,active,cmd_v,cmd_w,v,vdot,psidot,'
-                        'qs,qd,us,ud,iw,iv,a0,a1,a2,b0,b1,b2,breakaway,'
-                        'ready_lon,ready_lat,stalled,blocked,fault,'
-                        'x,y,yaw\n')
+                    self._flight.write(header)
                 self.get_logger().info(f'flight log: {path}')
             except OSError as exc:
                 self.get_logger().warn(f'no flight log: {exc}')
@@ -279,8 +319,11 @@ class AckermannAdaptiveController(Node):
                 f'{cmd_v:.3f},{cmd_w:.3f},{out.v:.3f},{c.vdot:.3f},'
                 f'{out.psidot:.3f},{c.qs:.3f},{c.qd:.3f},'
                 f'{out.steer:.3f},{out.drive:.3f},{c.iw:.3f},{c.iv:.3f},'
-                f'{m.a0:.3f},{m.a1:.3f},{m.a2:.3f},'
-                f'{m.b0:.3f},{m.b1:.3f},{m.b2:.3f},{c.breakaway:.3f},'
+                f'{m.a0l:.3f},{m.a0r:.3f},'
+                f'{m.a0l_rev:.3f},{m.a0r_rev:.3f},'
+                f'{m.a1:.3f},{m.a2:.3f},'
+                f'{m.b0:.3f},{m.b1:.3f},{m.b2:.3f},{m.b3:.3f},'
+                f'{c.breakaway:.3f},'
                 f'{int(c.ready_lon)},{int(c.ready_lat)},'
                 f'{int(out.stalled)},{int(c.blocked)},'
                 f'{int(out.steering_fault)},'
@@ -349,8 +392,16 @@ class AckermannAdaptiveController(Node):
             resp.success = False
             resp.message = 'must be ACTIVE to calibrate'
             return resp
-        self.core.policy.enable_calibration = True
-        self.core._enter(CAL, self._now())
+        if self.core.phase != RUN:
+            # SENSE has not measured the noise floor yet (or CAL is already
+            # running); calibrating now would size every gate from zeros.
+            resp.success = False
+            resp.message = f'phase is {self.core.phase}; wait for RUN'
+            return resp
+        # One-shot on purpose: this must NOT set policy.enable_calibration,
+        # which would silently re-enter CAL (and self-drive the wiggle) after
+        # every later ~/reset once armed.
+        self.core.start_cal()
         resp.success = True
         resp.message = 'calibration started; keep the area clear'
         self.get_logger().warn(resp.message)
@@ -395,33 +446,48 @@ class AckermannAdaptiveController(Node):
         # extrapolation of a prior and should not override the launch default.
         if not self.core.envelope.confirmed:
             return
+        # Quote the planner a LARGER radius than the car's true limit (see
+        # the radius_push_margin declaration): paths must leave RPP headroom
+        # to cut a tighter recovery chord without saturating the clamp.
+        quoted = r * self.radius_margin
         prev = self.pushed_radius
         if prev is not None:
-            if abs(r - prev) < self.radius_abs or \
-                    abs(r - prev) < self.radius_rel * prev:
+            if abs(quoted - prev) < self.radius_abs or \
+                    abs(quoted - prev) < self.radius_rel * prev:
                 return
         # Recorded optimistically; a rejection (typically Nav2 still
         # configuring, so the parameter is not declared yet) clears it again
         # so the next tick retries instead of waiting for a 10% change.
-        self.pushed_radius = r
-        self._set_remote(self.planner_server, self.planner_param, r)
-        self._set_remote(self.controller_server, self.controller_param, r)
+        self.pushed_radius = quoted
+        self._set_remote(self.planner_server, self.planner_param, quoted)
+        self._set_remote(self.controller_server, self.controller_param,
+                         quoted)
+        # Third consumer, at half scale: a cusp leg is about one quoted
+        # radius of path, and RPP's nearest-pose search must not be able to
+        # reach across the cusp -- half a leg keeps it on the current one.
+        self._set_remote(self.search_server, self.search_param, 0.5 * quoted)
 
     def _set_remote(self, server, name, value):
         """Fire-and-forget remote parameter set; never block the executor."""
         if not server or not name:
             return
-        cli = self.create_client(SetParameters, f'{server}/set_parameters')
+        # One persistent client per server. A client created fresh for each
+        # push raced DDS endpoint matching: service_is_ready() checked
+        # microseconds after creation reports False even against a healthy
+        # server, so every push depended on matching latency staying small.
+        cli = self._param_clients.get(server)
+        if cli is None:
+            cli = self.create_client(SetParameters, f'{server}/set_parameters')
+            self._param_clients[server] = cli
         if not cli.service_is_ready():
             self._push_failed(f'{server} parameters not available yet')
-            cli.destroy()
             return
         req = SetParameters.Request()
         req.parameters = [Parameter(name, Parameter.Type.DOUBLE,
                                     float(value)).to_parameter_msg()]
         future = cli.call_async(req)
 
-        def _done(fut, _cli=cli, _server=server, _name=name, _value=value):
+        def _done(fut, _server=server, _name=name, _value=value):
             try:
                 res = fut.result()
                 if res and res.results and not res.results[0].successful:
@@ -437,7 +503,6 @@ class AckermannAdaptiveController(Node):
                         f'({_server})')
             except Exception as exc:
                 self._push_failed(f'{_server} set {_name} failed: {exc}')
-            _cli.destroy()
 
         future.add_done_callback(_done)
 
@@ -527,7 +592,11 @@ class AckermannAdaptiveController(Node):
             'dt': f'{self.core.dt:.4f}',
             'sigma_v': f'{self.core.sigma_v:.4f}',
             'gate_d': f'{self.core.gate_d:.3f}',
-            'lateral_a': f'{m.a0:.3f} {m.a1:.3f} {m.a2:.3f}',
+            # gains per (travel direction x steering side) -- unequal is
+            # real: linkage geometry left/right, caster dynamics fwd/rev
+            'lateral_a': (f'fwd L{m.a0l:.3f} R{m.a0r:.3f}  '
+                          f'rev L{m.a0l_rev:.3f} R{m.a0r_rev:.3f}  '
+                          f'{m.a1:.3f} {m.a2:.3f}'),
             'longitudinal_b':
                 f'{m.b0:.3f} {m.b1:.3f} {m.b2:.3f} coulomb={m.b3:.3f}',
             # command-to-response delays, learned (bank winner per axis)

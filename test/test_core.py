@@ -72,6 +72,76 @@ def test_lateral_gain_converges():
     assert core.model.a0 == pytest.approx(plant.a0, rel=0.35)
 
 
+def test_asymmetric_steering_gain_is_learned_per_direction():
+    """The 08-23 robot steers left at 1.75 curvature/command, right at 1.20.
+
+    A symmetric model averaged the two and pushed the difference into the
+    trim term a1: right turns saturated, and straights carried a phantom
+    trim the car did not have. The split model must recover each side's own
+    gain and keep the trim near the truth (zero here).
+    """
+    core = AdaptiveCore()
+    plant = Plant(a=(1.75, 0.0, -0.30))
+    plant.a0_right = 1.20
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant,
+                 lambda s: (0.60, 0.5 * math.sin(2.0 * math.pi * 0.12 * s)),
+                 120.0, t0=t)
+    assert core.model.a0l == pytest.approx(1.75, rel=0.30), core.model
+    assert core.model.a0r == pytest.approx(1.20, rel=0.30), core.model
+    # the asymmetry must not masquerade as trim any more
+    assert abs(core.model.a1) < 0.08, core.model.a1
+
+
+def test_reverse_steering_gain_is_learned_separately():
+    """The 08-23 logs measured reverse-left at 0.73x its forward gain.
+
+    Kinematically kappa = tan(delta)/L is direction-invariant, but the
+    dynamics are not (caster works against a front-steered car in reverse).
+    The forward cells must not be polluted by reverse samples, and the
+    reverse cells must converge to the reverse plant, not the forward one.
+    """
+    core = AdaptiveCore()
+    plant = Plant(a=(1.60, 0.0, -0.30))
+    plant.rev_gain_scale = 0.7
+    t = settle_sense(core, plant)
+    slalom = lambda s: 0.5 * math.sin(2.0 * math.pi * 0.12 * s)
+    _, t = drive(core, plant, lambda s: (0.60, slalom(s)), 90.0, t0=t)
+    _, t = drive(core, plant, lambda s: (-0.60, slalom(s)), 120.0, t0=t)
+    m = core.model
+    assert m.a0l == pytest.approx(1.60, rel=0.30), m
+    assert m.a0l_rev == pytest.approx(0.7 * 1.60, rel=0.30), m
+    assert m.a0l_rev < m.a0l, m
+
+
+def test_single_flipped_gain_cell_is_not_believed():
+    """The 08-23 incident: fwd-right taught to -0.09 while the other three
+    cells sat at 1.4-1.9. One rack drives all four cells, so a lone flipped
+    sign is a poisoned fit, not a vehicle -- yet it steered fwd-right turns
+    INVERTED and its near-zero span dragged the worst-cell envelope to a
+    7 m planner radius (every path became a looping star)."""
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.rls_lat.theta = [1.87, -0.09, 1.43, 1.65, -0.016, -0.50]
+    core.rls_lat.count = 500
+    core.qs_lo, core.qs_hi = -1.0, 1.0
+    assert core.ready_lat
+    # envelope: the poisoned cell must not shrink the quoted curvature
+    # below what the prior would give
+    r = core.envelope.min_turning_radius(core.model)
+    assert r < 2.0, r
+    # inversion: a forward right turn must still steer right (us < 0)
+    core.v = core.v_fb = 0.4
+    us, _ = core._run(0.4, 0.3, -0.5, 0.1)
+    assert us < 0.0, us
+    # and a model like this must never reach the disk
+    assert not core.plausible()
+    # whereas a consistently inverted servo (all four negative) IS a
+    # believable vehicle and must persist untouched
+    core.rls_lat.theta = [-1.3, -1.3, -1.3, -1.3, 0.0, -0.3]
+    assert core.plausible()
+
+
 def test_learning_is_gated_below_the_noise_floor():
     core = AdaptiveCore()
     plant = Plant()
@@ -457,11 +527,16 @@ def test_applied_commands_drive_the_learner_not_our_own_output():
     core = AdaptiveCore()
     plant = Plant(a=(0.60, 0.04, -0.30), b=(4.0, 0.0, -0.35))
     t = settle_sense(core, plant)
-    # feed the plant a command the core never produced, and tell the core
+    # feed the plant a command the core never produced, and tell the core.
+    # Throttle sized so the plant cruises near 1 m/s, not 2.2: this test is
+    # about PASSIVE tapping, and at 2.2 m/s the shared a2*v^2 column
+    # (|a2 v^2| ~ 1.45 vs a0 = 0.6) dominates the per-cell gain columns and
+    # the split fit has nothing to pin the cells with -- a regime the real
+    # robot (v <= 0.9, speed term <= 4% of gain) never enters.
     for i in range(600):
         t += 0.1
         us = 0.8 * math.sin(2.0 * math.pi * 0.1 * i * 0.1)
-        ud = 0.45 + 0.15 * math.sin(2.0 * math.pi * 0.03 * i * 0.1)
+        ud = 0.09 + 0.04 * math.sin(2.0 * math.pi * 0.03 * i * 0.1)
         for _ in range(5):
             plant.step(us, ud, 0.02)
         x, y, psi = plant.observe()
@@ -553,9 +628,11 @@ def test_dead_steering_does_not_latch_the_controller_to_zero():
     core = AdaptiveCore()
     plant = DeadSteering()
     t = settle_sense(core, plant)
+    # 120 s, not 60: the per-direction split halves each gain's sample rate,
+    # so concluding BOTH sides are dead takes twice the evidence.
     out, t = drive(core, plant,
                    lambda s: (0.5, 0.6 * math.sin(2.0 * math.pi * 0.1 * s)),
-                   60.0, t0=t)
+                   120.0, t0=t)
     # the learner is entitled to conclude the gain is ~0 -- that is true
     assert abs(core.model.a0) < 0.5
     # ...but the controller must keep steering anyway
@@ -569,7 +646,7 @@ def test_steering_recovers_when_the_actuator_comes_back():
     t = settle_sense(core, plant)
     _, t = drive(core, plant,
                  lambda s: (0.5, 0.6 * math.sin(2.0 * math.pi * 0.1 * s)),
-                 60.0, t0=t)
+                 120.0, t0=t)
     assert core.steering_fault
     # servo reconnected: same plant, steering now works
     alive = Plant()
@@ -659,7 +736,9 @@ def test_normal_cruise_is_not_mistaken_for_a_stall():
 # The model actually learned on the robot, which made it lurch. b2 is
 # POSITIVE: the model believed going faster makes you accelerate harder.
 ROBOT_BAD_LON = [2.601463431608965, -0.08290769855274661, 4.583415448717575, 0.0]
-ROBOT_BAD_LAT = [0.243002130697819, -0.032426081319866, 0.136622565150797]
+# Recorded before the per-cell split: the symmetric gain fills all four.
+ROBOT_BAD_LAT = [0.243002130697819] * 4 + [-0.032426081319866,
+                                           0.136622565150797]
 
 
 def _load_bad(core):
@@ -681,7 +760,7 @@ def test_positive_drag_never_reaches_the_actuator():
 def test_speed_term_cannot_invert_or_null_the_steering():
     core = AdaptiveCore()
     settle_sense(core, Plant())
-    core.rls_lat.theta = [0.8, 0.0, -20.0]
+    core.rls_lat.theta = [0.8, 0.8, 0.8, 0.8, 0.0, -20.0]
     steers = []
     for v in (0.1, 0.5, 0.9, 1.4):
         core.v = v
@@ -753,7 +832,8 @@ def test_fault_reopens_the_covariance_so_recovery_is_possible():
     for i in range(3000):
         u = math.sin(i * 0.37)
         v = 0.4 + 0.3 * math.sin(i * 0.11)
-        core.rls_lat.update([u, 1.0, u * v * v], 0.0, 1.0)
+        core.rls_lat.update([max(u, 0.0), min(u, 0.0), 0.0, 0.0,
+                             1.0, u * v * v], 0.0, 1.0)
     shrunk = core.rls_lat.P[0][0]
     assert shrunk < 0.05 * core.policy.p0, shrunk
 
@@ -795,9 +875,12 @@ def test_inverted_steering_polarity_is_learned():
                    lambda s: (0.6, 0.5 * math.sin(2.0 * math.pi * 0.10 * s)),
                    180.0, t0=t)
     assert core.model.a0 < -0.3, core.model.a0
-    # commanded left turn now requires the OPPOSITE servo sign
+    # commanded left turn now requires the OPPOSITE servo sign. Assert on
+    # the heading CHANGE during the turn: psi accumulates arbitrary sign
+    # while the learner is still converging through the slalom above.
+    psi0 = plant.psi
     out, _ = drive(core, plant, lambda s: (0.5, 0.6), 10.0, t0=t)
-    assert plant.psi > 0.0                    # the robot actually turns left
+    assert plant.psi - psi0 > 1.0             # the robot actually turns left
     assert out.steer < 0.0                    # via an inverted command
 
 
