@@ -28,6 +28,7 @@ class Plant:
 
     kinetic = 0.0     # constant decel opposing motion while rolling
     delay = 0.0       # pure command-to-actuator delay, seconds
+    deadband = 0.0    # dead zone OFFSET: torque ~ (|qd| - deadband), 0 below
 
     def step(self, us, ud, dt):
         if self.delay > 0.0:
@@ -42,7 +43,11 @@ class Plant:
         self.qs += (us - self.qs) * (1.0 - math.exp(-dt / self.tau_s))
         self.qd += (ud - self.qd) * (1.0 - math.exp(-dt / self.tau_d))
 
-        vdot = self.b0 * self.qd + self.b1 + self.b2 * self.v * abs(self.v)
+        # Offset-type dead zone, the physical form: the first `deadband` of
+        # the command range produces nothing, the rest is linear from zero.
+        qd_eff = math.copysign(max(abs(self.qd) - self.deadband, 0.0),
+                               self.qd)
+        vdot = self.b0 * qd_eff + self.b1 + self.b2 * self.v * abs(self.v)
         if self.v != 0.0 and self.kinetic:
             vdot -= math.copysign(self.kinetic, self.v)
         v_new = self.v + vdot * dt

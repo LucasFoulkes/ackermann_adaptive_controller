@@ -22,8 +22,14 @@ Three phases:
 
 Two learned sub-models, both linear in their parameters so RLS applies:
 
-    longitudinal   vdot      = b0*qd + b1 + b2*v*|v|
+    longitudinal   vdot      = b0*qd + b1 + b2*v*|v| + b3*sgn(v)
     lateral        psidot/v  = a0*qs + a1 + a2*qs*v**2
+
+b3 is Coulomb friction: without it, friction leaks into b0 and b1 and the
+longitudinal fit converges to nonsense on a real drivetrain (b0 < 0 was
+observed). The command-to-response delay each model is aligned to is ALSO
+learned: each axis runs a small bank of identical estimators at candidate
+delays and control uses whichever currently predicts best (see DelayBank).
 
 The regressors are the commands that were on the wire ``lat_delay`` /
 ``lon_delay`` seconds before the response being explained, not the current
@@ -148,8 +154,18 @@ class Policy:
     # Nav2 is allowed to command -- and the steering model took 23 samples
     # in ten minutes. The cap ties the gate to the operating speed instead.
     gate_s_max: float = 0.24
-    # Invert the learned longitudinal model for control? Off: see _run.
-    use_learned_lon: bool = False
+    # Invert the learned longitudinal model once ready_lon holds. This was
+    # OFF for a long time because the fit itself was poisoned: a linear gain
+    # regressed against a dead-band + friction actuator averages "high
+    # throttle, zero acceleration" into b0 several times too low, and the
+    # inversion divided by it -- the lunge. Both causes are gone: the dead
+    # band is measured and compensated at the output (the learner sees a
+    # linearized motor), and Coulomb friction has its own term (b3) instead
+    # of leaking into the gain. First hardware session on that model fit
+    # b0 = 2.03, b3 = -0.52: sane. The inversion still falls back to the
+    # prior until ready_lon (count AND spans), and wrong-signed terms are
+    # clamped before they can reach the wheels.
+    use_learned_lon: bool = True
     # Steering authority at standstill (fraction of full lock); full
     # authority once rolling at gate_d. See the note in _run.
     steer_standstill: float = 0.45
@@ -202,6 +218,59 @@ class Policy:
     radius_floor: float = 0.25
     radius_ceiling: float = 8.0
 
+    # Throttle dead band -- LEARNED, from every start. The wire command that
+    # was applied lon_delay seconds before the wheels first turned is the one
+    # that broke them free; a median of those per direction is the dead
+    # band, and a fraction of it is applied as a static offset at the output
+    # so the PI no longer has to climb it on every launch. The earlier
+    # breakaway machinery failed because it measured the instantaneous
+    # command during a fast probe ramp (true value + ramp x latency, ~0.25
+    # high) and then pushed through the integrator on that number.
+    deadband_evidence: int = 4      # starts per direction before it is trusted
+    # Fraction applied. The sample reads high by ramp x detection latency
+    # (~+0.05 in simulation, a slow ramp against ~0.5 s of actuator + odometry
+    # lag), so 0.7 keeps the applied offset below the true breakaway: it must
+    # never move the car on its own.
+    deadband_trust: float = 0.7
+    deadband_max: float = 0.5       # sanity bound on what may be applied
+    # Only a SLOW start is a measurement: if the wheels turned within this
+    # many seconds of the throttle coming on, whatever was on the wire was
+    # already above the dead band -- an upper bound, not a sample. Without
+    # this, once compensation works every start is instant and the median
+    # creeps up on its own output.
+    deadband_slow_start: float = 0.8
+
+    # Delay learning. lat_delay / lon_delay above are INITIAL estimates:
+    # each axis runs a bank of estimators at (delay/spread, delay,
+    # delay*spread) and control follows the one with the lowest
+    # exponentially-weighted prediction error (time constant delay_ew_tau).
+    # A challenger must beat the incumbent by the margin to take over, so
+    # noise cannot flap the alignment. Estimation constants, not vehicle
+    # properties -- the delay itself is measured.
+    delay_spread: float = 1.5
+    delay_ew_tau: float = 30.0
+    delay_switch_margin: float = 0.8
+
+    # After the commanded curvature changes by more than this fraction of
+    # the envelope, the yaw-rate error is pure transport delay for one
+    # (learned) delay + servo constant -- integrating it is what kept the
+    # trim pinned on every transient. Risk constant; the window is learned.
+    iw_freeze_frac: float = 0.1
+
+    # Odometry plausibility. The bounds come from the vehicle's own learned
+    # physics -- acceleration from b0 + |b3|, yaw rate from the envelope --
+    # scaled by a risk margin; only the margin and the trip counts are
+    # hand-set. A step the car could not physically have produced is an
+    # odometry glitch: one is ridden through on the previous command,
+    # odom_glitch_trip in a row declare the odometry failed (zero output,
+    # no learning) until it has been sane for odom_recover_time. Learned
+    # from the 11:56 incident: a failing LiDAR USB link fed physically
+    # impossible poses at a perfectly healthy 10 Hz for 40 s -- the
+    # controller chased them and the learner ate them.
+    odom_glitch_margin: float = 2.0
+    odom_glitch_trip: int = 3
+    odom_recover_time: float = 1.0
+
     # Dead-man: no odometry for this many nominal steps stops the actuators.
     odom_timeout_steps: float = 3.0
 
@@ -216,6 +285,7 @@ class Model:
     b0: float = 0.0
     b1: float = 0.0
     b2: float = 0.0
+    b3: float = 0.0
     n_lat: int = 0
     n_lon: int = 0
 
@@ -301,6 +371,76 @@ class RLS:
 
         self.count += 1
         return True
+
+
+class DelayBank:
+    """Identical RLS estimators at candidate delays; the best one drives.
+
+    The command-to-response delay was measured by hand once (scanning lags
+    against flight logs until r-squared peaked). This does the same thing
+    continuously: every accepted sample updates all candidates, each scored
+    by the exponentially-weighted square of its one-step prediction error,
+    and control follows the current winner. A challenger must be clearly
+    better (margin) so odometry noise cannot flap the alignment.
+    """
+
+    def __init__(self, theta0, p0, p_max, delays, ew_tau, margin):
+        self.delays = list(delays)
+        self.bank = [RLS(list(theta0), p0, p_max) for _ in self.delays]
+        self.score = [None] * len(self.delays)
+        self.active = len(self.delays) // 2
+        self.ew_tau = ew_tau
+        self.margin = margin
+
+    @property
+    def rls(self):
+        return self.bank[self.active]
+
+    @property
+    def delay(self):
+        return self.delays[self.active]
+
+    def update(self, phi_fn, y, lam, dt):
+        """One sample for every candidate. Returns True if the active
+        estimator accepted it. ``phi_fn(delay)`` builds the regressor from
+        that candidate's delayed command, or None if history is too short."""
+        accepted = False
+        for i, (d, r) in enumerate(zip(self.delays, self.bank)):
+            phi = phi_fn(d)
+            if phi is None:
+                continue
+            inn = y - r.predict(phi)
+            if r.update(phi, y, lam) and finite(inn):
+                if i == self.active:
+                    accepted = True
+                a = clamp(dt / self.ew_tau, 0.0, 1.0)
+                e = inn * inn
+                self.score[i] = e if self.score[i] is None                     else self.score[i] + a * (e - self.score[i])
+        best = self.active
+        for i, s in enumerate(self.score):
+            if s is not None and (self.score[best] is None
+                                  or s < self.score[best]):
+                best = i
+        if best != self.active and self.score[self.active] is not None                 and self.score[best] < self.margin * self.score[self.active]:
+            self.active = best
+        return accepted
+
+    def inflate(self, p0):
+        for r in self.bank:
+            r.inflate(p0)
+
+    def seed(self, theta, count, p0):
+        """Restore a saved model into every candidate (they re-diverge)."""
+        for r in self.bank:
+            r.theta = list(theta)
+            r.count = count
+            for i in range(r.n):
+                for j in range(r.n):
+                    r.P[i][j] = p0 if i == j else 0.0
+
+    def set_delay(self, delay):
+        self.active = min(range(len(self.delays)),
+                          key=lambda i: abs(self.delays[i] - delay))
 
 
 class TwistEstimator:
@@ -476,6 +616,62 @@ class CurvatureEnvelope:
         return True
 
 
+class DeadBand:
+    """Throttle below which the wheels do not turn, learned from starts.
+
+    One median window per direction (``_Window``: a glitch cannot move it,
+    old evidence ages out). ``compensate`` maps a controller command onto
+    the live part of the actuator range -- ``d + |u| * (1 - d)`` -- so the
+    controller sees a linear motor. The applied offset is a fraction of the
+    measured breakaway: it must never move the car by itself.
+    """
+
+    def __init__(self, policy):
+        self.p = policy
+        self.fwd = _Window(policy.deadband_evidence, span=4)
+        self.rev = _Window(policy.deadband_evidence, span=4)
+
+    def _win(self, direction):
+        return self.fwd if direction > 0.0 else self.rev
+
+    def observe(self, direction, wire):
+        """The |wire| throttle that was on when the wheels first turned."""
+        if direction == 0.0 or not finite(wire) or not 0.0 < wire <= 1.0:
+            return False
+        self._win(direction).add(wire)
+        return True
+
+    def confirmed(self, direction):
+        return self._win(direction).confirmed
+
+    def value(self, direction):
+        """Offset applied in this direction; 0 until there is evidence."""
+        w = self._win(direction)
+        if not w.confirmed:
+            return 0.0
+        return clamp(self.p.deadband_trust * w.value, 0.0, self.p.deadband_max)
+
+    def compensate(self, ud):
+        if ud == 0.0:
+            return 0.0
+        d = self.value(sgn(ud))
+        return sgn(ud) * (d + abs(ud) * (1.0 - d))
+
+    def state(self):
+        return {'fwd': list(self.fwd.vals), 'rev': list(self.rev.vals)}
+
+    def load(self, d):
+        if not isinstance(d, dict):
+            return False
+        for key, win in (('fwd', self.fwd), ('rev', self.rev)):
+            vals = d.get(key)
+            if not isinstance(vals, list) or not all(
+                    finite(v) and 0.0 < v <= 1.0 for v in vals):
+                return False
+            win.vals = deque(vals[-win.vals.maxlen:], maxlen=win.vals.maxlen)
+        return True
+
+
 @dataclass
 class Output:
     """One control step's result."""
@@ -494,6 +690,8 @@ class Output:
     envelope_confirmed: bool = False
     breakaway: float = 0.0
     steering_fault: bool = False
+    deadband_fwd: float = 0.0
+    deadband_rev: float = 0.0
 
 
 class AdaptiveCore:
@@ -533,9 +731,26 @@ class AdaptiveCore:
         self.lam = 0.999
         self.dither = 0.0
 
-        self.rls_lat = RLS([p.prior_a0, 0.0, 0.0], p.p0, p.p_max)
-        self.rls_lon = RLS([p.prior_b0, 0.0, 0.0], p.p0, p.p_max)
+        def _delays(center):
+            return (center / p.delay_spread, center, center * p.delay_spread)
+        self.lat_bank = DelayBank([p.prior_a0, 0.0, 0.0], p.p0, p.p_max,
+                                  _delays(p.lat_delay), p.delay_ew_tau,
+                                  p.delay_switch_margin)
+        self.lon_bank = DelayBank([p.prior_b0, 0.0, 0.0, 0.0], p.p0, p.p_max,
+                                  _delays(p.lon_delay), p.delay_ew_tau,
+                                  p.delay_switch_margin)
+        self._kappa_prev = 0.0
+        self._kappa_changed_t = None
+        self.odom_ok = True
+        self._glitch_run = 0
+        self._sane_run = 0
+        # Start floor, re-applied AFTER the slew: stepping the wire straight
+        # to the learned breakaway IS the controlled launch; ramping to it
+        # through the slew just re-creates the stiction wait.
+        self._floor = 0.0
+        self._floor_dir = 0.0
         self.envelope = CurvatureEnvelope(p)
+        self.deadband = DeadBand(p)
 
         # Launch/rolling latch for the breakaway kick, with hysteresis so
         # odometry noise cannot flicker it.
@@ -547,6 +762,11 @@ class AdaptiveCore:
         self._cmd_hist = deque(maxlen=64)
         self.iw = self.iv = 0.0
         self.prev_us = self.prev_ud = 0.0
+        # Last throttle actually put on the wire (after dead-band compensation),
+        # its sign, and when that sign last came on (for the slow-start test).
+        self.prev_wire = 0.0
+        self._wire_sign = 0.0
+        self._wire_on_since = None
         # What was actually on the wire this tick, when someone else drives.
         self._wire = None
         self._cmd_dir = 0.0
@@ -570,6 +790,14 @@ class AdaptiveCore:
         self.phase_t0 = t
 
     @property
+    def rls_lat(self):
+        return self.lat_bank.rls
+
+    @property
+    def rls_lon(self):
+        return self.lon_bank.rls
+
+    @property
     def ready_lon(self):
         """Has the longitudinal model earned the right to be inverted?"""
         p = self.policy
@@ -589,7 +817,8 @@ class AdaptiveCore:
     def model(self):
         a = self.rls_lat.theta
         b = self.rls_lon.theta
-        return Model(a0=a[0], a1=a[1], a2=a[2], b0=b[0], b1=b[1], b2=b[2],
+        return Model(a0=a[0], a1=a[1], a2=a[2],
+                     b0=b[0], b1=b[1], b2=b[2], b3=b[3],
                      n_lat=self.rls_lat.count, n_lon=self.rls_lon.count)
 
     # -- the step ----------------------------------------------------------
@@ -627,6 +856,48 @@ class AdaptiveCore:
             self._wire = None
             return self._safe_output()
 
+        # ---------- odometry plausibility ---------------------------------
+        # A perfectly-timed stream can still be lying (failing LiDAR link,
+        # scan matcher jumping). Bounds from the vehicle's LEARNED physics:
+        # it cannot accelerate harder than full throttle plus friction says,
+        # and cannot yaw faster than its envelope at this speed allows.
+        if self.phase != SENSE:
+            b = self.rls_lon.theta
+            a_lim = self.policy.odom_glitch_margin * (
+                max(b[0], self.policy.prior_b0) + abs(min(b[3], 0.0)))
+            w_lim = max(
+                self.policy.odom_glitch_margin
+                * self.envelope.max_curvature(self.model, self.v_prev)
+                * max(abs(self.v_prev), self.gate_d),
+                1.5)
+            if abs(v - self.v_prev) > a_lim * dt or abs(psidot_raw) > w_lim:
+                self._sane_run = 0
+                self._glitch_run += 1
+                if self._glitch_run >= self.policy.odom_glitch_trip:
+                    self.odom_ok = False
+                if not self.odom_ok:
+                    # Once the stream is distrusted, judge it on its own
+                    # SELF-consistency: track it, so a stream that settles
+                    # can re-earn trust, while one that keeps jumping keeps
+                    # failing. (Frozen against the pre-failure speed, a sane
+                    # returning stream could never look plausible again.)
+                    self.v_prev = v
+                self.now = t
+                # One spike: hold the last command rather than jerk to zero.
+                # A failed stream: stop, and learn nothing from any of it.
+                return self._safe_output() if not self.odom_ok \
+                    else self._hold_output()
+            self._glitch_run = 0
+            if not self.odom_ok:
+                self._sane_run += 1
+                self.now = t
+                self.v_prev = v      # track sane samples so the checks work
+                if self._sane_run * self.dt >= self.policy.odom_recover_time:
+                    self.odom_ok = True
+                    self._sane_run = 0
+                else:
+                    return self._safe_output()
+
         self.now = t
         # Smooth the measured sample interval; everything rate-dependent below
         # is derived from this rather than from an assumed rate.
@@ -658,6 +929,16 @@ class AdaptiveCore:
             if abs(self.v_fast) > 0.6 * self.gate_d:
                 self.rolling = True
                 self._still_since = None
+                # The wheels just broke free. Whatever throttle was on the
+                # wire lon_delay ago is what did it: a dead-band sample, in
+                # the direction the car actually moved. Works in PASSIVE too
+                # (the history holds the joystick's commands there).
+                d = self._delayed_cmd(self.policy.lon_delay)
+                slow = (self._wire_on_since is not None
+                        and t - self._wire_on_since
+                        > self.policy.deadband_slow_start)
+                if slow and d is not None and sgn(d[1]) == sgn(v):
+                    self.deadband.observe(sgn(v), abs(d[1]))
         else:
             if abs(self.v_fast) < 0.3 * self.gate_d:
                 if self._still_since is None:
@@ -673,7 +954,7 @@ class AdaptiveCore:
             us_app, ud_app = applied
             self._wire = (float(us_app), float(ud_app))
         else:
-            us_app, ud_app = self.prev_us, self.prev_ud
+            us_app, ud_app = self.prev_us, self.prev_wire
             self._wire = None
         self.qs += (us_app - self.qs) * (1.0 - math.exp(-dt / p.tau_s))
         self.qd += (ud_app - self.qd) * (1.0 - math.exp(-dt / p.tau_d))
@@ -740,16 +1021,34 @@ class AdaptiveCore:
     def _learn(self, v):
         """Feed both learners, but only from samples that carry information."""
         ok = False
-        # Longitudinal. Drag is b2*v*|v|, not b2*v**2: quadratic drag opposes
-        # motion, so it must change sign in reverse.
-        p = self.policy
-        d_lon = self._delayed_cmd(p.lon_delay)
-        d_lat = self._delayed_cmd(p.lat_delay)
+        # Longitudinal. Drag is b2*v*|v| (opposes motion, so it changes sign
+        # in reverse); b3*sgn(v) is Coulomb friction, which is what used to
+        # leak into b0/b1 and drive the fit to a negative gain. Every delay
+        # candidate builds its regressor from its own delayed command.
         # Moving samples only: a stuck robot teaches "high throttle, zero
         # acceleration", which is stiction, not gain.
-        if d_lon is not None and abs(self.vdot) < 12.0 and abs(v) > self.gate_d:
-            if self.rls_lon.update([d_lon[1], 1.0, v * abs(v)],
-                                   self.vdot, self.lam):
+        if abs(self.vdot) < 12.0 and abs(v) > self.gate_d:
+            def phi_lon(delay):
+                d = self._delayed_cmd(delay)
+                if d is None:
+                    return None
+                # A nonzero wire inside the dead zone produces no torque:
+                # "throttle but no acceleration" samples are what once
+                # taught b0 several times too low. The threshold is the
+                # DERATED breakaway (trust * median): the raw median is the
+                # static breakaway, which sits above the dead-zone offset by
+                # the stiction, and skipping up to it starved the learner of
+                # its legitimate cruise samples. Zero-wire coasting stays:
+                # it identifies drag and Coulomb. A car with no dead-band
+                # evidence is unaffected.
+                if d[1] != 0.0:
+                    w = self.deadband._win(sgn(d[1]))
+                    thr = (self.policy.deadband_trust * w.value
+                           if w.vals else 0.0)
+                    if 0.0 < abs(d[1]) < thr:
+                        return None
+                return [d[1], 1.0, v * abs(v), sgn(v)]
+            if self.lon_bank.update(phi_lon, self.vdot, self.lam, self.dt):
                 ok = True
                 self.qd_lo, self.qd_hi = _span(self.qd_lo, self.qd_hi,
                                                self.qd)
@@ -759,22 +1058,23 @@ class AdaptiveCore:
         # deliberately no lower gate on psidot: straight-line samples are what
         # identify the trim term a1, so excluding them would lose the
         # misalignment the trim exists to cancel.
-        if d_lat is not None and abs(v) > self.gate_s and abs(self.psidot) < 4.0:
+        if abs(v) > self.gate_s and abs(self.psidot) < 4.0:
             kappa = self.psidot / v
-            qs = d_lat[0]
-            if self.rls_lat.update([qs, 1.0, qs * v * v],
-                                   kappa, self.lam):
+            def phi_lat(delay):
+                d = self._delayed_cmd(delay)
+                return None if d is None else [d[0], 1.0, d[0] * v * v]
+            if self.lat_bank.update(phi_lat, kappa, self.lam, self.dt):
                 ok = True
                 self.qs_lo, self.qs_hi = _span(self.qs_lo, self.qs_hi,
                                                self.qs)
             # Same sample, second use: how well the model predicted a
             # near-lock command is the only honest source for the envelope.
-            # Same regressor as the model, or the ratio compares a command the
-            # car has not responded to yet against the curvature it is still
-            # doing from an earlier one. With the lag-filtered qs here, every
-            # lock transition logged a "ratio" near zero and the envelope
-            # quoted 65% of the curvature the car actually has.
-            self.envelope.observe(qs, kappa, v, self.model)
+            # Same regressor (the ACTIVE delay's command) as the model, or
+            # the ratio compares a command the car has not responded to yet
+            # against the curvature it is still doing from an earlier one.
+            d = self._delayed_cmd(self.lat_bank.delay)
+            if d is not None:
+                self.envelope.observe(d[0], kappa, v, self.model)
         return ok
 
     def _cal(self, tc):
@@ -798,7 +1098,7 @@ class AdaptiveCore:
         """Invert the learned model and add integral trim."""
         p = self.policy
         a0, a1, a2 = self.rls_lat.theta
-        b0, b1, b2 = self.rls_lon.theta
+        b0, b1, b2, b3 = self.rls_lon.theta
 
         # --- steering -----------------------------------------------------
         # sgn(v) is zero at standstill, which would divide by zero; fall back
@@ -814,6 +1114,16 @@ class AdaptiveCore:
         # saturated steering command it can never satisfy.
         kappa_max = self.envelope.max_curvature(self.model, v, derate=False)
         kappa_des = clamp(cmd_w / v_eff, -kappa_max, kappa_max)
+        # A meaningful change in demanded curvature starts a settling window
+        # of one LEARNED delay plus the servo constant: during it the yaw
+        # error is transport delay, not trim, and integrating it is what had
+        # the trim pinned on 19-30% of every flight log.
+        if abs(kappa_des - self._kappa_prev) > p.iw_freeze_frac * kappa_max:
+            self._kappa_changed_t = self.now
+        self._kappa_prev = kappa_des
+        settling = (self._kappa_changed_t is not None
+                    and self.now - self._kappa_changed_t
+                    < self.lat_bank.delay + p.tau_s)
         # psidot = v * kappa, so a yaw error converts to a curvature
         # correction by dividing by SIGNED v. Dividing by |v| (as the original
         # spec did) winds the trim the wrong way whenever the robot reverses:
@@ -830,7 +1140,7 @@ class AdaptiveCore:
         # log had it pinned 90% of the time, biasing every turn one way and
         # unwinding slowly when the demand flipped -- "all left, all right".
         saturated = abs(self.prev_us) >= 0.95 * lim
-        if not saturated and abs(v) > 0.5 * self.gate_d:
+        if not saturated and not settling and abs(v) > 0.5 * self.gate_d:
             self.iw = clamp(
                 self.iw + p.ki_w * (cmd_w - self.psidot)
                 / v_signed * dt, -p.iw_max, p.iw_max)
@@ -838,12 +1148,15 @@ class AdaptiveCore:
         # the estimator: projecting every RLS update biases the fit, but a
         # wrong-signed coefficient must never reach an actuator.
         #
-        # A positive b2 means the model believes going faster makes you
-        # accelerate harder. The inversion then brakes while cruising, the
-        # robot drops below the motion gate, breakaway slams the throttle, and
-        # it limit-cycles. That was b2 = +4.58 on the robot.
+        # Longitudinal is different: b1/b2/b3 are nearly collinear at any
+        # one cruise speed, so their individual signs are partly arbitrary
+        # while their SUM is pinned by the data. Sign-clamping one of them
+        # (the old b2/b3 clamps here) made the inversion inconsistent with
+        # its own fit and shifted the equilibrium: on the robot a fitted
+        # b2 of +0.5..+2.5 was being zeroed and cruise ran 15-37% over the
+        # commanded speed. The throttle inversion now uses the fitted sum
+        # verbatim, evaluated only inside the speed range it was fitted on.
         a2 = min(a2, 0.0)     # cornering does not improve with speed
-        b2 = min(b2, 0.0)     # drag opposes motion
         b0 = max(b0, 0.0)     # more throttle cannot mean less acceleration
 
         # Until the data has genuinely covered a range of steering commands,
@@ -916,31 +1229,56 @@ class AdaptiveCore:
         err = cmd_v - v
         a_des = clamp(p.kp_v * err, -2.5, 2.5)
         self.iv = clamp(self.iv + p.ki_v * err * dt, -p.iv_max, p.iv_max)
+        # Everything below is in WIRE units -- what the actuator actually
+        # receives. The learned model is fit on the wire, so its inversion
+        # yields wire directly; the dead-band map only linearizes the
+        # BOOTSTRAP prior path. (Two bugs lived here: compensating the
+        # model's output again drove cruise 37% over the commanded speed,
+        # and flooring every output at the static breakaway stick-slipped
+        # any vehicle whose cruise level sits below its breakaway.)
         if not (self.ready_lon and p.use_learned_lon):
-            # The learned longitudinal model is NOT inverted for control.
-            # Every flight log shows the same thing: smooth while the throttle
-            # runs on the fixed prior, lunging from the tick the learned model
-            # takes over. The learner fits a LINEAR gain to a dead-band +
-            # stiction actuator and settles at b0 ~ 1.0-1.7 against a real
-            # free-rolling gain of ~5-6 -- it averages "high throttle, zero
-            # acceleration" samples into a low gain, and the inversion then
-            # divides by it. The model keeps being learned (diagnostics,
-            # persistence); it just does not drive the wheels.
-            ud = a_des / p.prior_b0
+            # Not yet earned: prior gain through the dead-band map, as
+            # prior_a0 does for steering.
+            ud = self.deadband.compensate(a_des / p.prior_b0)
         elif abs(b0) > p.b0_min:
-            ud = (a_des - b1 - b2 * v * abs(v)) / b0
+            # Invert the model EXACTLY as fitted: whatever the (partly
+            # arbitrary) split between b1, b2 and b3, inverting their sum
+            # reproduces the equilibrium the data actually showed.
+            #
+            # Evaluated at the SETPOINT, not the measurement. With measured
+            # v in the b2 term, the model became an undelayed feedback path
+            # with gain 2*|b2|*v/b0 stacked on kp -- and a collinearity-
+            # inflated b2 of +2 tripled the loop gain against ~0.6 s of
+            # actuator+odometry delay: the 1 Hz surge-stall "stepping" gait.
+            # At the setpoint it is pure feedforward: the equilibrium sits
+            # exactly at v = cmd_v, and kp and the trim stay the only
+            # feedback. Guards: sane b0 (above), and the quadratic is never
+            # evaluated outside the speed range it was fitted on.
+            s_dir = sgn(v) or sgn(cmd_v)
+            v_ff = cmd_v if self.vl_lo is None else clamp(cmd_v, self.vl_lo,
+                                                          self.vl_hi)
+            ud = (a_des - b1 - b2 * v_ff * abs(v_ff) - b3 * s_dir) / b0
         else:
             ud = 0.3 * sgn(err)
         if p.enable_dither and self.dither > 0.0:
             ud += self.dither * math.sin(2.0 * math.pi * 0.7 * self.now)
         ud = clamp(ud + self.iv, -1.0, 1.0)
-        if (p.launch_floor > 0.0 and direction and not self.rolling
-                and err * direction > 0.0):
+        self._floor = 0.0
+        self._floor_dir = 0.0
+        if direction and not self.rolling and err * direction > 0.0:
             # Not rolling yet, motion is wanted AND the PI agrees it should
-            # speed up that way: at least the floor, in the commanded
-            # direction. The last condition is what keeps this from ever
-            # turning a brake into throttle. See Policy.launch_floor.
-            ud = direction * max(ud * direction, p.launch_floor)
+            # speed up that way (the last condition keeps this from ever
+            # turning a brake into throttle): the wire goes straight to the
+            # LEARNED median breakaway -- applied only until the wheels
+            # turn, so it cannot over-floor a cruise. Until there is
+            # evidence, launch_floor is the bootstrap, as prior_a0 is for
+            # the envelope.
+            floor = (self.deadband._win(direction).value
+                     if self.deadband.confirmed(direction)
+                     else p.launch_floor)
+            if floor > 0.0:
+                ud = direction * max(ud * direction, floor)
+                self._floor, self._floor_dir = floor, direction
 
         # A zero speed command means stop, not "servo to zero speed".
         if cmd_v == 0.0 and cmd_w == 0.0:
@@ -956,7 +1294,7 @@ class AdaptiveCore:
         so the estimator is confident and slow. If the actuator comes back,
         that confidence is exactly what would keep the model wrong.
         """
-        self.rls_lat.inflate(self.policy.p0)
+        self.lat_bank.inflate(self.policy.p0)
 
     def _reflex(self, us, ud, v, cmd_v, t, dt):
         """Blocked detection. No probe, no escalation, no measurement.
@@ -980,6 +1318,7 @@ class AdaptiveCore:
                 # forced-zero output while blocked.
                 self.prev_ud = 0.0
                 self.iv = 0.0
+                self._floor = 0.0
                 return us, 0.0, True
 
         if want and not moving:
@@ -1001,6 +1340,7 @@ class AdaptiveCore:
                     self._capped_since = None
                     self.iv = 0.0
                     self.prev_ud = 0.0
+                    self._floor = 0.0
                     return us, 0.0, True
             return us, ud, stalled
         if moving:
@@ -1026,19 +1366,32 @@ class AdaptiveCore:
         # once the wheels turn, and nothing is gained by ramping DOWN slowly.
         rate = p.max_drive_rate * (2.0 if abs(ud) < abs(self.prev_ud) else 1.0)
         ud = self._slew(self.prev_ud, ud, rate * dt)
+        if self._floor > 0.0 and self._floor_dir:
+            # the launch floor bypasses the slew: see reset() note
+            ud = self._floor_dir * max(ud * self._floor_dir, self._floor)
         self.prev_us, self.prev_ud = us, ud
+        # The whole throttle path works in wire units (see _run); the dead-
+        # band map is applied inside _run to the bootstrap path only.
+        wire = ud
+        self.prev_wire = wire
         # The history the learner aligns its regressors to is what was ON THE
         # WIRE. In PASSIVE that is the joystick, not this (unpublished) output.
-        self._cmd_hist.append((self.now,) + (self._wire or (us, ud)))
+        entry = self._wire or (us, wire)
+        self._cmd_hist.append((self.now,) + entry)
+        if sgn(entry[1]) != self._wire_sign:
+            self._wire_sign = sgn(entry[1])
+            self._wire_on_since = self.now
         m = self.model
-        return Output(steer=us, drive=ud, phase=self.phase, learning=learning,
-                      stalled=stalled, v=self.v, psidot=self.psidot, dt=dt,
-                      model=m,
+        return Output(steer=us, drive=wire, phase=self.phase,
+                      learning=learning, stalled=stalled, v=self.v,
+                      psidot=self.psidot, dt=dt, model=m,
                       min_turning_radius=self.envelope.min_turning_radius(m),
                       max_curvature=self.envelope.max_curvature(m),
                       envelope_confirmed=self.envelope.confirmed,
                       breakaway=self.breakaway,
-                      steering_fault=self.steering_fault)
+                      steering_fault=self.steering_fault,
+                      deadband_fwd=self.deadband.value(1.0),
+                      deadband_rev=self.deadband.value(-1.0))
 
     @staticmethod
     def _slew(prev, target, limit):
@@ -1046,8 +1399,22 @@ class AdaptiveCore:
             return target
         return prev + clamp(target - prev, -limit, limit)
 
+    def _hold_output(self):
+        """A single implausible sample: keep the wire where it was."""
+        m = self.model
+        return Output(steer=self.prev_us, drive=self.prev_wire,
+                      phase=self.phase, v=self.v, psidot=self.psidot,
+                      dt=self.dt, model=m,
+                      min_turning_radius=self.envelope.min_turning_radius(m),
+                      max_curvature=self.envelope.max_curvature(m),
+                      envelope_confirmed=self.envelope.confirmed,
+                      breakaway=self.breakaway,
+                      steering_fault=self.steering_fault,
+                      deadband_fwd=self.deadband.value(1.0),
+                      deadband_rev=self.deadband.value(-1.0))
+
     def _safe_output(self):
-        self.prev_us = self.prev_ud = 0.0
+        self.prev_us = self.prev_ud = self.prev_wire = 0.0
         m = self.model
         return Output(phase=self.phase, v=self.v, psidot=self.psidot,
                       dt=self.dt, model=m,
@@ -1055,7 +1422,9 @@ class AdaptiveCore:
                       max_curvature=self.envelope.max_curvature(m),
                       envelope_confirmed=self.envelope.confirmed,
                       breakaway=self.breakaway,
-                      steering_fault=self.steering_fault)
+                      steering_fault=self.steering_fault,
+                      deadband_fwd=self.deadband.value(1.0),
+                      deadband_rev=self.deadband.value(-1.0))
 
     # -- persistence -------------------------------------------------------
 
@@ -1103,7 +1472,9 @@ class AdaptiveCore:
             'version': 2,
             'lateral': list(self.rls_lat.theta),
             'longitudinal': (list(self.rls_lon.theta) if lon_ok
-                             else [p.prior_b0, 0.0, 0.0]),
+                             else [p.prior_b0, 0.0, 0.0, 0.0]),
+            'lat_delay': self.lat_bank.delay,
+            'lon_delay': self.lon_bank.delay,
             'envelope': self.envelope.state(),
             'n_lat': int(self.rls_lat.count),
             'n_lon': int(self.rls_lon.count) if lon_ok else 0,
@@ -1112,6 +1483,7 @@ class AdaptiveCore:
                 'vl': [self.vl_lo, self.vl_hi] if lon_ok else [None, None],
                 'qs': [self.qs_lo, self.qs_hi],
             },
+            'deadband': self.deadband.state(),
             'sigma_v': self.sigma_v,
             'tick': self.tick,
         }
@@ -1132,9 +1504,13 @@ class AdaptiveCore:
         if not isinstance(d, dict) or d.get('version') not in (1, 2):
             return False
         lat, lon = d.get('lateral'), d.get('longitudinal')
-        for vec in (lat, lon):
-            if not isinstance(vec, list) or len(vec) != 3 or not finite(*vec):
-                return False
+        if not isinstance(lat, list) or len(lat) != 3 or not finite(*lat):
+            return False
+        # Files from before the Coulomb term carry a 3-parameter fit.
+        if not isinstance(lon, list) or len(lon) not in (3, 4) \
+                or not finite(*lon):
+            return False
+        lon = list(lon) + [0.0] * (4 - len(lon))
         p = self.policy
         if d['version'] >= 2:
             if not self.envelope.load(d.get('envelope')):
@@ -1148,27 +1524,27 @@ class AdaptiveCore:
             except (TypeError, ValueError):
                 return False
             qd, vl, qs = (_load_span(spans.get(k)) for k in ('qd', 'vl', 'qs'))
+            # Optional: files saved before the dead band was learned lack it.
+            if 'deadband' in d and not self.deadband.load(d['deadband']):
+                return False
         else:
             n_lat = n_lon = 0
             qd = vl = qs = (None, None)
 
-        self.rls_lat.theta = list(lat)
-        self.rls_lat.count = n_lat
+        p0 = min(p.p0 * inflate, p.p_max)
+        self.lat_bank.seed(lat, n_lat, p0)
         self.qs_lo, self.qs_hi = qs
         if lon[0] > p.b0_min:
-            self.rls_lon.theta = list(lon)
-            self.rls_lon.count = n_lon
+            self.lon_bank.seed(lon, n_lon, p0)
             self.qd_lo, self.qd_hi = qd
             self.vl_lo, self.vl_hi = vl
         else:
-            self.rls_lon.theta = [p.prior_b0, 0.0, 0.0]
-            self.rls_lon.count = 0
+            self.lon_bank.seed([p.prior_b0, 0.0, 0.0, 0.0], 0, p0)
             self.qd_lo = self.qd_hi = self.vl_lo = self.vl_hi = None
-        p0 = min(p.p0 * inflate, p.p_max)
-        for rls in (self.rls_lat, self.rls_lon):
-            for i in range(rls.n):
-                for j in range(rls.n):
-                    rls.P[i][j] = p0 if i == j else 0.0
+        for key, bank in (('lat_delay', self.lat_bank),
+                          ('lon_delay', self.lon_bank)):
+            if finite(d.get(key, float('nan'))):
+                bank.set_delay(float(d[key]))
         return True
 
     def _running_sigma(self):

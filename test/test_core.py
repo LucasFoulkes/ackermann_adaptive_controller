@@ -658,7 +658,7 @@ def test_normal_cruise_is_not_mistaken_for_a_stall():
 
 # The model actually learned on the robot, which made it lurch. b2 is
 # POSITIVE: the model believed going faster makes you accelerate harder.
-ROBOT_BAD_LON = [2.601463431608965, -0.08290769855274661, 4.583415448717575]
+ROBOT_BAD_LON = [2.601463431608965, -0.08290769855274661, 4.583415448717575, 0.0]
 ROBOT_BAD_LAT = [0.243002130697819, -0.032426081319866, 0.136622565150797]
 
 
@@ -811,7 +811,7 @@ def test_unready_model_is_not_inverted():
     plant = Plant()
     t = settle_sense(core, plant)
     # plant garbage into the model, as single-speed driving did on the robot
-    core.rls_lon.theta = [2.6, -0.08, 4.58]
+    core.rls_lon.theta = [2.6, -0.08, 4.58, 0.0]
     core.rls_lon.count = 500                 # plenty of samples...
     assert not core.ready_lon                # ...but no span: not ready
     plant.v = 0.5
@@ -1078,23 +1078,33 @@ def test_no_full_lock_while_stationary():
     assert abs(us) > core.policy.steer_standstill + 0.2, us
 
 
-def test_learned_throttle_model_is_not_inverted_by_default():
-    """A badly-fitted gain must not reach the wheels. Plant the low gain the
-    robot actually learned (b0 ~ 1.2 vs a free-rolling ~6) and mark the
-    model ready: the throttle must still come from the prior."""
+def test_ready_throttle_model_is_inverted_and_unready_is_not():
+    """The learned longitudinal model drives the wheels once it has EARNED
+    it (ready_lon: count and spans), and not a tick before. The old
+    permanent distrust existed because the fit was poisoned by the dead
+    band; that is compensated now and the fit is sane on hardware."""
     core = AdaptiveCore()
     settle_sense(core, Plant())
-    core.rls_lon.theta = [1.2, -1.0, 0.0]
+    core.rls_lon.theta = [3.0, 0.0, 0.0, -0.4]
     core.rls_lon.count = 10_000
-    core.qd_lo, core.qd_hi = 0.0, 0.8
-    core.vl_lo, core.vl_hi = 0.0, 0.8
-    assert core.ready_lon
     core.v = core.v_fb = 0.1
     core.rolling = True                     # 0.1 m/s is past the latch
     core.iv = 0.0
+    # no spans yet: not ready -> prior gain
+    assert not core.ready_lon
+    core.now += 10.0
     _, ud = core._run(0.1, 0.32, 0.0, 0.1)
-    expected = core.policy.kp_v * (0.32 - 0.1) / core.policy.prior_b0
-    assert ud == pytest.approx(expected, abs=0.02), ud
+    prior_based = core.policy.kp_v * (0.32 - 0.1) / core.policy.prior_b0
+    assert ud == pytest.approx(prior_based, abs=0.02), ud
+    # spans covered: ready -> the learned gain takes over
+    core.qd_lo, core.qd_hi = 0.0, 0.8
+    core.vl_lo, core.vl_hi = -0.4, 0.8      # both directions: b3 usable
+    assert core.ready_lon
+    core.prev_ud = 0.0
+    _, ud = core._run(0.1, 0.32, 0.0, 0.1)
+    a_des = core.policy.kp_v * (0.32 - 0.1)
+    expected = (a_des - (-0.4) * 1.0) / 3.0  # Coulomb feedforward included
+    assert ud == pytest.approx(expected, abs=0.03), ud
 
 
 def test_steering_gain_is_identified_through_a_real_delay():
@@ -1132,18 +1142,23 @@ def test_unaligned_regression_is_worse_on_a_delayed_plant():
 def test_yaw_trim_does_not_wind_up_while_saturated_or_stationary():
     core = AdaptiveCore()
     settle_sense(core, Plant())
+    # core.now advances so the transport-delay settling window (which also
+    # freezes the trim, deliberately) expires and each GUARD is what holds.
     core.prev_us = 1.0                      # servo at lock
     core.v = core.v_fb = 0.3
     for _ in range(50):
+        core.now += 0.1
         core._run(0.3, 0.32, 3.0, 0.1)      # impossible yaw demand
     assert abs(core.iw) < 1e-9
     core.prev_us = 0.3                      # not saturated, but stationary
     core.v = core.v_fb = 0.0
     for _ in range(50):
+        core.now += 0.1
         core._run(0.0, 0.32, 1.0, 0.1)
     assert abs(core.iw) < 1e-9
     core.v = core.v_fb = 0.3                # rolling, unsaturated: trims
     for _ in range(50):
+        core.now += 0.1
         core._run(0.3, 0.32, 0.3, 0.1)
     assert 0.0 < abs(core.iw) <= core.policy.iw_max + 1e-9
 
@@ -1253,7 +1268,7 @@ def test_v1_state_loads_parameters_but_not_evidence():
 def test_wrong_signed_throttle_model_is_replaced_by_the_prior_on_save():
     core = AdaptiveCore()
     settle_sense(core, Plant())
-    core.rls_lon.theta = [-0.9, 0.0, 2.8]   # what the robot actually saved
+    core.rls_lon.theta = [-0.9, 0.0, 2.8, 0.0]  # what the robot once saved
     core.rls_lon.count = 500
     assert core.plausible()                 # the steering model is fine...
     assert not core.lon_plausible()         # ...the throttle one is not
@@ -1261,5 +1276,310 @@ def test_wrong_signed_throttle_model_is_replaced_by_the_prior_on_save():
     assert saved['longitudinal'][0] == core.policy.prior_b0
     assert saved['n_lon'] == 0
     fresh = AdaptiveCore()
-    assert fresh.load_state(dict(saved, longitudinal=[-0.9, 0.0, 2.8]))
+    assert fresh.load_state(dict(saved, longitudinal=[-0.9, 0.0, 2.8, 0.0]))
     assert fresh.model.b0 == core.policy.prior_b0
+
+
+# -- regression: the throttle dead band is learned, not configured ---------
+
+def _start_stop_cycles(core, plant, t, cycles, cmd=0.3, on=6.0, off=2.5):
+    """Repeated launches from rest. Returns per-cycle time to 0.1 m/s."""
+    times = []
+    for _ in range(cycles):
+        t_on = t
+        reached = None
+        n = int(on / 0.1)
+        for _ in range(n):
+            x, y, psi = plant.observe()
+            out = core.step(t, x, y, psi, cmd, 0.0)
+            for _ in range(5):
+                plant.step(out.steer, out.drive, 0.02)
+            t += 0.1
+            if reached is None and abs(plant.v) > 0.1:
+                reached = t - t_on
+        times.append(reached if reached is not None else on)
+        _, t = drive(core, plant, lambda s: (0.0, 0.0), off, t0=t)
+        plant.v = 0.0                       # friction brings it to rest
+    return times, t
+
+
+def test_dead_band_is_learned_from_starts_and_compensated():
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.deadband = 0.30                   # nothing happens below 0.30
+    plant.kinetic = 0.2
+    t = settle_sense(core, plant)
+    times, t = _start_stop_cycles(core, plant, t, cycles=8)
+    assert core.deadband.confirmed(1.0)
+    learned = core.deadband.fwd.value
+    # measured at the wire lon_delay before motion: close to the effective
+    # breakaway (dead-zone offset plus stiction over the gain), never above
+    # it by more than the ramp x latency bias
+    eff = plant.deadband + plant.kinetic / plant.b0
+    assert learned == pytest.approx(eff, abs=0.08)
+    applied = core.deadband.value(1.0)
+    assert 0.0 < applied < eff              # a fraction: cannot move the car alone
+    # later starts are faster than the bootstrap ones
+    assert max(times[-3:]) < min(times[:2])
+    # ...and those fast starts added NO samples: only slow starts measure.
+    # Otherwise the estimate feeds on its own output and creeps upward.
+    n_slow = sum(x > core.policy.deadband_slow_start for x in times)
+    assert len(core.deadband.fwd.vals) == n_slow
+    # zero command still means zero on the wire
+    x, y, psi = plant.observe()
+    out = core.step(t + 0.1, x, y, psi, 0.0, 0.0)
+    assert out.drive == 0.0
+
+
+def test_dead_band_is_per_direction():
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.deadband = 0.25
+    t = settle_sense(core, plant)
+    # more cycles than evidence needs: once the longitudinal inversion
+    # engages, starts speed up and stop qualifying as slow samples
+    _start_stop_cycles(core, plant, t, cycles=10, cmd=-0.3)
+    assert core.deadband.confirmed(-1.0)
+    assert not core.deadband.confirmed(1.0)
+    assert core.deadband.value(1.0) == 0.0
+
+
+def test_dead_band_persists_and_is_optional_in_old_state_files():
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.deadband = 0.25
+    t = settle_sense(core, plant)
+    _start_stop_cycles(core, plant, t, cycles=5)
+    saved = core.state()
+    fresh = AdaptiveCore()
+    assert fresh.load_state(saved)
+    assert fresh.deadband.value(1.0) == pytest.approx(core.deadband.value(1.0))
+    without = {k: v for k, v in saved.items() if k != 'deadband'}
+    assert AdaptiveCore().load_state(without)
+    bad = dict(saved, deadband={'fwd': [1.5], 'rev': []})
+    assert not AdaptiveCore().load_state(bad)
+
+
+# -- regression: Coulomb term, learned delays, learned start feedforward ----
+
+def test_coulomb_friction_is_identified_not_leaked_into_the_gain():
+    """Without b3*sgn(v), drivetrain friction leaks into b0/b1 and the fit
+    goes to a negative gain on hardware. With it, both come out right."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.kinetic = 0.35
+    t = settle_sense(core, plant)
+    for speed in (0.35, 0.6, -0.35, -0.6, 0.45, -0.45):
+        _, t = drive(core, plant, lambda s, u=speed: (u, 0.0), 20.0, t0=t)
+    m = core.model
+    assert m.b0 == pytest.approx(plant.b0, rel=0.35)
+    assert m.b3 < -0.1                       # friction found, right sign
+    assert m.b3 == pytest.approx(-plant.kinetic, abs=0.2)
+
+
+def test_the_command_to_response_delay_is_learned():
+    """Two plants, one snappy and one laggy: the delay banks must diverge
+    the right way, without either model losing the gain."""
+    fast = AdaptiveCore()
+    pf = Plant()                             # only the 0.18 s actuator filter
+    t = settle_sense(fast, pf)
+    drive(fast, pf,
+          lambda s: (0.55, 0.7 * math.sin(2.0 * math.pi * 0.15 * s)),
+          120.0, t0=t)
+    slow = AdaptiveCore()
+    ps = Plant()
+    ps.delay = 0.4                           # plus a real transport delay
+    t = settle_sense(slow, ps)
+    drive(slow, ps,
+          lambda s: (0.55, 0.7 * math.sin(2.0 * math.pi * 0.15 * s)),
+          120.0, t0=t)
+    assert fast.lat_bank.delay < slow.lat_bank.delay
+    assert fast.model.a0 == pytest.approx(pf.a0, rel=0.4)
+    assert slow.model.a0 == pytest.approx(ps.a0, rel=0.4)
+
+
+def test_start_feedforward_is_the_learned_breakaway_not_a_preset():
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.deadband = 0.30
+    plant.kinetic = 0.2
+    t = settle_sense(core, plant)
+    _, t2 = _start_stop_cycles(core, plant, t, cycles=10)
+    assert core.deadband.confirmed(1.0)
+    median = core.deadband.fwd.value
+    # from rest, the very first commanded tick puts the wire AT LEAST at the
+    # measured median (the inversion may reasonably ask for more)
+    x, y, psi = plant.observe()
+    out = core.step(t2 + 0.1, x, y, psi, 0.3, 0.0)
+    assert out.drive >= median - 0.06
+    assert out.drive > core.policy.launch_floor  # not the bootstrap preset
+
+
+def test_trim_holds_during_the_learned_response_delay():
+    """A curvature step must not wind the trim while the car cannot yet
+    have responded -- that lag is transport delay, not steering error."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.delay = 0.4
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.5, 0.0), 12.0, t0=t)
+    iw0 = core.iw                            # steady trim from the cruise
+    # step the yaw command; sample iw within the settling window
+    for k in range(3):                       # 0.3 s < delay + tau_s
+        x, y, psi = plant.observe()
+        out = core.step(t + 0.1 * (k + 1), x, y, psi, 0.5, 0.5)
+        for _ in range(5):
+            plant.step(out.steer, out.drive, 0.02)
+    assert core.iw == pytest.approx(iw0, abs=0.01)  # froze through the dead time
+
+
+def test_pre_coulomb_state_files_still_load():
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    drive(core, plant, lambda s: (0.5, 0.3), 30.0, t0=t)
+    saved = core.state()
+    assert len(saved['longitudinal']) == 4
+    legacy = dict(saved, longitudinal=[2.4, 0.1, -0.3])   # 3-param era
+    fresh = AdaptiveCore()
+    assert fresh.load_state(legacy)
+    assert fresh.model.b0 == pytest.approx(2.4)
+    assert fresh.model.b3 == 0.0
+    assert fresh.lat_bank.delay == pytest.approx(saved['lat_delay'])
+
+
+# -- regression: lying odometry (the 11:56 LiDAR-USB incident) --------------
+
+def test_a_single_odometry_spike_holds_the_wire():
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    out, t = drive(core, plant, lambda s: (0.4, 0.0), 15.0, t0=t)
+    held = out.drive
+    n = core.model.n_lon
+    # one teleported pose (impossible acceleration), then normal again
+    x, y, psi = plant.observe()
+    out = core.step(t + 0.1, x + 0.4, y, psi, 0.4, 0.0)
+    assert out.drive == held                # rode through, no jerk to zero
+    assert core.model.n_lon == n            # and learned nothing from it
+    assert core.odom_ok
+    out, _ = drive(core, plant, lambda s: (0.4, 0.0), 3.0, t0=t + 0.2)
+    assert core.odom_ok and abs(plant.v - 0.4) < 0.1
+
+
+def test_sustained_garbage_odometry_stops_the_robot_and_the_learning():
+    import random
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.4, 0.0), 15.0, t0=t)
+    theta = list(core.rls_lon.theta) + list(core.rls_lat.theta)
+    rng = random.Random(3)
+    out = None
+    for _ in range(30):                     # 3 s of a jumping scan matcher
+        t += 0.1
+        x, y, psi = plant.observe()
+        out = core.step(t, x + rng.uniform(-0.3, 0.3),
+                        y + rng.uniform(-0.3, 0.3),
+                        psi + rng.uniform(-0.3, 0.3), 0.4, 0.0)
+    assert not core.odom_ok
+    assert out.drive == 0.0 and out.steer == 0.0
+    assert list(core.rls_lon.theta) + list(core.rls_lat.theta) == theta
+    # the stream comes back: sane for odom_recover_time, then drives again
+    plant.v = 0.0
+    for _ in range(25):
+        t += 0.1
+        x, y, psi = plant.observe()
+        core.step(t, x, y, psi, 0.0, 0.0)
+    assert core.odom_ok
+    out, _ = drive(core, plant, lambda s: (0.4, 0.0), 10.0, t0=t)
+    assert plant.v > 0.25
+
+
+# -- regression: the learned inversion must not double-compensate -----------
+
+def test_learned_inversion_does_not_double_compensate_the_dead_band():
+    """On the robot, cruise ran at 1.37x the command the moment ready_lon
+    engaged: the inversion's output is a WIRE value (the model is fit on
+    the wire), and compensate() then added the dead-band offset again."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.deadband = 0.25
+    plant.kinetic = 0.3
+    t = settle_sense(core, plant)
+    # learn everything: dead band, model, spans (forward and reverse)
+    times, t = _start_stop_cycles(core, plant, t, cycles=5)
+    _, t = drive(core, plant, lambda s: (-0.35, 0.0), 20.0, t0=t)
+    _, t = drive(core, plant, lambda s: (0.45, 0.0), 20.0, t0=t)
+    assert core.deadband.confirmed(1.0)
+    assert core.ready_lon and core.policy.use_learned_lon
+    # long steady cruise with the inversion engaged: speed must match
+    for cmd in (0.3, 0.45):
+        _, t = drive(core, plant, lambda s, c=cmd: (c, 0.0), 25.0, t0=t)
+        assert plant.v == pytest.approx(cmd, abs=0.08), (cmd, plant.v)
+
+
+# -- regression: the inversion must be consistent with its own fit ----------
+
+def test_inversion_uses_the_fitted_sum_even_with_an_ugly_split():
+    """At one cruise speed b1/b2/b3 are nearly collinear: the split is
+    arbitrary, the sum is not. The old sign clamps zeroed a fitted b2 > 0
+    out of the inversion and cruise ran 15%+ over the commanded speed on
+    the robot. Plant a weird-but-consistent split of the true map and the
+    closed loop must still settle exactly on the command."""
+    core = AdaptiveCore()
+    plant = Plant()                          # truth: 2.2*w - 0.35*v|v|
+    t = settle_sense(core, plant)
+    # a split that matches the truth at v = 0.3 but has b2 WRONG-signed:
+    # truth at 0.3: bias terms = -0.35*0.09 = -0.0315
+    # planted:      b1 + b2*0.09 + b3 = -0.4215 + 1.0*0.09 + 0.3*... 
+    core.rls_lon.theta = [2.2, -0.4215, +1.0, 0.3]
+    core.rls_lon.count = 10_000
+    core.qd_lo, core.qd_hi = 0.0, 0.8
+    core.vl_lo, core.vl_hi = 0.20, 0.40      # fitted only around cruise
+    for r in core.lon_bank.bank:             # freeze the planted split:
+        r.theta = list(core.rls_lon.theta)   # zero covariance = zero gain
+        for i in range(r.n):
+            for j in range(r.n):
+                r.P[i][j] = 1e-12 if i == j else 0.0
+    assert core.ready_lon
+    _, t = drive(core, plant, lambda s: (0.3, 0.0), 30.0, t0=t)
+    assert plant.v == pytest.approx(0.3, abs=0.03), plant.v
+
+
+# -- regression: the model feedforward must not become feedback -------------
+
+def test_feedforward_at_the_setpoint_does_not_surge_with_a_fat_b2():
+    """Evaluated at measured v, the b2 term added gain 2*b2*v/b0 on top of
+    kp; with the collinearity-inflated b2 the robot actually fitted (+2)
+    and a real actuator delay, the loop limit-cycled at ~1 Hz -- the
+    "walks in steps" gait. At the setpoint it is feedforward and the
+    cruise must be smooth AND on the commanded speed."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.delay = 0.35
+    t = settle_sense(core, plant)
+    # consistent at v=0.3 with a wildly positive b2 (sum matches truth)
+    core.rls_lon.theta = [2.2, -0.2115, +2.0, 0.0]
+    core.rls_lon.count = 10_000
+    core.qd_lo, core.qd_hi = 0.0, 0.8
+    core.vl_lo, core.vl_hi = 0.20, 0.40
+    for r in core.lon_bank.bank:
+        r.theta = list(core.rls_lon.theta)
+        for i in range(r.n):
+            for j in range(r.n):
+                r.P[i][j] = 1e-12 if i == j else 0.0
+    assert core.ready_lon
+    _, t = drive(core, plant, lambda s: (0.3, 0.0), 20.0, t0=t)
+    vs = []
+    for _ in range(100):                     # 10 s of steady cruise
+        t += 0.1
+        x, y, psi = plant.observe()
+        out = core.step(t, x, y, psi, 0.3, 0.0)
+        for _ in range(5):
+            plant.step(out.steer, out.drive, 0.02)
+        vs.append(plant.v)
+    mean = sum(vs) / len(vs)
+    dev = max(abs(x - mean) for x in vs)
+    assert mean == pytest.approx(0.3, abs=0.04), mean
+    assert dev < 0.06, dev                   # no surge-stall oscillation

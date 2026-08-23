@@ -34,7 +34,7 @@ identified online by recursive least squares.
 Two learned sub-models, both linear in their parameters:
 
 ```
-longitudinal   vdot     = b0*qd + b1 + b2*v*|v|
+longitudinal   vdot     = b0*qd + b1 + b2*v*|v| + b3*sgn(v)
 lateral        psidot/v = a0*qs + a1 + a2*qs*v^2
 ```
 
@@ -131,7 +131,8 @@ robot was off. The learner's readiness (sample counts and excitation spans)
 travels with it, so a restored steering model is inverted immediately rather
 than after 60 fresh samples. A throttle fit with the wrong sign (`b0 < 0`,
 which the dead-band actuator can produce) is replaced by the prior on save;
-it never drove the wheels anyway (`use_learned_lon: false`).
+at the time it did not drive the wheels (`use_learned_lon` was off until
+the dead band and Coulomb term made the fit trustworthy).
 
 `~/min_turning_radius` (`std_msgs/Float32`) carries the current value, and
 `/diagnostics` reports `envelope`, `envelope_evidence` and
@@ -154,6 +155,43 @@ extrapolation to planning speed drifts. In a bench run against a synthetic
 plant, a fixed-speed slalom recovered `a0 = 0.92` against a true `1.30`; the
 same slalom with the speed swept recovered `1.27`, and the learned radius
 settled at 0.89 m against a true 0.79 m.
+
+## The delays and the friction are learned too
+
+`b3*sgn(v)` is Coulomb friction. Without it, drivetrain friction leaks into
+`b0`/`b1` and the longitudinal fit converges to nonsense (a negative gain was
+observed on hardware); with it, the gain and the friction come out separately.
+The Coulomb feedforward is only used in the inversion once both directions
+have fed the fit — one-sided data cannot separate `b3` from the bias `b1`.
+
+The command-to-response delay each model aligns to is not configured either:
+each axis runs a small bank of identical estimators at candidate delays
+(`lat_delay`/`lon_delay` are just the initial centers) and control follows
+whichever currently predicts best, scored by exponentially-weighted
+prediction error with switching hysteresis. The learned lateral delay also
+sizes the trim freeze window: after the commanded curvature changes, the yaw
+error is pure transport delay for one delay + servo constant, and the trim
+integrator holds instead of winding up on it. `/diagnostics` reports
+`learned_delays`.
+
+## The throttle dead band is learned too
+
+A brushed motor behind an H-bridge does nothing for the first part of its
+command range, and the flight logs put this robot's breakaway at 0.18–0.38
+with a median of 0.24. Rather than configure that, every start measures it:
+the throttle that was on the wire `lon_delay` seconds before the wheels first
+turned is a dead-band sample in the direction the car moved. A median window
+per direction (`deadband_evidence` starts before it counts) is the estimate,
+and `deadband_trust` of it is applied as a **static** offset at the output —
+`d + |u|·(1 − d)` — so the PI sees a linear motor and no longer climbs the
+dead zone on each launch. Being a fraction, the offset can never move a
+stopped car by itself; being static, there is nothing to unwind after
+breakaway (the old "launch kick" lived in the integrator and lunged).
+Starts get the **full** learned median as feedforward — the wire goes
+straight to the measured breakaway when motion is commanded and the car is
+not yet rolling, so the integrator only tops up the spread. Until there is
+evidence, `launch_floor` is the bootstrap, exactly as `prior_a0` is for the
+envelope. `/diagnostics` reports `deadband`.
 
 ## Things to measure before trusting it
 

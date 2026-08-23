@@ -60,6 +60,9 @@ POLICY_PARAMS = (
     'max_drive_rate', 'blocked_after', 'blocked_release',
     'env_qs_threshold', 'env_evidence', 'env_derate', 'env_speed',
     'radius_floor', 'radius_ceiling',
+    'deadband_evidence', 'deadband_trust', 'deadband_max',
+    'delay_spread', 'delay_ew_tau', 'delay_switch_margin', 'iw_freeze_frac',
+    'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
 )
 _DEFAULTS = Policy()
 
@@ -503,6 +506,10 @@ class AckermannAdaptiveController(Node):
             status.level, status.message = DiagnosticStatus.ERROR, 'e-stopped'
         elif not self._odom_fresh():
             status.level, status.message = DiagnosticStatus.ERROR, 'no odometry'
+        elif not self.core.odom_ok:
+            status.level = DiagnosticStatus.ERROR
+            status.message = ('odometry implausible - outputs zeroed, '
+                              'learning suspended')
         elif self.core.steering_fault:
             status.level = DiagnosticStatus.ERROR
             status.message = 'steering gain collapsed - check the servo'
@@ -521,7 +528,12 @@ class AckermannAdaptiveController(Node):
             'sigma_v': f'{self.core.sigma_v:.4f}',
             'gate_d': f'{self.core.gate_d:.3f}',
             'lateral_a': f'{m.a0:.3f} {m.a1:.3f} {m.a2:.3f}',
-            'longitudinal_b': f'{m.b0:.3f} {m.b1:.3f} {m.b2:.3f}',
+            'longitudinal_b':
+                f'{m.b0:.3f} {m.b1:.3f} {m.b2:.3f} coulomb={m.b3:.3f}',
+            # command-to-response delays, learned (bank winner per axis)
+            'learned_delays':
+                f'lat={self.core.lat_bank.delay:.2f}s '
+                f'lon={self.core.lon_bank.delay:.2f}s',
             'samples': f'lat={m.n_lat} lon={m.n_lon}',
             'min_turning_radius':
                 f'{self.core.envelope.min_turning_radius(m):.3f}',
@@ -532,6 +544,13 @@ class AckermannAdaptiveController(Node):
                 f'left={len(self.core.envelope.left.vals)} '
                 f'right={len(self.core.envelope.right.vals)}',
             'breakaway': f'{self.core.breakaway:.3f}',
+            # learned throttle dead band: offset applied per direction and
+            # how many starts it rests on (0 until deadband_evidence)
+            'deadband':
+                f'fwd={self.core.deadband.value(1.0):.3f} '
+                f'rev={self.core.deadband.value(-1.0):.3f} '
+                f'starts fwd={len(self.core.deadband.fwd.vals)} '
+                f'rev={len(self.core.deadband.rev.vals)}',
             # what the learner has actually covered -- and whether that has
             # earned the model the right to be inverted
             'ready_lon': str(self.core.ready_lon),
@@ -541,6 +560,7 @@ class AckermannAdaptiveController(Node):
             'lat_span': ('none' if self.core.qs_lo is None else
                          f'qs {self.core.qs_lo:+.2f}..{self.core.qs_hi:+.2f}'),
             'blocked': str(self.core.blocked),
+            'odom_plausible': str(self.core.odom_ok),
             'steering': ('FAULT - gain collapsed'
                          if self.core.steering_fault else 'ok'),
             'model_plausible': str(self.core.plausible()),
