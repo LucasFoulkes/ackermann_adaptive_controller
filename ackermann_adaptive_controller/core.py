@@ -14,9 +14,16 @@ Three phases:
   quantization, heading noise. Every downstream threshold is derived from
   these numbers rather than guessed, which is what makes the same code work on
   a noisy 10 Hz LiDAR odometry and on clean wheel encoders.
-* ``CAL``    optional scripted wiggle to excite both axes quickly. Disabled by
-  default because it drives the robot autonomously; passive learning from
-  ordinary Nav2 commands reaches the same place given priors.
+* ``CAL``    scripted wiggle to excite both axes quickly. It drives the robot
+  on its own, so the CORE never enters it unasked (``enable_calibration``
+  is off); the node starts it on a fresh vehicle -- no state file, or after
+  a reset -- once the operator has armed the controller. Besides seeding
+  both fits it ESTABLISHES the signs: the steering sign from the learned
+  cells (an inverted servo is a vehicle, and is then defended against
+  later poison as the prior's sign used to be), and the throttle sign is
+  checked against the interface contract -- positive wire is forward -- and
+  refused, with the actuators held at zero, if the car went the other way
+  or did not move at all.
 * ``RUN``    invert the learned model, with integral trim riding *through* the
   inversion so the trim stays in physical units as the model changes.
 
@@ -244,6 +251,23 @@ class Policy:
     ready_lon_v_span_frac: float = 0.45
     ready_lat_samples: int = 60
     ready_lat_qs_span: float = 0.40
+    # Steering-sign establishment. The witness is the sign of the running
+    # sum of (delayed steering command x measured curvature) over accepted
+    # lateral samples with SUBSTANTIAL steering (|qs| of at least half
+    # ready_lat_qs_span: at trim-level wire the curvature is the trim a1,
+    # not the gain, and a straight drive with -0.02 of wire once witnessed
+    # an inverted servo on a correctly wired plant). The raw
+    # cross-correlation never passes through a prior; the fitted cells
+    # do -- on an inverted servo they travel from +prior through zero, and
+    # a vote taken on the way locked the wrong sign in the 08-29 bench
+    # run. Locked once sign_evidence such samples agree by at least
+    # sign_agreement of their total magnitude: 0.5 is three parts agreeing
+    # to one dissenting, which a shuffle transient (one poisoned cell of
+    # four) cannot reach. The CAL wiggle yields ~28 such samples at 10 Hz
+    # (5 s of wiggle, the settling window and the |qs| gate taken out), so
+    # 20 lets a fresh vehicle leave CAL with its sign known.
+    sign_evidence: int = 20
+    sign_agreement: float = 0.5
 
     # Inversion guards and limits.
     # Floor on the speed used to convert a yaw-rate command to curvature,
@@ -819,6 +843,9 @@ class CurvatureEnvelope:
         # driven yet) quotes the kinematic lock, which is the right answer
         # for a car that has not moved.
         self.v_op = 0.0
+        # The steering prior, SIGNED once the core has established the
+        # servo's direction (AdaptiveCore.prior_a0); kept current by it.
+        self.prior_a0 = policy.prior_a0
 
     @staticmethod
     def predict(model, qs, v):
@@ -870,7 +897,7 @@ class CurvatureEnvelope:
         # planner a 7 m radius and every path became a looping star.
         a0l, a0r, a0l_rev, a0r_rev = sane_gain_cells(
             (model.a0l, model.a0r, model.a0l_rev, model.a0r_rev),
-            self.p.prior_a0)
+            self.prior_a0)
         vv = model.a2 * v * v
         cells = [abs(model.a1 + a0l + vv), abs(model.a1 - a0r - vv)]
         if not forward:
@@ -1004,6 +1031,7 @@ class Output:
     envelope_confirmed: bool = False
     breakaway: float = 0.0
     steering_fault: bool = False
+    drive_fault: str = ''
     deadband_fwd: float = 0.0
     deadband_rev: float = 0.0
 
@@ -1153,6 +1181,21 @@ class AdaptiveCore:
         self.blocked = False
         self._failures = 0
         self.steering_fault = False
+        # Established signs. steer_sign is None until the learned cells
+        # have agreed unanimously on the servo's direction (CAL, or the
+        # first time the lateral model is ready); from then on the prior
+        # carries it and every tie or minority cell resolves to it, never
+        # to the sign the linkage was ASSUMED to have. Persisted. A reset
+        # forgets it: that is what a reset is for.
+        self.steer_sign = None
+        self._sign_num = 0.0     # sum of qs * kappa over accepted samples
+        self._sign_den = 0.0     # sum of |qs * kappa|
+        self._sign_n = 0
+        # The throttle sign is the interface contract (positive wire is
+        # forward), verified by CAL rather than compensated: a car that
+        # backs away from +0.42 wire, or does not move at all, is wiring,
+        # and the actuators are held at zero until a reset or another CAL.
+        self.drive_fault = ''
 
     def _enter(self, phase, t):
         self.phase = phase
@@ -1167,6 +1210,53 @@ class AdaptiveCore:
         wiggle either ended instantly or never.
         """
         self._enter(CAL, None)
+        self.drive_fault = ''
+
+    @property
+    def prior_a0(self):
+        """The steering prior with the ESTABLISHED sign, or as declared."""
+        p = self.policy
+        if self.steer_sign is None:
+            return p.prior_a0
+        return self.steer_sign * abs(p.prior_a0)
+
+    def _establish_sign(self):
+        """Lock the servo's direction from the command-curvature witness.
+
+        See Policy.sign_evidence. Until it locks, the declared prior's sign
+        stands (sane_gain_cells already believes a unanimous inversion in
+        the cells; establishment is what makes a LATER tie or minority
+        resolve to the real servo instead of the assumed one).
+        """
+        if self.steer_sign is not None:
+            return
+        p = self.policy
+        if self._sign_n < p.sign_evidence or self._sign_den <= 0.0:
+            return
+        r = self._sign_num / self._sign_den
+        if abs(r) < p.sign_agreement:
+            return
+        self.steer_sign = sgn(r)
+        self.envelope.prior_a0 = self.prior_a0
+        self._reseed_unexcited()
+
+    def _reseed_unexcited(self):
+        """Move cells that still sit at the declared seed onto the signed
+        prior, in every bank candidate. A cell nobody has driven yet holds
+        no evidence; left at +seed on an established-inverted car it read
+        as two strong votes for the wrong sign while the correctly learned
+        cells, sitting AT the (negative) prior, did not vote at all -- and
+        sane_gain_cells flipped the good cells (08-29 bench run, reverse
+        cells never driven)."""
+        seed = self.policy.prior_a0
+        signed = self.prior_a0
+        if signed == seed:
+            return          # the sign agrees with the seed: nothing to move
+        for r in self.lat_bank.bank:
+            for k in range(4):
+                if abs(r.theta[k] - seed) <= 0.1 * abs(seed):
+                    r.theta[k] = signed
+        self.lat_bank.prior = [signed] * 4 + list(self.lat_bank.prior[4:])
 
     def _a_limit(self):
         """Physics bound on plausible acceleration, from the learned model
@@ -1436,6 +1526,8 @@ class AdaptiveCore:
 
         # ---------- learn, gated by MEASURED noise ------------------------
         learning = self._learn(v)
+        if self.steer_sign is None:
+            self._establish_sign()
 
         # ---------- PHASE 2: CAL ------------------------------------------
         if self.phase == CAL:
@@ -1445,6 +1537,8 @@ class AdaptiveCore:
             return self._publish(us, ud, learning, False, dt)
 
         # ---------- PHASE 3: RUN ------------------------------------------
+        if self.drive_fault:
+            return self._safe_output()
         us, ud = self._run(self.v_fb, cmd_v, cmd_w, dt)
         us, ud, stalled = self._reflex(us, ud, self.v_fb, cmd_v, t, dt)
         return self._publish(us, ud, learning, stalled, dt)
@@ -1644,7 +1738,9 @@ class AdaptiveCore:
                 if v >= 0.0:
                     return [qsp, qsn, 0.0, 0.0, 1.0, d[0] * v * v]
                 return [0.0, 0.0, qsp, qsn, 1.0, d[0] * v * v]
-            if self.lat_bank.update(phi_lat, kappa, self.lam, self.dt):
+            accepted_lat = self.lat_bank.update(phi_lat, kappa, self.lam,
+                                                self.dt)
+            if accepted_lat:
                 ok = True
                 self.qs_lo, self.qs_hi = _span(self.qs_lo, self.qs_hi,
                                                self.qs)
@@ -1653,9 +1749,16 @@ class AdaptiveCore:
             # Same regressor (the ACTIVE delay's command) as the model, or
             # the ratio compares a command the car has not responded to yet
             # against the curvature it is still doing from an earlier one.
+            # Third use: the steering-sign witness (Policy.sign_evidence).
             d = self._delayed_cmd(self.lat_bank.delay)
             if d is not None:
                 self.envelope.observe(d[0], kappa, v, self.model)
+                if accepted_lat and self.steer_sign is None \
+                        and abs(d[0]) >= 0.5 * self.policy.ready_lat_qs_span:
+                    w = d[0] * kappa
+                    self._sign_num += w
+                    self._sign_den += abs(w)
+                    self._sign_n += 1
         return ok
 
     def _cal(self, tc):
@@ -1668,7 +1771,24 @@ class AdaptiveCore:
         return us, p.cal_drive
 
     def _finish_cal(self, t):
-        """Size the dither from measurements, seen THROUGH the learned gain."""
+        """Establish the signs, then size the dither from measurements,
+        seen THROUGH the learned gain.
+
+        Throttle: the wiggle has held cal_drive on the wire for five
+        seconds by now, so the held speed says which way the car answers a
+        positive wire. Backwards is an inverted drive; under the motion
+        gate is a car that did not move (dead motor, dead band above
+        cal_drive, or a brake). Neither is learnable, both are a fault.
+        """
+        v = self._held_speed()
+        if abs(v) <= self.gate_d:
+            self.drive_fault = 'no motion from +%.2f wire' % self.policy.cal_drive
+        elif v < 0.0:
+            self.drive_fault = 'inverted: +%.2f wire drove %.2f m/s' % (
+                self.policy.cal_drive, v)
+        else:
+            self.drive_fault = ''
+        self._establish_sign()
         b0 = self.rls_lon.theta[0]
         self.dither = clamp(
             5.0 * max(self.tick, self.sigma_v) * 4.4 / max(abs(b0), 1.0),
@@ -1764,13 +1884,14 @@ class AdaptiveCore:
         # prior gain instead of inverting it. The learner keeps running the
         # whole time; only the INVERSION waits for evidence.
         if not self.ready_lat:
-            a0l = a0r = a0l_rev = a0r_rev = p.prior_a0
+            a0l = a0r = a0l_rev = a0r_rev = self.prior_a0
             a1 = a2 = 0.0
         else:
             # A minority-sign cell is a poisoned fit, not a vehicle (see
-            # sane_gain_cells): steer that quadrant through the prior.
+            # sane_gain_cells): steer that quadrant through the (signed)
+            # prior.
             a0l, a0r, a0l_rev, a0r_rev = sane_gain_cells(
-                (a0l, a0r, a0l_rev, a0r_rev), p.prior_a0)
+                (a0l, a0r, a0l_rev, a0r_rev), self.prior_a0)
 
         # The net curvature the wire must produce picks the steering side,
         # and the direction the car is about to travel (v_eff's sign, which
@@ -1801,7 +1922,7 @@ class AdaptiveCore:
             # Fall back to the prior so the robot keeps steering: if the
             # actuator is alive the resulting yaw re-teaches the real gain,
             # and if it is dead nothing is lost.
-            den = p.prior_a0 if p.prior_a0 > p.den_min else 1.0
+            den = self.prior_a0 if abs(self.prior_a0) > p.den_min else 1.0
             if not self.steering_fault:
                 self.get_fault_reset()
             self.steering_fault = True
@@ -2065,6 +2186,7 @@ class AdaptiveCore:
                       envelope_confirmed=self.envelope.confirmed,
                       breakaway=self.breakaway,
                       steering_fault=self.steering_fault,
+                      drive_fault=self.drive_fault,
                       deadband_fwd=self.deadband.value(1.0),
                       deadband_rev=self.deadband.value(-1.0))
 
@@ -2085,6 +2207,7 @@ class AdaptiveCore:
                       envelope_confirmed=self.envelope.confirmed,
                       breakaway=self.breakaway,
                       steering_fault=self.steering_fault,
+                      drive_fault=self.drive_fault,
                       deadband_fwd=self.deadband.value(1.0),
                       deadband_rev=self.deadband.value(-1.0))
 
@@ -2098,6 +2221,7 @@ class AdaptiveCore:
                       envelope_confirmed=self.envelope.confirmed,
                       breakaway=self.breakaway,
                       steering_fault=self.steering_fault,
+                      drive_fault=self.drive_fault,
                       deadband_fwd=self.deadband.value(1.0),
                       deadband_rev=self.deadband.value(-1.0))
 
@@ -2124,7 +2248,7 @@ class AdaptiveCore:
         # AND sign-consistent: one collapsed or flipped cell saved to disk
         # is a permanent can't-turn-that-way car, and the 08-23 -0.09 cell
         # was being re-saved every 30 s while it steered inverted.
-        consistent = list(sane_gain_cells(raw, self.policy.prior_a0)) \
+        consistent = list(sane_gain_cells(raw, self.prior_a0)) \
             == list(raw)
         return (finite(*spans)
                 and min(spans) > self.policy.den_min
@@ -2198,6 +2322,8 @@ class AdaptiveCore:
             # The scale every speed-shaped gate is a fraction of. Restored
             # so a rebooted car does not start with its gates at zero.
             'v_op': self.v_op,
+            # The servo's established direction (+1/-1), or None.
+            'steer_sign': self.steer_sign,
         }
 
     def load_state(self, d, inflate=1.0):
@@ -2270,11 +2396,22 @@ class AdaptiveCore:
         # Where the restored throttle fit is judged: the same scale
         # lon_sane and readiness use, clamped into the span as they are.
         judge_v = self.v_op or max(abs(vl[0] or 0.0), abs(vl[1] or 0.0))
+        # The established steering sign comes BEFORE the cells are judged:
+        # it is what a persisted tie resolves to.
+        sign = d.get('steer_sign')
+        self.steer_sign = float(sign) if sign in (1, -1, 1.0, -1.0) else None
+        self.envelope.prior_a0 = self.prior_a0
+        if self.steer_sign is not None and self.prior_a0 != p.prior_a0:
+            # Cells the file still carries at the declared seed are
+            # unexcited, not evidence (see _reseed_unexcited).
+            seed = p.prior_a0
+            lat = [self.prior_a0 if abs(c - seed) <= 0.1 * abs(seed) else c
+                   for c in lat[:4]] + list(lat[4:])
         # A file can carry poisoned cells (it did: 08-28, a 2-2 sign split
         # saved under the old tie rule and restored on every launch that
         # day). Seed the learner from the sanitised cells so it does not
         # START inverted and have to unlearn its way back through zero.
-        lat = list(sane_gain_cells(lat[:4], p.prior_a0)) + list(lat[4:])
+        lat = list(sane_gain_cells(lat[:4], self.prior_a0)) + list(lat[4:])
         self.lat_bank.seed(lat, n_lat, p0)
         self.qs_lo, self.qs_hi = qs
         if lon[2] > 0.0:

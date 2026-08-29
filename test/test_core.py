@@ -2245,3 +2245,99 @@ def test_old_state_file_with_a_polluted_span_does_not_set_the_gates():
     fresh.step(t + 0.1, *plant.observe(), 0.32, 0.0)
     assert fresh.v_op == pytest.approx(0.32)
     assert fresh.gate_d == pytest.approx(0.15, rel=0.05)
+
+
+# -- bootstrap on an unknown vehicle: CAL establishes the signs ---------------
+
+def test_calibration_establishes_an_inverted_steering_sign_and_defends_it():
+    """The servo turns the other way from the declared prior. CAL's wiggle
+    teaches the forward cells negative; the sign is then ESTABLISHED, so a
+    later persisted 2-2 split resolves to the real servo, where the old
+    rule resolved it to the prior's sign -- a permanently inverted car."""
+    core = AdaptiveCore(Policy(enable_calibration=True))
+    plant = Plant(a=(-1.30, 0.04, 0.30))
+    t = settle_sense(core, plant)
+    assert core.phase == CAL and core.steer_sign is None
+    out, t = drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
+    assert core.phase == RUN
+    assert not core.drive_fault
+    # the wiggle alone is enough: the sign is known before the first leg
+    assert core.steer_sign == -1.0, (core._sign_n, core._sign_num, core.model)
+    assert core.prior_a0 < 0.0
+    # persisted, and a tie in the file resolves to the established sign
+    saved = core.state()
+    assert saved['steer_sign'] == -1.0
+    tie = dict(saved, lateral=[+2.17, -4.55, -2.50, +4.32, 0.0, -0.3])
+    fresh = AdaptiveCore()
+    assert fresh.load_state(tie)
+    assert fresh.steer_sign == -1.0
+    assert all(c < 0.0 for c in fresh.rls_lat.theta[:4]), fresh.rls_lat.theta
+    # ...whereas without the established sign the same tie went positive
+    naive = AdaptiveCore()
+    assert naive.load_state(dict(tie, steer_sign=None))
+    assert all(c > 0.0 for c in naive.rls_lat.theta[:4])
+    # and the restored inverted car steers correctly from the first tick,
+    # before it is ready: the bootstrap gain carries the sign
+    fresh.v = fresh.v_fb = 0.4
+    fresh.rls_lat.count = 0
+    us, _ = fresh._run(0.4, 0.3, 0.5, 0.1)    # left turn on an inverted servo
+    assert us < 0.0, us
+
+
+def test_sign_is_established_from_ordinary_driving_too():
+    core = AdaptiveCore()
+    plant = Plant(a=(-1.30, 0.04, 0.30))
+    t = settle_sense(core, plant)
+    drive(core, plant,
+          lambda s: (0.6, 0.5 * math.sin(2.0 * math.pi * 0.10 * s)), 90.0, t0=t)
+    assert core.ready_lat and core.steer_sign == -1.0
+    # a correctly wired car establishes + just the same (and nothing is
+    # locked before there is driving to witness)
+    core2 = AdaptiveCore()
+    plant2 = Plant(a=(1.30, 0.04, -0.30))
+    t = settle_sense(core2, plant2)
+    assert core2.steer_sign is None and core2.prior_a0 > 0.0
+    drive(core2, plant2,
+          lambda s: (0.6, 0.5 * math.sin(2.0 * math.pi * 0.10 * s)), 30.0, t0=t)
+    assert core2.steer_sign == 1.0
+
+
+def test_sign_is_not_established_from_a_split_vote():
+    """The witness is the command-curvature correlation, not the fitted
+    cells (which travel through the prior's sign on their way to an
+    inverted one). Disagreeing evidence waits; agreeing evidence locks."""
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    p = core.policy
+    # 60 samples, 60% of the magnitude one way: below the agreement bar
+    core._sign_num, core._sign_den, core._sign_n = 0.2 * 60, 60.0, 60
+    core._establish_sign()
+    assert core.steer_sign is None
+    # three parts to one the other way: locked, whatever the cells say
+    core.rls_lat.theta = [1.06, 0.87, 1.25, 1.25, 0.0, -0.3]   # still in transit
+    core._sign_num, core._sign_den, core._sign_n = -0.5 * 60, 60.0, 60
+    core._establish_sign()
+    assert core.steer_sign == -1.0
+    assert core.prior_a0 == -abs(p.prior_a0)
+
+
+def test_calibration_refuses_an_inverted_or_dead_throttle():
+    for label, b in (('inverted', (-2.20, 0.0, -0.35)), ('dead', (0.0, 0.0, -0.35))):
+        core = AdaptiveCore(Policy(enable_calibration=True))
+        plant = Plant(b=b)
+        t = settle_sense(core, plant)
+        out, t = drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
+        assert core.phase == RUN
+        assert core.drive_fault, label
+        assert (label in core.drive_fault) or ('no motion' in core.drive_fault)
+        out, t = drive(core, plant, lambda s: (0.5, 0.0), 5.0, t0=t)
+        assert out.drive == 0.0 and out.steer == 0.0 and out.drive_fault
+        # a reset, or asking for calibration again, clears it
+        core.start_cal()
+        assert not core.drive_fault
+    # and a healthy car passes
+    core = AdaptiveCore(Policy(enable_calibration=True))
+    plant = Plant()
+    t = settle_sense(core, plant)
+    drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
+    assert core.phase == RUN and not core.drive_fault

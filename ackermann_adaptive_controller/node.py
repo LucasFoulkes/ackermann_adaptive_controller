@@ -66,7 +66,8 @@ POLICY_PARAMS = (
     'radius_floor_ratio', 'radius_ceiling_ratio',
     'deadband_evidence', 'deadband_trust', 'deadband_max',
     'deadband_slow_start', 'b0_min_frac', 'den_min_frac', 'p0', 'p_max',
-    'ready_lat_samples', 'ready_lat_qs_span', 'ready_lon_samples',
+    'ready_lat_samples', 'ready_lat_qs_span', 'sign_evidence',
+    'sign_agreement', 'ready_lon_samples',
     'ready_lon_qd_span', 'ready_lon_v_span_frac', 'stall_time',
     'blocked_retries', 'blocked_hold', 'odom_timeout_steps',
     'cal_steer', 'cal_drive',
@@ -122,6 +123,14 @@ class AckermannAdaptiveController(Node):
             ('estop_joy_topic', '/joy'),
             ('estop_button', 1),
             ('start_active', False),
+            # A vehicle with no learned state (no state file, or just
+            # reset) runs the CAL wiggle once, as soon as it is ACTIVE and
+            # SENSE has measured the noise floor. The wiggle drives the
+            # robot on its own; arming the controller is the consent. It
+            # is what establishes the signs on an unknown vehicle. This
+            # robot restores its state file at every boot, so it never
+            # fires here except after ~/reset.
+            ('calibrate_on_fresh_start', True),
             # Policy (see core.Policy for what each one means).
             *[(name, getattr(_DEFAULTS, name)) for name in POLICY_PARAMS],
             # Learned turning radius -> Nav2. Both plugins accept it live and
@@ -231,6 +240,7 @@ class AckermannAdaptiveController(Node):
         self._push_warned = False
         self._warned_implausible = False
         self._warned_fault = False
+        self._warned_drive_fault = False
         self.radius_filt = None
         self.lookahead_filt = None
         self.radius_alpha = float(g['radius_filter_alpha'])
@@ -265,7 +275,8 @@ class AckermannAdaptiveController(Node):
                 self.get_logger().info(f'flight log: {path}')
             except OSError as exc:
                 self.get_logger().warn(f'no flight log: {exc}')
-        self._load_state()
+        self._cal_on_fresh = bool(g['calibrate_on_fresh_start'])
+        self._cal_pending = self._cal_on_fresh and not self._load_state()
 
         self.active = bool(g['start_active'])
         self.estopped = False
@@ -441,6 +452,23 @@ class AckermannAdaptiveController(Node):
             applied=applied, v_meas=v_meas, psidot_meas=psidot_meas)
         self.out_steer, self.out_drive = out.steer, out.drive
 
+        # Fresh vehicle, armed, noise floor measured: calibrate once.
+        if self._cal_pending and self.active and not self.estopped \
+                and self.core.phase == RUN:
+            self._cal_pending = False
+            self.core.start_cal()
+            self.get_logger().warn(
+                'no learned state: calibration wiggle starting now to '
+                'establish the signs and seed the model; keep the area clear')
+        if out.drive_fault and not self._warned_drive_fault:
+            self.get_logger().error(
+                f'THROTTLE FAULT from calibration: {out.drive_fault}; '
+                'actuators held at zero (check wiring; ~/reset or '
+                '~/calibrate to try again)')
+            self._warned_drive_fault = True
+        elif not out.drive_fault:
+            self._warned_drive_fault = False
+
         if self._flight is not None:
             c = self.core
             m = c.model
@@ -570,9 +598,13 @@ class AckermannAdaptiveController(Node):
         self.core.reset()
         self.estopped = False
         self.active = False
+        self._cal_pending = self._cal_on_fresh
         self._zero_burst()
         resp.success = True
         resp.message = 'learner reset; mode PASSIVE; e-stop cleared'
+        if self._cal_pending:
+            resp.message += ('; the next set_active true runs the '
+                             'calibration wiggle (fresh vehicle)')
         self.get_logger().info(resp.message)
         return resp
 
@@ -756,24 +788,26 @@ class AckermannAdaptiveController(Node):
     # -- persistence -------------------------------------------------------
 
     def _load_state(self):
-        """Warm start, so the radius is not relearned from scratch each boot."""
+        """Warm start, so the radius is not relearned from scratch each boot.
+        Returns True if a model was restored (a fresh vehicle otherwise)."""
         try:
             with open(self.state_file) as fh:
                 data = yaml.safe_load(fh)
         except FileNotFoundError:
-            return
+            return False
         except Exception as exc:
             self.get_logger().warn(f'ignoring unreadable state file: {exc}')
-            return
+            return False
         if self.core.load_state(data):
             r = self.core.envelope.min_turning_radius(self.core.model)
             self.get_logger().info(
                 f'restored model from {self.state_file} '
                 f'(turning radius {r:.3f} m, '
                 f'envelope {"confirmed" if self.core.envelope.confirmed else "unconfirmed"})')
-        else:
-            self.get_logger().warn(
-                f'state file {self.state_file} failed validation; ignoring')
+            return True
+        self.get_logger().warn(
+            f'state file {self.state_file} failed validation; ignoring')
+        return False
 
     def save_state(self):
         """Atomic write: a half-written state file must never load."""
@@ -815,6 +849,9 @@ class AckermannAdaptiveController(Node):
             status.level = DiagnosticStatus.ERROR
             status.message = ('odometry implausible - outputs zeroed, '
                               'learning suspended')
+        elif self.core.drive_fault:
+            status.level = DiagnosticStatus.ERROR
+            status.message = f'throttle fault: {self.core.drive_fault}'
         elif self.core.steering_fault:
             status.level = DiagnosticStatus.ERROR
             status.message = 'steering gain collapsed - check the servo'
@@ -878,6 +915,14 @@ class AckermannAdaptiveController(Node):
                            else 'live' if self._lidar_fresh() else 'STALE'),
             'steering': ('FAULT - gain collapsed'
                          if self.core.steering_fault else 'ok'),
+            # servo direction: established from evidence, or still the
+            # declared prior's
+            'steer_sign': ('assumed +' if self.core.steer_sign is None
+                           else f'established {self.core.steer_sign:+.0f}'),
+            'throttle': self.core.drive_fault or 'ok',
+            'calibration': ('pending (fresh vehicle)' if self._cal_pending
+                            else 'done' if self.core.dither > 0.0
+                            else 'not run'),
             'model_plausible': str(self.core.plausible()),
             'radius_pushed_to_nav2':
                 'none' if self.pushed_radius is None

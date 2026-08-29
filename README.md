@@ -28,7 +28,7 @@ identified online by recursive least squares.
 | Phase | What happens |
 |---|---|
 | `SENSE` | Sit still for `t_sense` and measure the *sensor*: velocity noise floor, quantization, heading noise. Every downstream gate is derived from these numbers. Restarts if the robot moves. |
-| `CAL` | Optional scripted wiggle to excite both axes fast. **Off by default** — it drives the robot autonomously. |
+| `CAL` | Scripted wiggle to excite both axes fast. It drives the robot autonomously, so the core never enters it unasked; the **node runs it once on a fresh vehicle** (no state file, or after `~/reset`) as soon as the controller is ACTIVE and `SENSE` is done (`calibrate_on_fresh_start`, default true), or on `~/calibrate`. It establishes the **signs**: the steering sign is learned from the cells (an inverted servo is a vehicle) and from then on defended — a later tie or minority cell resolves to it, not to the declared prior's sign; the throttle sign is the interface contract (positive wire = forward) and is *verified*: a car that backs away from the wiggle's +0.42 wire, or does not move, is a wiring fault and the actuators are held at zero (`/diagnostics` `throttle`). |
 | `RUN` | Invert the learned model, with integral trim riding through the inversion. |
 
 Two learned sub-models, both linear in their parameters:
