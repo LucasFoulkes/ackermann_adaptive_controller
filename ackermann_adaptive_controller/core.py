@@ -580,11 +580,16 @@ class RLS:
         self.innovation = 0.0
         # Parameter projection (Ioannou & Sun): ``bounds[i]`` is (lo, hi)
         # or None. A clipped parameter's excess is moved onto ``absorber``
-        # (an index) scaled by the regressor ratio, so the prediction for
-        # the sample that caused the clip is unchanged -- the constraint
-        # only redistributes a split the data could not pin down.
+        # (an index, or a tuple of candidate indices of which the first
+        # with a nonzero regressor is used -- the steering cell in play,
+        # for the lateral fit) scaled by the regressor ratio, so the
+        # prediction for the sample that caused the clip is unchanged --
+        # the constraint only redistributes a split the data could not
+        # pin down. Clipping WITHOUT an absorber diverged the lateral fit
+        # to a0l -40 (08-29 bench).
         self.bounds = list(bounds) if bounds else [None] * self.n
-        self.absorber = absorber
+        self.absorber = (tuple(absorber) if isinstance(absorber, (tuple, list))
+                         else (absorber,) if absorber is not None else ())
 
     def predict(self, phi):
         return sum(t * p for t, p in zip(self.theta, phi))
@@ -607,10 +612,10 @@ class RLS:
                 continue
             excess = theta[i] - clipped
             theta[i] = clipped
-            j = self.absorber
-            if j is not None and j != i and phi[j] != 0.0 \
-                    and finite(phi[i], phi[j]):
-                theta[j] += excess * phi[i] / phi[j]
+            for j in self.absorber:
+                if j != i and phi[j] != 0.0 and finite(phi[i], phi[j]):
+                    theta[j] += excess * phi[i] / phi[j]
+                    break
         return theta
 
     def inflate(self, p0):
@@ -1269,10 +1274,20 @@ class AdaptiveCore:
                 above.append(d)
             return below + [center] + above
         # All four gain cells start at the same prior; the data splits them.
+        # a2 <= 0 is physics (cornering does not improve with speed) and
+        # is enforced IN the fit, like b2: at one speed a0 and a2 are
+        # collinear, and on a 1.8 m/s vehicle the fit once put the whole
+        # gain into a2 = +0.039 (x 3.24 = the true a0) with the cells at
+        # -0.1 -- the envelope quoted 9.8 m one run and 22.6 the next
+        # (08-29 bench). The absorber is the cell in play (one of the
+        # four has a nonzero regressor per sample): it takes the gain a2
+        # may not hold, and the sample's prediction is unchanged.
         self.lat_bank = DelayBank([p.prior_a0] * 4 + [0.0, 0.0],
                                   p.p0, p.p_max,
                                   _delays(p.lat_delay), p.delay_ew_tau,
                                   p.delay_switch_margin,
+                                  bounds=[None] * 5 + [(None, 0.0)],
+                                  absorber=(0, 1, 2, 3),
                                   gain_idx=(0, 1, 2, 3),
                                   min_count=p.ready_lat_samples,
                                   # a2 <= 0 is physics (see _run); an
@@ -1331,6 +1346,7 @@ class AdaptiveCore:
         self.rolling = False
         self._roll_run = 0
         self._roll_since = None
+        self._below_gate = False
         self._still_since = None
         self.v_fast = 0.0
         self.qs = self.qd = 0.0
@@ -1374,9 +1390,24 @@ class AdaptiveCore:
         self._cal_stage = None   # 'signs' | 'gains' | 'reverse'
         self._cal_t0 = None      # when the current stage began
         self._cal_sub = None     # reverse: 'brake' | 'pulse' | 'stop'
-        self._sign_num = 0.0     # sum of qs * kappa over accepted samples
-        self._sign_den = 0.0     # sum of |qs * kappa|
+        # Sign witness PER candidate delay: sum of qs(t - d) * kappa and
+        # of |qs * kappa| for every d on the lateral grid, and the count.
+        # Established from the candidate with the largest correlation
+        # magnitude, which is the aligned one whatever the prior says: a
+        # correctly wired plant with a 1.2 s delay was locked INVERTED by
+        # a witness on the 0.45 s prior (150 degrees out of phase with
+        # the 0.55 Hz wiggle, 08-29 bench).
+        self._sign_num = None
+        self._sign_den = None
         self._sign_n = 0
+        # The same model-free witness for the throttle: sum of ud(t - d) *
+        # vdot per candidate delay. Its peak across the grid is the
+        # cross-correlation delay estimate, which is what CAL trusts: the
+        # FITTED gains stopped peaking at the aligned delay once a2 was
+        # projected (the absorber inflates a misaligned candidate's cell),
+        # while the raw sums peaked at 1.01 / 1.52 / 2.28 s for plants at
+        # 0.8 / 1.2 / 2.0 s (08-29 bench).
+        self._lon_corr = None
         # The throttle sign is the interface contract (positive wire is
         # forward), verified by CAL rather than compensated: a car that
         # backs away from +0.42 wire, or does not move at all, is wiring,
@@ -1409,6 +1440,19 @@ class AdaptiveCore:
             return p.prior_a0
         return self.steer_sign * abs(p.prior_a0)
 
+    def witness_delay(self, axis):
+        """The cross-correlation delay estimate for 'lat' or 'lon': the
+        candidate whose model-free witness sum has the largest magnitude,
+        or None before there is any."""
+        if axis == 'lat':
+            sums, bank = self._sign_num, self.lat_bank
+        else:
+            sums, bank = self._lon_corr, self.lon_bank
+        if not sums or not any(sums):
+            return None
+        i = max(range(len(sums)), key=lambda k: abs(sums[k]))
+        return bank.delays[i]
+
     def _establish_sign(self):
         """Lock the servo's direction from the command-curvature witness.
 
@@ -1420,9 +1464,13 @@ class AdaptiveCore:
         if self.steer_sign is not None:
             return
         p = self.policy
-        if self._sign_n < p.sign_evidence or self._sign_den <= 0.0:
+        if self._sign_n < p.sign_evidence or self._sign_num is None:
             return
-        r = self._sign_num / self._sign_den
+        # the correlation peak across the grid: largest |sum|
+        i = max(range(len(self._sign_num)), key=lambda k: abs(self._sign_num[k]))
+        if self._sign_den[i] <= 0.0:
+            return
+        r = self._sign_num[i] / self._sign_den[i]
         if abs(r) < p.sign_agreement:
             return
         self.steer_sign = sgn(r)
@@ -1468,7 +1516,8 @@ class AdaptiveCore:
         if noise <= 0.0:
             return None     # no measured noise floor: no scale for "impossible"
         direction = sgn(self.v_prev)
-        if not direction:
+        # From near rest anything can happen (stiction): no bound.
+        if not direction or abs(self.v_prev) < self.gate_d:
             return None
         window = self.now - (self.lon_bank.delay + p.tau_d) - since
         u_same = 0.0
@@ -1758,6 +1807,28 @@ class AdaptiveCore:
                     self.rolling = False
             else:
                 self._still_since = None
+            # A mid-segment stall that never unlatched `rolling` is still
+            # a stall: the car came back through the motion gate on a
+            # stiction release, and for one settling window that
+            # acceleration is energy the wire did not put in. Left
+            # "settled", those releases fed the throttle fit as cruise
+            # and it became the dead zone -- b0 6.38 with b3/b0 0.216, the
+            # breakaway, on the 08-29 16:37 drive, under-driving the car
+            # into the next stall (the stepping gait). Any passage back
+            # through the gate IN THE SAME DIRECTION re-arms the window,
+            # for the learners and for the speed-up gate alike. A passage
+            # that comes out the other side is a reversal, which the
+            # direction logic above handles and the throttle learner is
+            # deliberately NOT re-armed for (a braked reversal is
+            # continuous, valid data).
+            if abs(self.v_fast) < self.gate_d:
+                if not self._below_gate:
+                    self._below_gate = sgn(self.v_fast) or self._roll_dir or 1.0
+            elif self._below_gate:
+                same_way = sgn(self.v_fast) == self._below_gate
+                self._below_gate = False
+                if same_way:
+                    self._roll_since = self.now
             # A direction change is a transient for the LATERAL learner,
             # like breakaway: for one delay plus the servo constant the yaw
             # still belongs to the old direction while the regressors (and
@@ -1997,6 +2068,12 @@ class AdaptiveCore:
                 return [d[1], 1.0, v_reg * abs(v_reg), sgn(v)]
             if self.lon_bank.update(phi_lon, self.vdot, self.lam, self.dt):
                 ok = True
+                if self._lon_corr is None:
+                    self._lon_corr = [0.0] * len(self.lon_bank.delays)
+                for k, dk in enumerate(self.lon_bank.delays):
+                    dd = self._delayed_cmd(dk)
+                    if dd is not None:
+                        self._lon_corr[k] += dd[1] * self.vdot
                 self.qd_lo, self.qd_hi = _span(self.qd_lo, self.qd_hi,
                                                self.qd)
                 self.vl_lo, self.vl_hi = _span(self.vl_lo, self.vl_hi,
@@ -2047,15 +2124,25 @@ class AdaptiveCore:
             # Same regressor (the ACTIVE delay's command) as the model, or
             # the ratio compares a command the car has not responded to yet
             # against the curvature it is still doing from an earlier one.
-            # Third use: the steering-sign witness (Policy.sign_evidence).
+            # Third use: the steering-sign witness (Policy.sign_evidence),
+            # accumulated at EVERY candidate delay (see reset()).
             d = self._delayed_cmd(self.lat_bank.delay)
             if d is not None:
                 self.envelope.observe(d[0], kappa, v, self.model)
-                if accepted_lat and self.steer_sign is None \
-                        and abs(d[0]) >= 0.5 * self.policy.ready_lat_qs_span:
-                    w = d[0] * kappa
-                    self._sign_num += w
-                    self._sign_den += abs(w)
+            if accepted_lat:
+                if self._sign_num is None:
+                    self._sign_num = [0.0] * len(self.lat_bank.delays)
+                    self._sign_den = [0.0] * len(self.lat_bank.delays)
+                counted = False
+                for k, dk in enumerate(self.lat_bank.delays):
+                    dd = self._delayed_cmd(dk)
+                    if dd is None or abs(dd[0]) < 0.5 * self.policy.ready_lat_qs_span:
+                        continue
+                    w = dd[0] * kappa
+                    self._sign_num[k] += w
+                    self._sign_den[k] += abs(w)
+                    counted = True
+                if counted:
                     self._sign_n += 1
         return ok
 
@@ -2130,7 +2217,8 @@ class AdaptiveCore:
         """Size the dither from measurements, seen THROUGH the learned
         gain, and enter RUN. The signs were settled by the stages.
 
-        The delay banks jump to their cross-correlation peak here: the
+        The delay banks jump to their cross-correlation peak here -- the
+        model-free witness sums (witness_delay), not the fitted gains: the
         wiggle is a DESIGNED excitation (0.55 Hz, a quarter turn of phase
         per 0.45 s of delay) that separates the candidates as ordinary
         driving does not, and it is free of the rotation artefacts that
@@ -2138,8 +2226,13 @@ class AdaptiveCore:
         banks only follow a sustained lead (DelayBank.update).
         """
         self._establish_sign()
-        self.lat_bank.jump_to_peak()
-        self.lon_bank.jump_to_peak()
+        for axis, bank in (('lat', self.lat_bank), ('lon', self.lon_bank)):
+            d = self.witness_delay(axis)
+            if d is not None:
+                bank.set_delay(d)
+                bank._lead = (None, 0)
+            else:
+                bank.jump_to_peak()
         self._cal_stage = self._cal_sub = None
         b0 = self.rls_lon.theta[0]
         self.dither = clamp(

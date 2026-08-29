@@ -2273,18 +2273,22 @@ def test_large_fast_vehicle_learns_and_tracks():
 
 
 def test_long_delay_is_found_from_a_wide_bank():
-    """This robot's own scale, but a 1.2 s command-to-response delay: the
-    bank must reach it without anyone retyping lat_delay."""
-    core = AdaptiveCore()
-    plant = Plant(pose_noise=0.002)
-    plant.delay = 1.2
-    t = settle_sense(core, plant)
-    drive(core, plant,
-          lambda s: (0.45 + 0.15 * math.sin(2.0 * math.pi * 0.03 * s),
-                     0.6 * math.sin(2.0 * math.pi * 0.06 * s)),
-          200.0, t0=t)
-    assert core.lat_bank.delay >= 1.0, core.lat_bank.delay
-    assert core.model.a0 == pytest.approx(plant.a0, rel=0.35), core.model.a0
+    """This robot's own scale, but 0.8-2.0 s of command-to-response delay,
+    either servo polarity: CAL (the designed excitation) must leave the
+    lateral bank past the prior AND lock the right sign -- a witness on
+    the prior's 0.45 s was 150 degrees out of phase with the 0.55 Hz
+    wiggle at 1.2 s and locked a correctly wired car inverted."""
+    for delay in (0.8, 1.2, 2.0):
+        for polarity in (1.0, -1.0):
+            core = AdaptiveCore(Policy(enable_calibration=True))
+            plant = Plant(a=(1.30 * polarity, 0.04, 0.30 * polarity),
+                          pose_noise=0.002)
+            plant.delay = delay
+            t = settle_sense(core, plant)
+            run_cal(core, plant, t)
+            assert core.phase == RUN and not core.drive_fault, (delay, polarity)
+            assert core.steer_sign == polarity, (delay, polarity, core.model)
+            assert core.lat_bank.delay > core.policy.lat_delay, (delay, polarity)
 
 
 def test_old_state_file_with_a_polluted_span_does_not_set_the_gates():
@@ -2336,7 +2340,7 @@ def test_calibration_establishes_an_inverted_steering_sign_and_defends_it():
     assert not core.drive_fault
     # the signs stage alone is enough: the sign is known before the first
     # leg, and the stages ran to completion
-    assert core.steer_sign == -1.0, (core._sign_n, core._sign_num, core.model)
+    assert core.steer_sign == -1.0, (core._sign_n, core.model)
     assert stages == ['signs', 'gains', 'reverse'], stages
     assert core.prior_a0 < 0.0
     # persisted, and a tie in the file resolves to the established sign
@@ -2384,13 +2388,14 @@ def test_sign_is_not_established_from_a_split_vote():
     core = AdaptiveCore()
     settle_sense(core, Plant())
     p = core.policy
+    n = len(core.lat_bank.delays)
     # 60 samples, 60% of the magnitude one way: below the agreement bar
-    core._sign_num, core._sign_den, core._sign_n = 0.2 * 60, 60.0, 60
+    core._sign_num, core._sign_den, core._sign_n = [0.2 * 60] * n, [60.0] * n, 60
     core._establish_sign()
     assert core.steer_sign is None
     # three parts to one the other way: locked, whatever the cells say
     core.rls_lat.theta = [1.06, 0.87, 1.25, 1.25, 0.0, -0.3]   # still in transit
-    core._sign_num, core._sign_den, core._sign_n = -0.5 * 60, 60.0, 60
+    core._sign_num, core._sign_den, core._sign_n = [-0.5 * 60] * n, [60.0] * n, 60
     core._establish_sign()
     assert core.steer_sign == -1.0
     assert core.prior_a0 == -abs(p.prior_a0)
@@ -2696,3 +2701,39 @@ def test_envelope_quote_is_floored_like_the_inversion():
     r = core.envelope.min_turning_radius(core.model)
     assert r <= 1.0 / (core.policy.span_floor * 2.0) + 1e-9, r
     assert r < 2.5
+
+
+# -- 08-29 16:37 drive: a mid-segment stall is a stall -------------------------
+
+def test_a_mid_segment_stiction_release_is_neither_learned_nor_a_glitch():
+    """Cruising, the car sticks for half a second (rolling never unlatches)
+    and breaks free again. The release is not settled cruise: the
+    throttle fit must not take it (it made the fit the dead zone), and
+    the speed-up gate must not hold the wire on it (13 holds in 4.5 min)."""
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.002)
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 20.0, t0=t)
+    assert core.rolling
+    b0_before = core.model.b0
+    # a 0.5 s stall the plant imposes (a rug edge), then it lets go
+    for _ in range(5):
+        t += 0.1
+        plant.v = 0.0
+        out = core.step(t, *plant.observe(), 0.30, 0.0)
+    assert core.rolling                                 # never unlatched
+    n_stall = core.model.n_lon
+    held = 0
+    for i in range(12):
+        t += 0.1
+        gl = core._glitch_run
+        out = core.step(t, *plant.observe(), 0.30, 0.0)
+        held += core._glitch_run > gl
+        for _ in range(5):
+            plant.step(out.steer, out.drive, 0.02)
+        if i == 0:
+            plant.v = 0.35                              # the release: a jump
+    assert held == 0, held                              # not a glitch
+    assert core.odom_ok
+    assert core.model.n_lon == n_stall                  # not learned from
+    assert core.model.b0 == pytest.approx(b0_before, rel=0.05)
