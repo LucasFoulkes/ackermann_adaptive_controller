@@ -99,15 +99,70 @@ def sane_gain_cells(cells, prior):
     is taken only among cells that have moved off the prior -- cells still
     at their seed carry no evidence and must not outvote a learner that
     legitimately discovered an inverted servo (all-negative is consistent
-    and believed). Ties or no voters: believe the fit as it stands.
+    and believed).
+
+    A TIE is poison too, not a vehicle: two cells cannot say the servo is
+    wired one way while the other two say the opposite. Under the old
+    "believe a tie as it stands" rule a 2-2 split (a0l +2.17, a0r -4.55,
+    a0lr -2.50, a0rr +4.32, learned from lagged odometry on 08-28 01:01)
+    passed plausible(), was persisted, was restored on every launch that
+    day and steered every forward right turn LEFT; it recurred at 22:14
+    (+0.73, -3.54, -2.79, +2.33) and was restored again at 22:19. A tie
+    resolves to the sign the linkage was installed with (the prior's):
+    an inverted servo has to win a majority, as it always did.
     """
     voters = [c for c in cells if abs(c - prior) > 0.1 * abs(prior)]
     pos = sum(1 for c in voters if c > 0.0)
     neg = sum(1 for c in voters if c < 0.0)
     if pos == neg:
-        return list(cells)
-    s = 1.0 if pos > neg else -1.0
+        if pos == 0:
+            return list(cells)          # no evidence either way
+        s = 1.0 if prior > 0.0 else -1.0
+    else:
+        s = 1.0 if pos > neg else -1.0
     return [c if c * s > 0.0 else s * abs(prior) for c in cells]
+
+
+def lon_sane(b, vl_lo, vl_hi, policy):
+    """Is a longitudinal fit ``[b0, b1, b2, b3]`` physically a vehicle?
+
+    Two signs are physics, not tuning: more throttle means more
+    acceleration (``b0 > b0_min``), and holding a cruise takes throttle,
+    not brake -- drag and friction oppose motion, a flat floor does not
+    push. The second is judged where the inversion is actually evaluated:
+    the feedforward wire ``-(b1 + b2*v|v| + b3*sgn(v)) / b0`` at the
+    planning speed (``env_speed``, clamped into the fitted span, per
+    direction with evidence only -- a span that never reversed says
+    nothing about reverse). It is judged on the SUM, never on b2 or b3
+    alone (at one cruise speed only their sum is data-pinned: the
+    b2-clamp lesson in _run), and NOT at the span's extreme: a lurch peak
+    of 0.89 m/s once sat in the span while the data was pinned at 0.3,
+    and a fit that is -0.005 wire at cruise read +1.0 m/s^2 there.
+
+    Tolerance in wire units: ``launch_floor``, the constant already
+    justified as below the lowest breakaway ever observed. A fit asking
+    for less than -launch_floor of throttle to hold cruise is not fit
+    noise. Why it exists: the model restored on 08-28 22:19 was
+    ``[0.39, 0.04, +2.84, -0.04]`` -- b0 above the floor, so the old
+    b0-only test let it through -- and its cruise feedforward was -0.44
+    wire; the car sat at the launch floor and stalled 31% of the session.
+    Flight-log audit (sum at 0.35 m/s): the 08-23 sessions violate the
+    sign on 0-3% of ticks, the lagged-odometry sessions on 27-98%.
+    """
+    b0, b1, b2, b3 = b
+    if not finite(b0, b1, b2, b3) or b0 <= policy.b0_min:
+        return False
+    tol = policy.launch_floor
+    if vl_hi is not None and finite(vl_hi) and vl_hi > 0.0:
+        v = min(policy.env_speed, vl_hi)
+        if -(b1 + b2 * v * v + b3) / b0 < -tol:
+            return False
+    if vl_lo is not None and finite(vl_lo) and vl_lo < 0.0:
+        v = -min(policy.env_speed, -vl_lo)
+        # reverse: the wire needed is negative; "less than -tol" mirrors
+        if -(b1 + b2 * v * abs(v) - b3) / b0 > tol:
+            return False
+    return True
 
 
 @dataclass
@@ -728,9 +783,27 @@ class DeadBand:
             return 0.0
         return clamp(self.p.deadband_trust * w.value, 0.0, self.p.deadband_max)
 
-    def compensate(self, ud):
+    def compensate(self, ud, motion=0.0):
+        """Map a controller command onto the live part of the actuator.
+
+        ``motion`` is the sign of the car's current travel (0 at rest).
+        The dead band is a property of STARTING TORQUE: it must be crossed
+        to make the wheels turn in the commanded direction. A command
+        AGAINST the current motion is braking, and braking a rolling car
+        needs no offset -- any opposite-sign PWM on the H-bridge is
+        retarding torque from the first count. Applying the reverse
+        offset there made the bootstrap path a relay: 08-28 22:35, rolling
+        forward at 0.36 m/s on a 0.32 command, a -0.03 PI correction left
+        the map as -0.2..-0.36 of reverse torque, the car stopped in 0.4 s
+        (-1.0 m/s^2), the PI asked for +0.3, the car surged to 0.6 m/s
+        (+1.3 m/s^2) -- a 1.1 s limit cycle that the learner then fit as
+        b0 = -5, which disabled the inversion that would have replaced
+        the bootstrap. Braking passes through linearly.
+        """
         if ud == 0.0:
             return 0.0
+        if motion and sgn(ud) != sgn(motion):
+            return ud
         d = self.value(sgn(ud))
         return sgn(ud) * (d + abs(ud) * (1.0 - d))
 
@@ -830,6 +903,8 @@ class AdaptiveCore:
         self._floor_dir = 0.0
         self._cap = 0.0
         self.envelope = CurvatureEnvelope(p)
+        self._roll_dir = 0.0
+        self._dir_since = None
         self.deadband = DeadBand(p)
 
         # Launch/rolling latch for the breakaway kick, with hysteresis so
@@ -933,11 +1008,27 @@ class AdaptiveCore:
 
     # -- the step ----------------------------------------------------------
 
-    def step(self, t, x, y, psi, cmd_v, cmd_w, applied=None):
+    def step(self, t, x, y, psi, cmd_v, cmd_w, applied=None,
+             v_meas=None, psidot_meas=None):
         """Advance one odometry sample. Returns an :class:`Output`.
 
         ``t`` is seconds from the odometry stamp; the whole loop is driven by
         measured time so it is correct at any odometry rate.
+
+        ``v_meas`` / ``psidot_meas`` are a MEASURED body twist (signed
+        forward speed, yaw rate) when the odometry source provides a real
+        one (wheel encoders). Given, they replace the pose-differenced
+        values. NOT for a filter's velocity STATE: the robot_localization
+        EKF's twist lagged the car by 1-1.5 s and a learner fitting it
+        collapsed the steering cells within a minute, four times on
+        08-28/29 -- the launch pins use_odom_twist false for it. The rest of
+        this note is why differencing is only sound at its native rate:
+        replaying a parked 50 Hz EKF session (08-27) through the
+        differencer tripped the plausibility gate on 17% of ticks -- 5 mm
+        of pose jitter over 20 ms is 0.25 m/s of "velocity" against a
+        0.08 m/s bound -- while the same data decimated to 10 Hz tripped
+        none. The pose is still consumed for the sample clock and the
+        glitch gate; the differencer keeps running as the fallback.
 
         ``applied`` is the ``(steering, throttle)`` pair actually on the wire,
         when that is not what this controller last emitted -- which is exactly
@@ -954,6 +1045,9 @@ class AdaptiveCore:
         if step is None:
             return self._safe_output()
         dt, v, psidot_raw = step
+        if v_meas is not None and psidot_meas is not None \
+                and finite(v_meas, psidot_meas):
+            v, psidot_raw = float(v_meas), float(psidot_meas)
 
         if self.phase != SENSE and dt > 5.0 * self.dt:
             # Odometry gap. The differenced sample is an average over the
@@ -1047,6 +1141,8 @@ class AdaptiveCore:
                 self._roll_run = 0
                 self.rolling = True
                 self._roll_since = self.now
+                self._roll_dir = sgn(self.v_fast)
+                self._dir_since = self.now
                 self._still_since = None
                 # The wheels just broke free. Whatever throttle was on the
                 # wire lon_delay ago is what did it: a dead-band sample, in
@@ -1066,6 +1162,23 @@ class AdaptiveCore:
                     self.rolling = False
             else:
                 self._still_since = None
+            # A direction change is a transient for the LATERAL learner,
+            # like breakaway: for one delay plus the servo constant the yaw
+            # still belongs to the old direction while the regressors (and
+            # the cell, chosen by the sign of v) belong to the new one. A
+            # moving reversal never unlatched `rolling`, so that gate never
+            # re-armed: 08-28 16:01, the first cusp of the session (0.6 m/s
+            # backwards -> forward in 0.6 s) rewrote a0lr 2.07 -> 0.04,
+            # a0rr 1.63 -> 3.47, a1 -0.05 -> +1.03 in five ticks, and the
+            # planner was quoted 1.75 m for a minute. The longitudinal
+            # learner is NOT re-armed: a braked reversal is continuous,
+            # valid throttle-vs-acceleration data (no stiction release),
+            # and it is where the friction term gets its two-sided samples.
+            d = sgn(self.v_fast)
+            if d and abs(self.v_fast) > 0.6 * self.gate_d and d != self._roll_dir:
+                if self._roll_dir:
+                    self._dir_since = self.now
+                self._roll_dir = d
 
         # ---------- command filters: best estimate of actuator state -------
         p = self.policy
@@ -1077,6 +1190,7 @@ class AdaptiveCore:
             self._wire = None
         self.qs += (us_app - self.qs) * (1.0 - math.exp(-dt / p.tau_s))
         self.qd += (ud_app - self.qd) * (1.0 - math.exp(-dt / p.tau_d))
+
 
         # ---------- learn, gated by MEASURED noise ------------------------
         learning = self._learn(v)
@@ -1209,7 +1323,8 @@ class AdaptiveCore:
         # how fwd-right was taught -0.09 on 08-23 while the robot shuffled
         # with the steering hard over.
         settled_lat = (self.rolling and self._roll_since is not None
-                       and self.now - self._roll_since
+                       and self.now - max(self._roll_since,
+                                          self._dir_since or self._roll_since)
                        >= self.lat_bank.delay + self.policy.tau_s)
         if settled_lat and abs(v) > self.gate_s and abs(self.psidot) < 4.0:
             kappa = self.psidot / v
@@ -1408,6 +1523,19 @@ class AdaptiveCore:
         err = cmd_v - v
         a_des = clamp(p.kp_v * err, -2.5, 2.5)
         self.iv = clamp(self.iv + p.ki_v * err * dt, -p.iv_max, p.iv_max)
+        # A MOVING reversal -- the command points against the car's travel
+        # while it is still measurably rolling -- is braking, not a launch.
+        # Everything sized for a start from rest is wrong here: the new
+        # direction's Coulomb feedforward is a push, and an integrator
+        # winding on err ~ -0.6 during the brake adds to it; with the
+        # ~0.45 s delay the wire was still 0.29 three ticks after the car
+        # had crossed zero, so the new leg peaked at 0.55 m/s median,
+        # 0.90 max, on a 0.30 command (08-28 22:46, 45 such reversals).
+        # Brake with the proportional term only, integrator held at zero;
+        # below gate_d the launch-from-rest logic takes over as usual.
+        reversing = bool(direction) and v * direction < -self.gate_d
+        if reversing:
+            self.iv = 0.0
         # Everything below is in WIRE units -- what the actuator actually
         # receives. The learned model is fit on the wire, so its inversion
         # yields wire directly; the dead-band map only linearizes the
@@ -1415,11 +1543,18 @@ class AdaptiveCore:
         # model's output again drove cruise 37% over the commanded speed,
         # and flooring every output at the static breakaway stick-slipped
         # any vehicle whose cruise level sits below its breakaway.)
-        if not (self.ready_lon and p.use_learned_lon):
-            # Not yet earned: prior gain through the dead-band map, as
-            # prior_a0 does for steering.
-            ud = self.deadband.compensate(a_des / p.prior_b0)
-        elif abs(b0) > p.b0_min:
+        if not (self.ready_lon and p.use_learned_lon
+                and self.lon_plausible()):
+            # Not yet earned, or not a vehicle (lon_sane: collapsed or
+            # wrong-signed gain, or a fit that accelerates with no
+            # throttle): prior gain through the dead-band map, as prior_a0
+            # does for steering. Same bootstrap either way -- inverting a
+            # fit that is not physically a car is worse than not having
+            # learned yet (08-28 22:19: -0.44 wire of "feedforward" for a
+            # +0.25 cruise, the car never left the launch floor).
+            motion = sgn(v) if abs(v) > self.gate_d else 0.0
+            ud = self.deadband.compensate(a_des / p.prior_b0, motion)
+        else:
             # Invert the model EXACTLY as fitted: whatever the (partly
             # arbitrary) split between b1, b2 and b3, inverting their sum
             # reproduces the equilibrium the data actually showed.
@@ -1456,10 +1591,9 @@ class AdaptiveCore:
             # triple it. Bounded prior-relative, a risk constant on how far
             # the learned value may scale the loop, not a vehicle property.
             b0_fb = clamp(b0, 0.5 * p.prior_b0, 2.0 * p.prior_b0)
-            ud = a_des / b0_fb \
-                - (b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
-        else:
-            ud = 0.3 * sgn(err)
+            ud = a_des / b0_fb
+            if not reversing:
+                ud -= (b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
         if p.enable_dither and self.dither > 0.0:
             ud += self.dither * math.sin(2.0 * math.pi * 0.7 * self.now)
         ud = clamp(ud + self.iv, -1.0, 1.0)
@@ -1671,6 +1805,29 @@ class AdaptiveCore:
                 and consistent
                 and not self.steering_fault)
 
+    def stop_horizon(self):
+        """How long a follower should project a command for collisions.
+
+        The learned reaction delay (nothing the controller does reaches the
+        wheels sooner) plus the time the car takes to come to rest from the
+        planning speed on its own friction (b3, the Coulomb term). Friction
+        alone is the conservative choice -- active braking is shorter. None
+        until the friction term is identified (it needs both directions
+        fed), so the follower keeps its own default until then.
+
+        Why: RPP's projection horizon is a typed 1.5 s; at the end of a
+        segment it projects past the cusp into whatever the planner put the
+        cusp next to, and aborts. 08-29 00:08: three such aborts, each a
+        clear-costmap + replan costing 25-30 s, on a car that stops in
+        ~0.35 s from 0.35 m/s (b3 = -0.95 m/s^2).
+        """
+        p = self.policy
+        b3 = self.rls_lon.theta[3]
+        if not (self.ready_lon and self.lon_plausible()
+                and finite(b3) and b3 < 0.0):
+            return None
+        return self.lon_bank.delay + p.env_speed / (-b3)
+
     def lon_plausible(self):
         """More throttle means more acceleration, or the fit is not a vehicle.
 
@@ -1679,7 +1836,8 @@ class AdaptiveCore:
         test let that reach disk. Such a fit is replaced by the prior on save.
         """
         m = self.model
-        return finite(m.b0) and m.b0 > self.policy.b0_min
+        return lon_sane((m.b0, m.b1, m.b2, m.b3), self.vl_lo, self.vl_hi,
+                        self.policy)
 
     def state(self):
         """Everything worth carrying across a reboot.
@@ -1714,13 +1872,17 @@ class AdaptiveCore:
             'tick': self.tick,
         }
 
-    def load_state(self, d, inflate=4.0):
+    def load_state(self, d, inflate=1.0):
         """Restore a saved model. Returns True if the whole thing was valid.
 
-        The covariance is inflated rather than restored: the parameters are
-        probably still right, but the tyres, the floor and the battery have all
-        had a chance to change while the robot was off, so the learner should
-        be readier to move than it was when it saved.
+        The covariance is re-opened to a FRESH model's p0 rather than
+        restored: the parameters are probably still right, but the tyres,
+        the floor and the battery have all had a chance to change while the
+        robot was off, so the learner should be readier to move than it was
+        when it saved. Not readier than a model that knows nothing, though:
+        at 4 x p0 (the old value) five transient ticks at the first cusp of
+        08-28 23:15 rewrote three cells of a 3862-sample model (a0lr 2.07
+        -> 0.04) and sent the planner a 1.75 m radius for a minute.
 
         Version 1 files are accepted for their parameters only. Their
         envelope evidence was measured against the lag-filtered command rather
@@ -1769,9 +1931,14 @@ class AdaptiveCore:
             qd = vl = qs = (None, None)
 
         p0 = min(p.p0 * inflate, p.p_max)
+        # A file can carry poisoned cells (it did: 08-28, a 2-2 sign split
+        # saved under the old tie rule and restored on every launch that
+        # day). Seed the learner from the sanitised cells so it does not
+        # START inverted and have to unlearn its way back through zero.
+        lat = list(sane_gain_cells(lat[:4], p.prior_a0)) + list(lat[4:])
         self.lat_bank.seed(lat, n_lat, p0)
         self.qs_lo, self.qs_hi = qs
-        if lon[0] > p.b0_min:
+        if lon_sane(lon, vl[0], vl[1], p):
             self.lon_bank.seed(lon, n_lon, p0)
             self.qd_lo, self.qd_hi = qd
             self.vl_lo, self.vl_hi = vl

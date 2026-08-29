@@ -9,7 +9,8 @@ import math
 import pytest
 
 from ackermann_adaptive_controller.core import (CAL, RUN, SENSE, AdaptiveCore,
-                                            Policy, RLS, TwistEstimator, clamp)
+                                            Policy, RLS, TwistEstimator, clamp,
+                                            lon_sane, sane_gain_cells)
 from plant import Plant, drive, settle_sense
 
 
@@ -593,8 +594,9 @@ def test_state_round_trips():
     assert fresh.load_state(saved)
     assert fresh.envelope.min_turning_radius(fresh.model) == \
         pytest.approx(radius, rel=1e-9)
-    # covariance is inflated on restore, not restored
-    assert fresh.rls_lat.P[0][0] > core.policy.p0
+    # covariance is re-opened to a fresh model's p0 on restore -- readier
+    # to move than when saved, no more gullible than knowing nothing
+    assert fresh.rls_lat.P[0][0] == pytest.approx(core.policy.p0)
 
 
 def test_corrupt_state_is_rejected():
@@ -1666,3 +1668,268 @@ def test_feedforward_at_the_setpoint_does_not_surge_with_a_fat_b2():
     dev = max(abs(x - mean) for x in vs)
     assert mean == pytest.approx(0.3, abs=0.04), mean
     assert dev < 0.06, dev                   # no surge-stall oscillation
+
+
+# -- measured twist (EKF) ----------------------------------------------------
+
+def test_measured_twist_replaces_pose_differencing():
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.0)
+    t = settle_sense(core, plant)
+    # Pose frozen: differencing would say 0. The measured twist says 0.5.
+    x, y, psi = plant.observe()
+    for _ in range(60):
+        t += 0.1
+        core.step(t, x, y, psi, 0.0, 0.0, v_meas=0.5, psidot_meas=0.2)
+    assert core.odom_ok
+    assert core.v == pytest.approx(0.5, abs=0.05)
+    assert core.psidot == pytest.approx(0.2, abs=0.05)
+
+
+def test_measured_twist_survives_fast_jittery_poses():
+    """The 08-27 replay: a parked car at 50 Hz with 5 mm of pose jitter.
+
+    Differenced, that is 0.25 m/s of phantom velocity per sample against
+    an acceleration bound of a_lim * 0.02 s, and the glitch gate declared
+    the odometry failed on 17% of ticks. With the measured twist the same
+    poses must never trip it.
+    """
+    import random
+    rng = random.Random(3)
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.0)
+    t = settle_sense(core, plant)
+    x0, y0, psi0 = plant.observe()
+    failed = 0
+    for _ in range(50 * 60):
+        t += 0.02
+        x = x0 + rng.gauss(0.0, 0.005)
+        y = y0 + rng.gauss(0.0, 0.005)
+        psi = psi0 + rng.gauss(0.0, 0.002)
+        core.step(t, x, y, psi, 0.0, 0.0, v_meas=rng.gauss(0.0, 0.01),
+                  psidot_meas=rng.gauss(0.0, 0.004))
+        failed += not core.odom_ok
+    assert failed == 0
+
+
+def test_differencing_remains_the_fallback():
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.55, 0.0), 10.0, t0=t)
+    assert core.v > 0.2                 # no twist given: differenced, moving
+
+
+
+
+# -- regression: 08-28 sign poisoning that survived persistence -------------
+
+POISONED_LAT_0828 = [2.17, -4.55, -2.50, 4.32, 0.26, -3.38]   # saved 01:01
+POISONED_LON_0828 = [0.39, 0.04, 2.84, -0.04]                 # restored 22:19
+
+
+def test_two_two_sign_tie_is_poison_not_a_vehicle():
+    """The 08-28 file: two cells positive, two negative. Under the old
+    'believe a tie' rule it passed plausible(), was persisted, and steered
+    every forward right turn LEFT on each launch that restored it."""
+    cells = sane_gain_cells(POISONED_LAT_0828[:4], 1.25)
+    assert all(c > 0.0 for c in cells), cells
+    assert cells[0] == pytest.approx(2.17) and cells[3] == pytest.approx(4.32)
+    # an inverted servo still needs a majority, and no evidence stays as is
+    assert sane_gain_cells([-1.3, -1.3, -1.3, 1.25], 1.25) == \
+        [-1.3, -1.3, -1.3, -1.25]
+    assert sane_gain_cells([1.25, 1.25, 1.25, 1.25], 1.25) == [1.25] * 4
+
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.rls_lat.theta = list(POISONED_LAT_0828)
+    core.rls_lat.count = 500
+    core.qs_lo, core.qs_hi = -1.0, 1.0
+    assert core.ready_lat
+    assert not core.plausible()             # must not reach disk
+    core.v = core.v_fb = 0.4
+    us_r, _ = core._run(0.4, 0.3, -0.5, 0.1)
+    us_l, _ = core._run(0.4, 0.3, +0.5, 0.1)
+    assert us_r < 0.0 < us_l, (us_r, us_l)   # right steers right, left left
+    # the envelope is quoted from the sanitised cells, never from a
+    # negative one (a0r=-4.55 raw would put the right side at |a1-a0r|)
+    r = core.envelope.min_turning_radius(core.model)
+    assert 0.0 < r < core.policy.radius_ceiling
+    assert core.envelope.max_curvature(core.model) < abs(0.26 + 4.55)
+
+
+def test_self_accelerating_throttle_model_is_not_a_vehicle():
+    """b0 above the floor, so the old b0-only test let this through; it
+    claims +0.18 m/s^2 at 0.25 m/s with the throttle at zero."""
+    pol = Policy()
+    assert not lon_sane(POISONED_LON_0828, -0.4, 0.4, pol)
+    assert lon_sane([1.7, 0.02, -0.4, -0.4], -0.4, 0.4, pol)   # healthy
+    # judged only where the fit has been: no reverse span, no reverse test
+    assert lon_sane([1.7, -0.3, -0.1, 0.0], None, 0.4, pol)
+    assert not lon_sane([0.2, -0.3, -0.1, 0.0], None, 0.4, pol)  # collapsed
+    # judged at the planning speed, not the span's lurch peak: the fresh
+    # 22:28 fit is -0.005 wire at cruise and would read +1 m/s^2 at 0.89
+    assert lon_sane([2.02, -0.07, 1.49, -0.10], -0.5, 0.89, pol)
+
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.rls_lon.theta = list(POISONED_LON_0828)
+    core.rls_lon.count = 500
+    core.qd_lo, core.qd_hi = -0.5, 0.5
+    core.vl_lo, core.vl_hi = -0.4, 0.4
+    assert core.ready_lon
+    assert not core.lon_plausible()
+    saved = core.state()
+    assert saved['longitudinal'][0] == core.policy.prior_b0
+    # and the inversion does not use it: a forward cruise request must
+    # produce forward throttle, not the -0.44 the fit would give
+    core.v = core.v_fb = 0.25
+    _, ud = core._run(0.25, 0.35, 0.0, 0.1)    # wants to speed up
+    assert ud > 0.0, ud
+
+
+def test_loaded_poison_is_sanitised_before_seeding_the_learner():
+    """22:19: a plain-MOLA launch restored the 22:14 file and drove
+    inverted from the first tick. Neither half may survive a load."""
+    src = AdaptiveCore()
+    settle_sense(src, Plant())
+    src.rls_lat.theta = list(POISONED_LAT_0828)
+    src.rls_lat.count = 500
+    src.qs_lo, src.qs_hi = -1.0, 1.0
+    src.rls_lon.theta = list(POISONED_LON_0828)
+    src.rls_lon.count = 500
+    src.qd_lo, src.qd_hi = -0.5, 0.5
+    src.vl_lo, src.vl_hi = -0.4, 0.4
+    d = src.state()
+    d['lateral'] = list(POISONED_LAT_0828)          # as if persisted raw
+    d['longitudinal'] = list(POISONED_LON_0828)
+    d['spans']['vl'] = [-0.4, 0.4]                  # the span it was fit on
+    fresh = AdaptiveCore()
+    assert fresh.load_state(d)
+    m = fresh.model
+    assert min(m.a0l, m.a0r, m.a0l_rev, m.a0r_rev) > 0.0
+    assert m.b0 == fresh.policy.prior_b0 and m.b2 == 0.0
+
+
+
+def test_braking_a_rolling_car_does_not_cross_the_reverse_dead_band():
+    """22:35 relay: with dead-band evidence, a small negative correction
+    while rolling forward became reverse torque. Braking is linear."""
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    for _ in range(6):
+        core.deadband.observe(1.0, 0.19)
+        core.deadband.observe(-1.0, 0.27)
+    assert core.deadband.confirmed(1.0) and core.deadband.confirmed(-1.0)
+    db = core.deadband
+    assert db.compensate(-0.05, motion=1.0) == pytest.approx(-0.05)
+    assert db.compensate(0.05, motion=-1.0) == pytest.approx(0.05)
+    assert db.compensate(-0.05, motion=0.0) < -0.15     # a start: offset
+    assert db.compensate(0.05, motion=1.0) > 0.10       # with motion: offset
+    # through the controller: rolling forward faster than commanded on the
+    # bootstrap path, the wire may retard but not by the reverse offset
+    assert not core.ready_lon
+    core.v = core.v_fb = core.v_fast = 0.5
+    core.rolling = True
+    _, ud = core._run(0.5, 0.32, 0.0, 0.1)
+    assert -0.12 < ud < 0.0, ud
+
+
+
+# -- regression: moving reversal is braking, not a launch (08-28 22:46) -----
+
+def test_moving_reversal_brakes_without_feedforward_or_integrator():
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.rls_lon.theta = [6.0, 0.02, 0.9, -1.2]    # the 22:46 fit
+    core.rls_lon.count = 500
+    core.qd_lo, core.qd_hi = -0.5, 0.5
+    core.vl_lo, core.vl_hi = -0.6, 0.6
+    assert core.ready_lon and core.lon_plausible()
+    core.rolling = True
+    core.v = core.v_fb = core.v_fast = 0.5
+    core.iv = 0.12                                  # wound during the brake
+    core._cmd_dir = 1.0
+    _, ud = core._run(0.5, -0.30, 0.0, 0.1)
+    # brake: retarding, bounded by the proportional term alone
+    assert -0.25 < ud < 0.0, ud
+    assert core.iv == 0.0
+    # the same request from rest IS a launch: floor applies
+    core.rolling = False
+    core.v = core.v_fb = core.v_fast = 0.0
+    _, ud0 = core._run(0.0, -0.30, 0.0, 0.1)
+    assert ud0 <= -core.policy.launch_floor, ud0
+
+
+def test_cusp_reversal_does_not_lunge_on_the_plant():
+    """Forward driving at varied speed (so the throttle model is earned),
+    then a Reeds-Shepp cusp: the reverse leg must not overshoot the command
+    the way the 22:46 log did (0.55 m/s median, 0.90 max, on 0.30)."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.delay = 0.3
+    plant.deadband = 0.2
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant,
+                 lambda s: (0.40 + 0.25 * math.sin(2.0 * math.pi * 0.1 * s),
+                            0.0), 40.0, t0=t)
+    assert core.ready_lon and core.lon_plausible()
+    # cusp: the smoother ramps the command through zero in ~0.2 s while
+    # the car is still rolling forward
+    peak_rev = 0.0
+    t_flip = t
+    for _ in range(40):
+        t += 0.1
+        cv = max(-0.30, 0.30 - 3.0 * (t - t_flip))
+        x, y, psi = plant.observe()
+        o = core.step(t, x, y, psi, cv, 0.0)
+        for _ in range(5):
+            plant.step(o.steer, o.drive, 0.02)
+        peak_rev = max(peak_rev, -plant.v)
+    assert peak_rev < 0.45, peak_rev
+
+
+# -- regression: 08-28 23:15 post-restore transient and cusp window ---------
+
+def test_direction_change_rearms_the_settled_gates():
+    """A moving reversal never unlatched `rolling`, so the learners took
+    the sign-change transient as settled data (16:01: a0lr 2.07 -> 0.04)."""
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 6.0, t0=t)
+    assert core.rolling and core._roll_dir == 1.0
+    since = core._dir_since
+    roll_since = core._roll_since
+    _, t = drive(core, plant, lambda s: (-0.30, 0.0), 6.0, t0=t)
+    assert core.rolling and core._roll_dir == -1.0
+    assert core._dir_since > since + 1.0       # lateral gate re-armed
+    assert core._roll_since == roll_since      # longitudinal gate untouched
+
+
+def test_restored_model_is_no_more_gullible_than_a_fresh_one():
+    src = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(src, plant)
+    drive(src, plant, lambda s: (0.4 + 0.2 * math.sin(0.6 * s), 0.3), 40.0,
+          t0=t)
+    fresh = AdaptiveCore()
+    assert fresh.load_state(src.state())
+    p0 = fresh.policy.p0
+    assert fresh.rls_lat.P[0][0] == pytest.approx(p0)
+    assert fresh.rls_lon.P[0][0] == pytest.approx(p0)
+
+
+def test_stop_horizon_is_delay_plus_friction_stopping_time():
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    assert core.stop_horizon() is None                 # nothing identified
+    core.rls_lon.theta = [6.0, 0.02, 0.9, -0.95]       # the 00:08 fit
+    core.rls_lon.count = 500
+    core.qd_lo, core.qd_hi = -0.5, 0.5
+    core.vl_lo, core.vl_hi = -0.6, 0.6
+    p = core.policy
+    assert core.stop_horizon() == pytest.approx(
+        core.lon_bank.delay + p.env_speed / 0.95)
+    core.rls_lon.theta = [6.0, 0.02, 0.9, 0.10]        # friction not found
+    assert core.stop_horizon() is None

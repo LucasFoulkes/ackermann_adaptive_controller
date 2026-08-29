@@ -37,10 +37,11 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-from geometry_msgs.msg import Twist, TwistStamped
+from geometry_msgs.msg import (Twist, TwistStamped,
+                               TwistWithCovarianceStamped)
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Joy
-from std_msgs.msg import Float32
+from std_msgs.msg import Bool, Float32, Int8
 from rcl_interfaces.srv import SetParameters
 from std_srvs.srv import SetBool, Trigger
 
@@ -64,6 +65,11 @@ POLICY_PARAMS = (
     'env_qs_threshold', 'env_evidence', 'env_derate', 'env_speed',
     'radius_floor', 'radius_ceiling',
     'deadband_evidence', 'deadband_trust', 'deadband_max',
+    'deadband_slow_start', 'b0_min', 'den_min', 'p0', 'p_max',
+    'ready_lat_samples', 'ready_lat_qs_span', 'ready_lon_samples',
+    'ready_lon_qd_span', 'ready_lon_v_span', 'stall_time',
+    'blocked_retries', 'blocked_hold', 'odom_timeout_steps',
+    'cal_steer', 'cal_drive',
     'delay_spread', 'delay_ew_tau', 'delay_switch_margin', 'iw_freeze_frac',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
 )
@@ -90,6 +96,23 @@ class AckermannAdaptiveController(Node):
         p = self.declare_parameters('', [
             # MOLA's nav_msgs/Odometry topic; NOT /odometry.
             ('odom_topic', '/lidar_odometry/pose'),
+            # Use the message's twist (signed vx, yaw rate) instead of
+            # differencing the pose. Only for a source that fills it in
+            # (robot_localization EKF); MOLA's twist is all zeros.
+            ('use_odom_twist', False),
+            # Independent LiDAR-odometry liveness watchdog. The dead-man
+            # below keys on message arrival; with the EKF fused
+            # (odom_topic=/odometry/filtered) that topic keeps ticking at
+            # 50 Hz off the gyro even if the LiDAR dies, so the dead-man
+            # would never fire and the car would drive on a dead-reckoned,
+            # drifting pose. Watching the RAW LiDAR odometry (MOLA still
+            # publishes it under use_ekf -- only its TF was turned off)
+            # restores the pre-EKF semantics: no scans -> MOLA stops
+            # publishing this -> stale -> stop. Empty, or equal to
+            # odom_topic (the plain-LO case, where the dead-man already
+            # covers it), disables the extra watchdog.
+            ('lidar_odom_topic', '/lidar_odometry/pose'),
+            ('lidar_odom_timeout', 0.5),
             ('cmd_vel_topic', '/cmd_vel'),
             ('steering_topic', '/actuators/steering/command'),
             ('throttle_topic', '/actuators/throttle/command'),
@@ -121,6 +144,32 @@ class AckermannAdaptiveController(Node):
             # scale. Empty server name disables.
             ('search_dist_server', '/controller_server'),
             ('search_dist_param', 'FollowPath.max_robot_pose_search_dist'),
+            # The follower's own geometry, tied to the LEARNED car. Pure
+            # pursuit asks curvature 2e/L^2 for a lateral error e at
+            # lookahead L; with L below the turning radius R the demand
+            # exceeds the car's lock for errors under R/2 (08-29 00:08:
+            # min_lookahead 0.4 m, a 0.2 m error asked 2.5/m of a 1.4/m
+            # car, the car fell off the arc, the carrot ended up behind it
+            # and RPP reversed -- 25 s of fwd/rev inside a single-direction
+            # segment). L = R keeps the demand inside the envelope for any
+            # error up to R/2; the maximum lookahead is a ratio of the same
+            # radius (a carrot never needs to sit beyond the diameter of the
+            # tightest circle the car drives). The collision projection
+            # horizon is core.stop_horizon (delay + stopping time). Empty
+            # server disables all three.
+            ('follower_server', '/controller_server'),
+            ('lookahead_min_param', 'FollowPath.min_lookahead_dist'),
+            ('lookahead_max_param', 'FollowPath.max_lookahead_dist'),
+            ('lookahead_max_ratio', 2.0),
+            ('collision_horizon_param',
+             'FollowPath.max_allowed_time_to_collision_up_to_carrot'),
+            # Direction of the single-direction segment the navigator handed
+            # the follower (+1/-1, 0 between segments). A cmd_vel against it
+            # is not a maneuver the plan contains, it is the follower's
+            # carrot having fallen behind the car: executed, it is the
+            # shuffle; held as a stop, the progress checker fails the leg in
+            # 8 s and the navigator replans from where the car is.
+            ('segment_direction_topic', '/cusp_navigator/segment_direction'),
             # Hysteresis: republishing on every wobble would make Smac rebuild
             # its primitive table continuously.
             ('radius_rel_change', 0.10),
@@ -163,6 +212,15 @@ class AckermannAdaptiveController(Node):
         self.controller_server = str(g['controller_server'])
         self.controller_param = str(g['controller_radius_param'])
         self.search_server = str(g['search_dist_server'])
+        self.follower_server = str(g['follower_server'])
+        self.lookahead_min_param = str(g['lookahead_min_param'])
+        self.lookahead_max_param = str(g['lookahead_max_param'])
+        self.lookahead_max_ratio = float(g['lookahead_max_ratio'])
+        self.collision_horizon_param = str(g['collision_horizon_param'])
+        self.pushed_lookahead = None
+        self.pushed_horizon = None
+        self.segment_dir = 0
+        self._dir_held = False
         self.search_param = str(g['search_dist_param'])
         self.radius_rel = float(g['radius_rel_change'])
         self.radius_abs = float(g['radius_abs_change'])
@@ -223,6 +281,17 @@ class AckermannAdaptiveController(Node):
 
         self.pub_steer = self.create_publisher(Float32, self.steering_topic, 1)
         self.pub_drive = self.create_publisher(Float32, self.throttle_topic, 1)
+        # Zero-velocity witness for the EKF, published only while the
+        # dead-man is holding the actuators at zero (odometry or LiDAR
+        # stale). During a LiDAR outage the filter has NO velocity
+        # measurement, so its velocity state latches at the last value and
+        # the pose dead-reckons (08-28: 0.825 m/s held for a 40 s outage
+        # = 33 m of phantom). But the halt is a FACT this node created:
+        # the wheels are stopped because it stopped them (and the Pico
+        # dead-man backs it). Telling the filter "v = 0" while halted is
+        # a measurement, not a guess.
+        self.pub_halt = self.create_publisher(
+            TwistWithCovarianceStamped, '~/halted_twist', 1)
         self.pub_diag = self.create_publisher(
             DiagnosticArray, '/diagnostics', 1)
         self.pub_radius = self.create_publisher(
@@ -237,8 +306,22 @@ class AckermannAdaptiveController(Node):
             Float32, self.throttle_topic,
             lambda m: setattr(self, 'tap_drive', float(m.data)), 1)
 
+        self.use_odom_twist = bool(g['use_odom_twist'])
         self.create_subscription(
             Odometry, g['odom_topic'], self.on_odom, sensor_qos)
+
+        # LiDAR-odometry liveness, independent of the (possibly fused)
+        # control odometry above. See the parameter comment.
+        self.last_lidar_odom_t = None
+        self._lidar_odom_timeout = float(g['lidar_odom_timeout'])
+        lidar_topic = str(g['lidar_odom_topic'])
+        self._lidar_watchdog = bool(lidar_topic) and \
+            lidar_topic != str(g['odom_topic'])
+        if self._lidar_watchdog:
+            self.create_subscription(
+                Odometry, lidar_topic,
+                lambda m: setattr(self, 'last_lidar_odom_t', self._now()),
+                sensor_qos)
         if bool(g['use_stamped_cmd_vel']):
             self.create_subscription(
                 TwistStamped, g['cmd_vel_topic'],
@@ -249,6 +332,20 @@ class AckermannAdaptiveController(Node):
         if self.estop_button >= 0:
             self.create_subscription(
                 Joy, g['estop_joy_topic'], self.on_joy, sensor_qos)
+        if str(g['segment_direction_topic']):
+            latched = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                 history=HistoryPolicy.KEEP_LAST, depth=1)
+            self.create_subscription(
+                Int8, str(g['segment_direction_topic']),
+                lambda m: setattr(self, 'segment_dir', int(m.data)), latched)
+            # Tell the navigator when a hold is in force, so it can replan
+            # instead of waiting for Nav2's progress checker.
+            self.pub_held = self.create_publisher(Bool, '~/direction_held',
+                                                  latched)
+            self.pub_held.publish(Bool(data=False))
+        else:
+            self.pub_held = None
 
         self.create_service(SetBool, '~/set_active', self.srv_set_active)
         self.create_service(Trigger, '~/calibrate', self.srv_calibrate)
@@ -260,7 +357,9 @@ class AckermannAdaptiveController(Node):
         self.create_timer(float(g['save_period']), self.save_state)
 
         self.get_logger().info(
-            f"odom={g['odom_topic']} cmd_vel={g['cmd_vel_topic']} "
+            f"odom={g['odom_topic']}"
+            f"{' (twist from message)' if self.use_odom_twist else ''} "
+            f"cmd_vel={g['cmd_vel_topic']} "
             f"-> {self.steering_topic}, {self.throttle_topic} | "
             f"mode={'ACTIVE' if self.active else 'PASSIVE'} "
             f"calibration={'on' if g['enable_calibration'] else 'off'}")
@@ -277,6 +376,22 @@ class AckermannAdaptiveController(Node):
         if not finite(v, w):
             self.get_logger().warn('non-finite cmd_vel rejected')
             return
+        if self.segment_dir and v * self.segment_dir < 0.0:
+            # Against the segment's direction: hold, do not reverse (see the
+            # segment_direction_topic parameter).
+            if not self._dir_held:
+                self.get_logger().warn(
+                    'follower asked to drive against the current segment '
+                    f'direction ({self.segment_dir:+d}); holding instead',
+                    throttle_duration_sec=5.0)
+                self._dir_held = True
+                if self.pub_held is not None:
+                    self.pub_held.publish(Bool(data=True))
+            v, w = 0.0, 0.0
+        elif self._dir_held:
+            self._dir_held = False
+            if self.pub_held is not None:
+                self.pub_held.publish(Bool(data=False))
         self.cmd_v, self.cmd_w = v, w
         self.last_cmd_t = self._now()
 
@@ -299,6 +414,15 @@ class AckermannAdaptiveController(Node):
             return
         self.last_odom_t = self._now()
 
+        # LiDAR watchdog gates LEARNING too, not just the actuators: on
+        # 08-27 the fused odometry kept sliding after the LiDAR died and
+        # 97 s of phantom motion collapsed the learned steering gains
+        # (a0l 2.21 -> 0.16, "radius 9.6 m"). Odometry that no live scan
+        # is vouching for teaches nothing; the core's gap handling drops
+        # the first sample on resume, so skipping here is seamless.
+        if not self._lidar_fresh():
+            return
+
         cmd_v, cmd_w = self.cmd_v, self.cmd_w
         if not self._cmd_fresh():
             cmd_v = cmd_w = 0.0
@@ -306,9 +430,13 @@ class AckermannAdaptiveController(Node):
         # ACTIVE: our own last output is what the Pico is holding. PASSIVE:
         # someone else is driving, so learn from what is actually on the wire.
         applied = None if self.active else (self.tap_steer, self.tap_drive)
+        v_meas = psidot_meas = None
+        if self.use_odom_twist:
+            tw = msg.twist.twist
+            v_meas, psidot_meas = tw.linear.x, tw.angular.z
         out = self.core.step(
             t, pose.position.x, pose.position.y, psi, cmd_v, cmd_w,
-            applied=applied)
+            applied=applied, v_meas=v_meas, psidot_meas=psidot_meas)
         self.out_steer, self.out_drive = out.steer, out.drive
 
         if self._flight is not None:
@@ -351,15 +479,44 @@ class AckermannAdaptiveController(Node):
         timeout = max(self.core.policy.odom_timeout_steps * self.core.dt, 0.3)
         return self._now() - self.last_odom_t < timeout
 
+    def _lidar_fresh(self):
+        """Is the RAW LiDAR odometry still arriving? Independent of the
+        fused control odometry, which the EKF keeps alive off the gyro even
+        when the LiDAR is blind. No watchdog configured -> always fresh."""
+        if not self._lidar_watchdog:
+            return True
+        if self.last_lidar_odom_t is None:
+            return False
+        return self._now() - self.last_lidar_odom_t < self._lidar_odom_timeout
+
     def on_publish_tick(self):
         """Republish at 50 Hz so the Pico watchdog never expires mid-drive."""
         if not self.active or self.estopped:
             return
-        if not self._odom_fresh():
-            # Blind: stop. When odometry returns the core sees the gap and
-            # drops that sample, so the slew restarts from rest as well.
+        if not self._odom_fresh() or not self._lidar_fresh():
+            # Blind: stop. Either the control odometry stalled, or -- with
+            # the EKF masking a LiDAR blackout by dead-reckoning off the
+            # gyro -- the raw LiDAR odometry went stale while the fused
+            # topic kept ticking. When odometry returns the core sees the
+            # gap and drops that sample, so the slew restarts from rest.
+            if not self._lidar_fresh():
+                self.get_logger().warn(
+                    'LiDAR odometry stale; stopping (EKF may still be '
+                    'publishing a dead-reckoned pose)',
+                    throttle_duration_sec=2.0)
             self._zero_burst()
             self.out_steer = self.out_drive = 0.0
+            m = TwistWithCovarianceStamped()
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.header.frame_id = 'base_link'
+            # Twist is all zeros by construction. Variances: the wheels
+            # are commanded stopped and the Pico dead-man enforces it
+            # within 0.25 s; 0.02 m/s / 0.05 rad/s std covers rolling to
+            # a stop on the slew.
+            m.twist.covariance[0] = 4e-4    # vx
+            m.twist.covariance[7] = 4e-4    # vy
+            m.twist.covariance[35] = 2.5e-3  # vyaw
+            self.pub_halt.publish(m)
             return
         if self.core.phase != CAL and not self._cmd_fresh():
             self._zero_burst()
@@ -439,17 +596,43 @@ class AckermannAdaptiveController(Node):
             self.radius_filt += self.radius_alpha * (raw - self.radius_filt)
         r = self.radius_filt
         self.pub_radius.publish(Float32(data=float(r)))
-        if not self.publish_radius:
-            return
-        # Only trust the envelope enough to steer the planner once the model
-        # has some evidence behind it; before that the value is a derated
+        # Collision projection horizon: learned, independent of the envelope.
+        h = self.core.stop_horizon()
+        if h is not None and self.follower_server and (
+                self.pushed_horizon is None
+                or abs(h - self.pushed_horizon) >= self.radius_rel * self.pushed_horizon):
+            self.pushed_horizon = h
+            self.get_logger().info(
+                f'collision horizon -> {h:.2f} s ({self.follower_server})')
+            self._set_remote(self.follower_server, self.collision_horizon_param, h)
+        # Only trust the envelope enough to steer Nav2 once the model has
+        # some evidence behind it; before that the value is a derated
         # extrapolation of a prior and should not override the launch default.
         if not self.core.envelope.confirmed:
+            return
+        if not (self.publish_radius or self.search_server
+                or self.follower_server):
             return
         # Quote the planner a LARGER radius than the car's true limit (see
         # the radius_push_margin declaration): paths must leave RPP headroom
         # to cut a tighter recovery chord without saturating the clamp.
         quoted = r * self.radius_margin
+        # The car has FOUR minimum turning radii (direction x side) and the
+        # controller steers with all four; Nav2 takes one number, so the
+        # planner is quoted the weakest cell x margin. Say which is which.
+        m = self.core.model
+        v2 = self.core.policy.env_speed ** 2
+        cells = {'fwd-L': abs(m.a1 + m.a0l + m.a2 * v2),
+                 'fwd-R': abs(m.a1 - m.a0r - m.a2 * v2),
+                 'rev-L': abs(m.a1 + m.a0l_rev + m.a2 * v2),
+                 'rev-R': abs(m.a1 - m.a0r_rev - m.a2 * v2)}
+        self.get_logger().info(
+            'learned turning radii at %.2f m/s: %s -> planner gets %.2f m '
+            '(weakest x %.1f)' % (
+                self.core.policy.env_speed,
+                ', '.join(f'{k} {1.0 / c if c > 1e-3 else float("inf"):.2f}'
+                          for k, c in cells.items()),
+                quoted, self.radius_margin))
         prev = self.pushed_radius
         if prev is not None:
             if abs(quoted - prev) < self.radius_abs or \
@@ -459,13 +642,36 @@ class AckermannAdaptiveController(Node):
         # configuring, so the parameter is not declared yet) clears it again
         # so the next tick retries instead of waiting for a 10% change.
         self.pushed_radius = quoted
-        self._set_remote(self.planner_server, self.planner_param, quoted)
-        self._set_remote(self.controller_server, self.controller_param,
-                         quoted)
+        if self.publish_radius:
+            self._set_remote(self.planner_server, self.planner_param, quoted)
+            self._set_remote(self.controller_server, self.controller_param,
+                             quoted)
         # Third consumer, at half scale: a cusp leg is about one quoted
         # radius of path, and RPP's nearest-pose search must not be able to
         # reach across the cusp -- half a leg keeps it on the current one.
+        # Gated by its OWN server name, not by publish_turning_radius.
+        # TRIED AND REVERTED 08-28 23:40: sizing this from a learned cusp
+        # overshoot (0.17-0.22 m; measurement since removed) instead. The
+        # follower needs more than the overshoot: after a cusp the nearest
+        # path point sits further along than the slide, the closest-pose
+        # search stuck, the carrot fell behind the robot and it reversed to
+        # it -- 15 direction flips/min against 6.7 with the half-radius
+        # rule, legs 0.36 m, 1 of 8 goals reached.
         self._set_remote(self.search_server, self.search_param, 0.5 * quoted)
+        # Follower lookahead from the RAW learned radius (see the parameter
+        # comment). Order the two writes so min never exceeds max between
+        # them: max first when growing, min first when shrinking.
+        if self.follower_server:
+            lo, hi = r, self.lookahead_max_ratio * r
+            if self.pushed_lookahead is None or r > self.pushed_lookahead:
+                self._set_remote(self.follower_server, self.lookahead_max_param, hi)
+                self._set_remote(self.follower_server, self.lookahead_min_param, lo)
+            else:
+                self._set_remote(self.follower_server, self.lookahead_min_param, lo)
+                self._set_remote(self.follower_server, self.lookahead_max_param, hi)
+            self.pushed_lookahead = r
+            self.get_logger().info(
+                f'follower lookahead -> {lo:.2f}..{hi:.2f} m ({self.follower_server})')
 
     def _set_remote(self, server, name, value):
         """Fire-and-forget remote parameter set; never block the executor."""
@@ -499,8 +705,7 @@ class AckermannAdaptiveController(Node):
                             f'{_server} accepted {_name}')
                     self._push_warned = False
                     self.get_logger().info(
-                        f'learned minimum turning radius -> {_value:.3f} m '
-                        f'({_server})')
+                        f'pushed {_name} -> {_value:.3f} ({_server})')
             except Exception as exc:
                 self._push_failed(f'{_server} set {_name} failed: {exc}')
 
@@ -509,6 +714,8 @@ class AckermannAdaptiveController(Node):
     def _push_failed(self, why):
         """Forget the push so the next tick retries; complain once."""
         self.pushed_radius = None
+        self.pushed_lookahead = None
+        self.pushed_horizon = None
         if not self._push_warned:
             self.get_logger().warn(f'{why}; will keep retrying')
             self._push_warned = True
@@ -630,6 +837,8 @@ class AckermannAdaptiveController(Node):
                          f'qs {self.core.qs_lo:+.2f}..{self.core.qs_hi:+.2f}'),
             'blocked': str(self.core.blocked),
             'odom_plausible': str(self.core.odom_ok),
+            'lidar_odom': ('n/a' if not self._lidar_watchdog
+                           else 'live' if self._lidar_fresh() else 'STALE'),
             'steering': ('FAULT - gain collapsed'
                          if self.core.steering_fault else 'ok'),
             'model_plausible': str(self.core.plausible()),

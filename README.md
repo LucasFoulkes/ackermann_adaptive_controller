@@ -114,10 +114,23 @@ is derated by `env_derate`, because conservative means a **larger** radius: a
 planner that thinks the car turns tighter than it does emits paths the car
 cannot follow.
 
-Once both directions are confirmed the value is pushed live into
+Once both directions are confirmed the value is pushed live into Nav2. The
+car has four minimum turning radii (direction × side) and the controller
+steers with all four; Nav2 takes one number, so it gets the weakest cell ×
+`radius_push_margin`:
 
-- `planner_server` → `GridBased.minimum_turning_radius`
-- `controller_server` → `FollowPath.regulated_linear_scaling_min_radius`
+- `planner_server` → `GridBased.minimum_turning_radius` (quoted radius)
+- `controller_server` → `FollowPath.max_robot_pose_search_dist` (½ quoted:
+  RPP's closest-pose search must not reach across a cusp)
+- `controller_server` → `FollowPath.min/max_lookahead_dist` (raw radius, ×2:
+  pure pursuit's curvature demand 2e/L² stays inside the car's lock for any
+  lateral error up to R/2)
+- `controller_server` → `FollowPath.max_allowed_time_to_collision_up_to_carrot`
+  (learned throttle delay + stopping time on friction)
+
+The `FollowPath.regulated_linear_scaling_min_radius` push exists but is off
+by configuration (`controller_server: ""`): RPP has no curvature limit, only
+a slow-down threshold, and pushing a radius into it made the follower crawl.
 
 Verified against Nav2 Jazzy 1.3.12: Smac accepts the change while active and
 regenerates its motion primitives — the same goal replans from 2.22 m at
