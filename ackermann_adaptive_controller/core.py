@@ -127,10 +127,29 @@ def sane_gain_cells(cells, prior):
         s = 1.0 if prior > 0.0 else -1.0
     else:
         s = 1.0 if pos > neg else -1.0
-    return [c if c * s > 0.0 else s * abs(prior) for c in cells]
+    out = [c if c * s > 0.0 else s * abs(prior) for c in cells]
+    # One rack, one servo: the four cells differ by geometry and caster
+    # (0.73x measured), not by an order of magnitude. A cell under a
+    # quarter of the median of the other three is a collapsed fit, not
+    # a vehicle (a0r 0.15 against 2.43 / 2.18 / 1.66 after 34 s on a
+    # poisoned model, 08-29 17:29 -- and the envelope quotes the WORST
+    # cell to the planner). It is replaced by that median; the fraction
+    # is Policy.span_floor's, the same "reduced but not erased" floor.
+    # Siblings are EXCITED cells only (off the prior, as for the vote): a
+    # dead servo collapses the driven cells while the undriven ones sit
+    # at the prior, and those must not rescue it (the fault must fire).
+    for i, c in enumerate(out):
+        others = sorted(abs(out[j]) for j in range(4)
+                        if j != i and abs(out[j] - s * abs(prior)) > 0.1 * abs(prior))
+        if not others:
+            continue
+        med = others[len(others) // 2]
+        if med > 0.0 and abs(c) < 0.25 * med:
+            out[i] = s * med
+    return out
 
 
-def lon_sane(b, vl_lo, vl_hi, policy, v_op):
+def lon_sane(b, vl_lo, vl_hi, policy, v_op, breakaway=None):
     """Is a longitudinal fit ``[b0, b1, b2, b3]`` physically a vehicle?
 
     Two signs are physics, not tuning: more throttle means more
@@ -158,6 +177,16 @@ def lon_sane(b, vl_lo, vl_hi, policy, v_op):
     """
     b0, b1, b2, b3 = b
     if not finite(b0, b1, b2, b3) or b0 <= policy.b0_min:
+        return False
+    # The wire that breaks the car free (the measured breakaway) must
+    # produce at least the friction the fit claims, or the car could not
+    # have started: b0 x breakaway >= |b3|, with a factor of two for the
+    # breakaway sample reading high. A fit of b0 0.78 with b3 -0.53 says
+    # full throttle is 0.78 m/s^2 -- it put the feedback gain at its floor
+    # and every correction 4x too strong (08-29 17:29: rail-to-rail wire,
+    # six stalls in 34 s). The 13:45 model: 4.64 x 0.22 = 1.02 >= 0.48.
+    if breakaway is not None and finite(breakaway) and breakaway > 0.0 \
+            and b0 * breakaway < 0.5 * abs(b3):
         return False
     tol = policy.launch_floor
     if not finite(v_op) or v_op < 0.0:
@@ -2805,7 +2834,12 @@ class AdaptiveCore:
         """
         m = self.model
         return lon_sane((m.b0, m.b1, m.b2, m.b3), self.vl_lo, self.vl_hi,
-                        self.policy, self.speed_scale)
+                        self.policy, self.speed_scale, self._breakaway_median())
+
+    def _breakaway_median(self):
+        """The measured forward breakaway wire (raw median), or None."""
+        w = self.deadband.fwd
+        return w.value if w.confirmed else None
 
     def state(self):
         """Everything worth carrying across a reboot.
@@ -2939,7 +2973,7 @@ class AdaptiveCore:
             # judges) is kept.
             lon[1] += lon[2] * min(judge_v, vl[1] or judge_v) ** 2
             lon[2] = 0.0
-        if lon_sane(lon, vl[0], vl[1], p, judge_v):
+        if lon_sane(lon, vl[0], vl[1], p, judge_v, self._breakaway_median()):
             self.lon_bank.seed(lon, n_lon, p0)
             self.qd_lo, self.qd_hi = qd
             self.vl_lo, self.vl_hi = vl

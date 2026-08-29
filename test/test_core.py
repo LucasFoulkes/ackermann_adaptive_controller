@@ -2775,3 +2775,40 @@ def test_an_implausible_stream_is_answered_neutrally_and_fails_only_after_the_ho
     assert len(held) >= 5
     assert all(abs(d - f) < 1e-9 and d > 0.0 for d, f in held), held
     assert core.prev_wire == 0.0                                # failed: zero
+
+
+# -- 08-29 17:29: fits that could not be the car ---------------------------------
+
+def test_a_throttle_gain_that_cannot_overcome_its_own_friction_is_not_a_vehicle():
+    pol = Policy()
+    good = [4.636, 0.054, -0.529, -0.956]          # the 13:45 model
+    bad = [0.78, 0.19, 0.0, -0.53]                 # what 16:59 saved
+    assert lon_sane(good, -0.4, 0.4, pol, 0.32, breakaway=0.22)
+    assert not lon_sane(bad, -0.4, 0.4, pol, 0.32, breakaway=0.22)
+    assert lon_sane(bad, -0.4, 0.4, pol, 0.32)     # no breakaway measured: unjudged
+    # and on load, with the dead band in the file, the poison is replaced
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    for x in (0.22, 0.21, 0.24, 0.22):
+        core.deadband.observe(1.0, x)
+    d = core.state()
+    d['longitudinal'] = bad
+    d['n_lon'] = 500
+    d['spans']['qd'] = [-0.5, 0.5]; d['spans']['vl'] = [-0.4, 0.4]
+    fresh = AdaptiveCore()
+    assert fresh.load_state(d)
+    assert fresh.model.b0 == fresh.policy.prior_b0
+
+
+def test_a_collapsed_steering_cell_is_replaced_by_its_siblings():
+    cells = sane_gain_cells((2.43, 0.15, 2.18, 1.66), 1.25)
+    assert cells[1] == pytest.approx(2.18)          # the median of the others
+    assert cells[0] == 2.43 and cells[2] == 2.18 and cells[3] == 1.66
+    # a genuinely weaker cell (reverse-left at 0.73x, measured) is kept
+    cells = sane_gain_cells((1.93, 1.29, 1.41, 1.75), 1.25)
+    assert cells == [1.93, 1.29, 1.41, 1.75]
+    # and the envelope no longer quotes the collapsed cell to the planner
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.rls_lat.theta = [2.43, 0.15, 2.18, 1.66, 0.0, -0.3]
+    assert core.envelope.min_turning_radius(core.model) < 1.2     # was 11 m
