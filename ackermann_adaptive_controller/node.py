@@ -231,6 +231,7 @@ class AckermannAdaptiveController(Node):
         self._warned_implausible = False
         self._warned_fault = False
         self.radius_filt = None
+        self.lookahead_filt = None
         self.radius_alpha = float(g['radius_filter_alpha'])
         self.tap_steer = 0.0
         self.tap_drive = 0.0
@@ -596,6 +597,25 @@ class AckermannAdaptiveController(Node):
             self.radius_filt += self.radius_alpha * (raw - self.radius_filt)
         r = self.radius_filt
         self.pub_radius.publish(Float32(data=float(r)))
+        # The follower's lookahead is sized from the FORWARD cells only,
+        # filtered the same way. The planner's quote must be the weakest of
+        # all four cells (a wider radius is the safe error for a planner);
+        # the follower's risk runs the other way -- a longer lookahead puts
+        # the carrot at the end of every leg shorter than it and the arc is
+        # never followed -- and the legs with room to pursue are the
+        # forward ones (2026-08-29 12:04 run: 57 reverse legs median
+        # 0.63 m, forward median ~1.3 m). In that run the rev-R cell,
+        # 295 samples all session, wandered 0.60 -> 1.08 -> 0.83 m and
+        # dragged min_lookahead 0.68 -> 1.00 m while 49% of legs were
+        # under 1.0 m.
+        raw_fwd = self.core.envelope.min_turning_radius(
+            self.core.model, forward=True)
+        if finite(raw_fwd) and raw_fwd > 0.0:
+            if self.lookahead_filt is None:
+                self.lookahead_filt = raw_fwd
+            else:
+                self.lookahead_filt += self.radius_alpha * (
+                    raw_fwd - self.lookahead_filt)
         # Collision projection horizon: learned, independent of the envelope.
         h = self.core.stop_horizon()
         if h is not None and self.follower_server and (
@@ -633,6 +653,7 @@ class AckermannAdaptiveController(Node):
                 ', '.join(f'{k} {1.0 / c if c > 1e-3 else float("inf"):.2f}'
                           for k, c in cells.items()),
                 quoted, self.radius_margin))
+        self._push_lookahead()
         prev = self.pushed_radius
         if prev is not None:
             if abs(quoted - prev) < self.radius_abs or \
@@ -658,20 +679,31 @@ class AckermannAdaptiveController(Node):
         # it -- 15 direction flips/min against 6.7 with the half-radius
         # rule, legs 0.36 m, 1 of 8 goals reached.
         self._set_remote(self.search_server, self.search_param, 0.5 * quoted)
-        # Follower lookahead from the RAW learned radius (see the parameter
-        # comment). Order the two writes so min never exceeds max between
-        # them: max first when growing, min first when shrinking.
-        if self.follower_server:
-            lo, hi = r, self.lookahead_max_ratio * r
-            if self.pushed_lookahead is None or r > self.pushed_lookahead:
-                self._set_remote(self.follower_server, self.lookahead_max_param, hi)
-                self._set_remote(self.follower_server, self.lookahead_min_param, lo)
-            else:
-                self._set_remote(self.follower_server, self.lookahead_min_param, lo)
-                self._set_remote(self.follower_server, self.lookahead_max_param, hi)
-            self.pushed_lookahead = r
-            self.get_logger().info(
-                f'follower lookahead -> {lo:.2f}..{hi:.2f} m ({self.follower_server})')
+
+    def _push_lookahead(self):
+        """Follower lookahead from the RAW learned FORWARD radius (see the
+        parameter comment and on_radius_tick), on its own change gate so a
+        wandering reverse cell moving the planner quote does not re-push
+        it. Order the two writes so min never exceeds max between them:
+        max first when growing, min first when shrinking."""
+        r = self.lookahead_filt
+        if not self.follower_server or r is None:
+            return
+        prev = self.pushed_lookahead
+        if prev is not None and (abs(r - prev) < self.radius_abs
+                                 or abs(r - prev) < self.radius_rel * prev):
+            return
+        lo, hi = r, self.lookahead_max_ratio * r
+        if prev is None or r > prev:
+            self._set_remote(self.follower_server, self.lookahead_max_param, hi)
+            self._set_remote(self.follower_server, self.lookahead_min_param, lo)
+        else:
+            self._set_remote(self.follower_server, self.lookahead_min_param, lo)
+            self._set_remote(self.follower_server, self.lookahead_max_param, hi)
+        self.pushed_lookahead = r
+        self.get_logger().info(
+            f'follower lookahead -> {lo:.2f}..{hi:.2f} m (forward cells, '
+            f'{self.follower_server})')
 
     def _set_remote(self, server, name, value):
         """Fire-and-forget remote parameter set; never block the executor."""

@@ -419,7 +419,7 @@ class RLS:
     estimate permanently.
     """
 
-    def __init__(self, theta0, p0, p_max):
+    def __init__(self, theta0, p0, p_max, bounds=None, absorber=None):
         self.n = len(theta0)
         self.theta = list(theta0)
         self.P = [[p0 if i == j else 0.0 for j in range(self.n)]
@@ -428,9 +428,40 @@ class RLS:
         self.lam = 1.0
         self.count = 0
         self.innovation = 0.0
+        # Parameter projection (Ioannou & Sun): ``bounds[i]`` is (lo, hi)
+        # or None. A clipped parameter's excess is moved onto ``absorber``
+        # (an index) scaled by the regressor ratio, so the prediction for
+        # the sample that caused the clip is unchanged -- the constraint
+        # only redistributes a split the data could not pin down.
+        self.bounds = list(bounds) if bounds else [None] * self.n
+        self.absorber = absorber
 
     def predict(self, phi):
         return sum(t * p for t, p in zip(self.theta, phi))
+
+    def project(self, theta, phi):
+        """Clip ``theta`` into ``bounds``; move each clipped excess onto the
+        absorber so ``theta . phi`` is preserved (needs a nonzero absorber
+        regressor -- the constant term's is 1)."""
+        theta = list(theta)
+        for i, b in enumerate(self.bounds):
+            if b is None:
+                continue
+            lo, hi = b
+            clipped = theta[i]
+            if lo is not None and clipped < lo:
+                clipped = lo
+            if hi is not None and clipped > hi:
+                clipped = hi
+            if clipped == theta[i]:
+                continue
+            excess = theta[i] - clipped
+            theta[i] = clipped
+            j = self.absorber
+            if j is not None and j != i and phi[j] != 0.0 \
+                    and finite(phi[i], phi[j]):
+                theta[j] += excess * phi[i] / phi[j]
+        return theta
 
     def inflate(self, p0):
         """Re-open the covariance so the estimate can move again.
@@ -466,7 +497,7 @@ class RLS:
         theta = [self.theta[i] + gain[i] * err for i in range(self.n)]
         if not finite(*theta):
             return False
-        self.theta = theta
+        self.theta = self.project(theta, phi)
 
         # P = (P - gain outer Pphi) / lam, then symmetrize and bound.
         for i in range(self.n):
@@ -503,9 +534,11 @@ class DelayBank:
     better (margin) so odometry noise cannot flap the alignment.
     """
 
-    def __init__(self, theta0, p0, p_max, delays, ew_tau, margin):
+    def __init__(self, theta0, p0, p_max, delays, ew_tau, margin,
+                 bounds=None, absorber=None):
         self.delays = list(delays)
-        self.bank = [RLS(list(theta0), p0, p_max) for _ in self.delays]
+        self.bank = [RLS(list(theta0), p0, p_max, bounds, absorber)
+                     for _ in self.delays]
         self.score = [None] * len(self.delays)
         self.active = len(self.delays) // 2
         self.ew_tau = ew_tau
@@ -689,13 +722,16 @@ class CurvatureEnvelope:
             return None
         return min(self.left.value, self.right.value)
 
-    def max_curvature(self, model, v=None, derate=True):
+    def max_curvature(self, model, v=None, derate=True, forward=False):
         """Curvature believed reachable at full lock, at the planning speed.
 
         ``derate=False`` skips the pre-evidence derating. The controller's own
         clamp must use it: derated, the clamp holds steering below the
         evidence threshold, so the envelope can never confirm and the clamp
         never lifts -- a loop the planner push (which stays derated) is not in.
+
+        ``forward=True`` takes the worst of the two FORWARD cells only. For
+        the follower's lookahead, not the planner: see the node's push.
         """
         v = self.p.env_speed if v is None else v
         # Worst of ALL FOUR cells: Smac plans forward and reverse arcs with
@@ -708,11 +744,11 @@ class CurvatureEnvelope:
             (model.a0l, model.a0r, model.a0l_rev, model.a0r_rev),
             self.p.prior_a0)
         vv = model.a2 * v * v
-        extrapolated = min(
-            abs(model.a1 + a0l + vv),
-            abs(model.a1 - a0r - vv),
-            abs(model.a1 + a0l_rev + vv),
-            abs(model.a1 - a0r_rev - vv))
+        cells = [abs(model.a1 + a0l + vv), abs(model.a1 - a0r - vv)]
+        if not forward:
+            cells += [abs(model.a1 + a0l_rev + vv),
+                      abs(model.a1 - a0r_rev - vv)]
+        extrapolated = min(cells)
         if not finite(extrapolated):
             extrapolated = 0.0
 
@@ -730,8 +766,8 @@ class CurvatureEnvelope:
         kappa = max(kappa, 1.0 / self.p.radius_ceiling)
         return kappa
 
-    def min_turning_radius(self, model, v=None):
-        return 1.0 / self.max_curvature(model, v)
+    def min_turning_radius(self, model, v=None, forward=False):
+        return 1.0 / self.max_curvature(model, v, forward=forward)
 
     def state(self):
         return {'left': list(self.left.vals), 'right': list(self.right.vals)}
@@ -888,9 +924,23 @@ class AdaptiveCore:
                                   p.p0, p.p_max,
                                   _delays(p.lat_delay), p.delay_ew_tau,
                                   p.delay_switch_margin)
+        # Drag opposes motion: b2 <= 0 is physics, enforced IN the fit.
+        # At one cruise speed b1/b2/b3 are collinear and only their sum is
+        # pinned; left free, the split wandered to b2 = +2.74 (2026-08-29
+        # 12:49 run, 18k samples at 0.32 m/s), and the inversion evaluated
+        # that sum at the COMMANDED speed -- off the cruise point, where
+        # the split is everything: the model's holding wire fell with
+        # speed (0.33 at 0.05 m/s, 0.20 at 0.32), so a 0.07 command got
+        # MORE wire than cruise and the car did 0.30 m/s for any command
+        # in 0.05..0.32, arriving at every cusp at 0.36 m/s. The old fix
+        # was a post-hoc clamp in the inversion, rejected because it moved
+        # the equilibrium; the projection here keeps the prediction at the
+        # clipping sample exact by moving the excess onto b1.
         self.lon_bank = DelayBank([p.prior_b0, 0.0, 0.0, 0.0], p.p0, p.p_max,
                                   _delays(p.lon_delay), p.delay_ew_tau,
-                                  p.delay_switch_margin)
+                                  p.delay_switch_margin,
+                                  bounds=[None, None, (None, 0.0), None],
+                                  absorber=1)
         self._kappa_prev = 0.0
         self._kappa_changed_t = None
         self.odom_ok = True
@@ -917,6 +967,8 @@ class AdaptiveCore:
         self.qs = self.qd = 0.0
         # (stamp, us, ud) history for delay-aligned regression
         self._cmd_hist = deque(maxlen=64)
+        # Sane raw speeds, for the held-speed span (see _held_speed).
+        self._v_hist = deque(maxlen=64)
         self.iw = self.iv = 0.0
         self.prev_us = self.prev_ud = 0.0
         # Last throttle actually put on the wire (after dead-band compensation),
@@ -1119,6 +1171,7 @@ class AdaptiveCore:
         self.psidot += self.alpha * (psidot_raw - self.psidot)
         self.v_prev = v
         self.v = v
+        self._v_hist.append(v)
         tau = self.policy.v_fb_tau
         if tau > 0.0:
             self.v_fb += (v - self.v_fb) * (1.0 - math.exp(-dt / tau))
@@ -1241,6 +1294,24 @@ class AdaptiveCore:
             self._enter(CAL if p.enable_calibration else RUN, t)
         return self._safe_output()
 
+    def _held_speed(self):
+        """The speed the car has HELD: the median of the raw speed over one
+        settling window (learned delay + actuator constant, the same span
+        the learner already demands before it believes a sample). The
+        speed span exists to say what range the fit was identified over;
+        single ticks of pose-differenced odometry are not that range.
+        2026-08-29: the persisted span read -1.14..1.15 m/s on a car
+        commanded at most 0.32 -- every value past 0.5 was an ICP jump
+        (10% of commanded ticks sat 0.2 m/s above the command), so the
+        "evaluate inside the fitted range" clamp on the feedforward and
+        the identifiability test in ready_lon were both inert."""
+        n = max(3, int(round((self.lon_bank.delay + self.policy.tau_d)
+                             / max(self.dt, 1e-3))))
+        recent = list(self._v_hist)[-n:]
+        if not recent:
+            return self.v
+        return sorted(recent)[len(recent) // 2]
+
     def _delayed_cmd(self, delay):
         """The (us, ud) that was on the wire `delay` seconds ago."""
         target = self.now - delay
@@ -1311,7 +1382,8 @@ class AdaptiveCore:
                 ok = True
                 self.qd_lo, self.qd_hi = _span(self.qd_lo, self.qd_hi,
                                                self.qd)
-                self.vl_lo, self.vl_hi = _span(self.vl_lo, self.vl_hi, v)
+                self.vl_lo, self.vl_hi = _span(self.vl_lo, self.vl_hi,
+                                               self._held_speed())
         # Lateral. psidot/v is curvature; dividing by v amplifies noise, which
         # is why the speed gate is 1.6x the longitudinal one. There is
         # deliberately no lower gate on psidot: straight-line samples are what
@@ -1390,7 +1462,19 @@ class AdaptiveCore:
         # Ask for no more curvature than the vehicle is believed to have.
         # Without this the inversion winds the trim integrator up against a
         # saturated steering command it can never satisfy.
-        kappa_max = self.envelope.max_curvature(self.model, v, derate=False)
+        #
+        # Evaluated at v_eff, not the raw sample speed, here and in the
+        # speed term of the inversion below. Pose-differenced odometry
+        # spikes under motion: the 2026-08-29 12:04 run had |v| above the
+        # command by 0.2 m/s on 10% of commanded ticks (single-tick peaks to
+        # 1.15 m/s against 0.32 commanded; MOLA at rest is quiet, p99 1.5 cm)
+        # and with a2 at -3.0 a 0.7 m/s tick took the span from 2.1 to 0.9
+        # -- a 1.4x median, 2.1x p90 steering-gain kick on those ticks, and
+        # the same tick shrank kappa_max under the demand. The commanded
+        # speed is what the car is about to do; the learner keeps the raw
+        # speed (filtering a regressor biases RLS).
+        kappa_max = self.envelope.max_curvature(self.model, v_eff,
+                                                derate=False)
         kappa_des = clamp(cmd_w / v_eff, -kappa_max, kappa_max)
         # A meaningful change in demanded curvature starts a settling window
         # of one LEARNED delay plus the servo constant: during it the yaw
@@ -1460,7 +1544,7 @@ class AdaptiveCore:
             a0_dir = a0l if knet >= 0.0 else a0r
         else:
             a0_dir = a0l_rev if knet >= 0.0 else a0r_rev
-        span = a0_dir + a2 * v * v
+        span = a0_dir + a2 * v_eff * v_eff
         if abs(a0_dir) > p.den_min:
             self.steering_fault = False
             # Understeer may reduce the gain but not erase it, and certainly
@@ -1938,6 +2022,11 @@ class AdaptiveCore:
         lat = list(sane_gain_cells(lat[:4], p.prior_a0)) + list(lat[4:])
         self.lat_bank.seed(lat, n_lat, p0)
         self.qs_lo, self.qs_hi = qs
+        if lon[2] > 0.0:
+            # Same projection as the fit's, anchored at the planning speed
+            # so the persisted cruise wire (what lon_sane judges) is kept.
+            lon[1] += lon[2] * p.env_speed ** 2
+            lon[2] = 0.0
         if lon_sane(lon, vl[0], vl[1], p):
             self.lon_bank.seed(lon, n_lon, p0)
             self.qd_lo, self.qd_hi = qd

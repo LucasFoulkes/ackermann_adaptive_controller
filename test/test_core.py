@@ -630,11 +630,15 @@ def test_dead_steering_does_not_latch_the_controller_to_zero():
     core = AdaptiveCore()
     plant = DeadSteering()
     t = settle_sense(core, plant)
-    # 120 s, not 60: the per-direction split halves each gain's sample rate,
-    # so concluding BOTH sides are dead takes twice the evidence.
+    # 180 s: the per-direction split halves each gain's sample rate, so
+    # concluding BOTH sides are dead takes twice the evidence of one, and
+    # the cells hover at den_min from ~80 s to ~130 s (the fault flag
+    # flips, the fallback changes the excitation, the collapse pauses)
+    # before settling below it -- at 120 s the verdict depended on the
+    # third decimal of the speed (2026-08-29, v_eff in the inversion).
     out, t = drive(core, plant,
                    lambda s: (0.5, 0.6 * math.sin(2.0 * math.pi * 0.1 * s)),
-                   120.0, t0=t)
+                   180.0, t0=t)
     # the learner is entitled to conclude the gain is ~0 -- that is true
     assert abs(core.model.a0) < 0.5
     # ...but the controller must keep steering anyway
@@ -648,7 +652,7 @@ def test_steering_recovers_when_the_actuator_comes_back():
     t = settle_sense(core, plant)
     _, t = drive(core, plant,
                  lambda s: (0.5, 0.6 * math.sin(2.0 * math.pi * 0.1 * s)),
-                 120.0, t0=t)
+                 180.0, t0=t)   # see test_dead_steering_does_not_latch...
     assert core.steering_fault
     # servo reconnected: same plant, steering now works
     alive = Plant()
@@ -1756,6 +1760,89 @@ def test_two_two_sign_tie_is_poison_not_a_vehicle():
     r = core.envelope.min_turning_radius(core.model)
     assert 0.0 < r < core.policy.radius_ceiling
     assert core.envelope.max_curvature(core.model) < abs(0.26 + 4.55)
+
+
+def test_positive_drag_is_projected_out_of_the_fit_and_the_car_slows_down():
+    """2026-08-29 12:49 run: a collinear cruise fit with b2 = +2.74 made
+    the feedforward RISE as the command fell (0.32 wire for a 0.07 m/s
+    command vs 0.20 for cruise), so the car ran ~0.30 m/s whatever the
+    follower asked below cruise. The constraint lives in the fit, keeps
+    the cruise wire (prediction-preserving projection), and a command
+    below cruise must now actually slow the car."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.delay = 0.35
+    t = settle_sense(core, plant)
+    # the robot's situation: consistent at v=0.3, wildly positive b2
+    seed = [2.2, -0.2115, +2.0, 0.0]
+    core.qd_lo, core.qd_hi = 0.0, 0.8
+    core.vl_lo, core.vl_hi = 0.20, 0.40
+    core.lon_bank.seed(seed, 10_000, 1e-12)
+    ff_before = -(seed[1] + seed[2] * 0.09 + seed[3]) / seed[0]
+    _, t = drive(core, plant, lambda s: (0.3, 0.0), 20.0, t0=t)
+    m = core.model
+    assert m.b2 <= 0.0
+    # the holding wire at the cruise the data pinned is (nearly) unchanged:
+    # the projection preserves the prediction at the sample that fired it,
+    # which with this frozen covariance is the first accepted one -- the
+    # launch overshoot at ~0.34 m/s -- and nothing re-adapts afterwards.
+    # On the robot P is re-opened on load and the excess at a live clip is
+    # tiny, so the anchor mismatch is a test artefact: 0.02 wire here.
+    ff_after = -(m.b1 + m.b2 * 0.09 + m.b3) / m.b0
+    assert ff_after == pytest.approx(ff_before, abs=0.05)
+    # and it no longer grows as the command shrinks
+    assert -(m.b1 + m.b2 * 0.15 ** 2 + m.b3) / m.b0 <= ff_after + 1e-9
+    # follower asks for half speed: the car must come down, not hold 0.3
+    vs = []
+    for _ in range(80):                       # 8 s
+        t += 0.1
+        x, y, psi = plant.observe()
+        out = core.step(t, x, y, psi, 0.15, 0.0)
+        for _ in range(5):
+            plant.step(out.steer, out.drive, 0.02)
+        vs.append(plant.v)
+    assert max(vs) < 0.33
+    assert vs[-1] < 0.22, vs[-1]
+
+
+def test_projection_preserves_the_prediction_at_the_clipping_sample():
+    r = RLS([2.0, 0.0, 0.5, 0.0], 10.0, 1e4,
+            bounds=[None, None, (None, 0.0), None], absorber=1)
+    phi = [0.3, 1.0, 0.09, 1.0]
+    before = r.predict(phi)
+    r.theta = r.project(r.theta, phi)
+    assert r.theta[2] == 0.0
+    assert r.predict(phi) == pytest.approx(before)
+
+
+def test_speed_span_is_of_speeds_the_car_held():
+    """A one-tick odometry jump inside the acceleration gate used to
+    become the top of the fitted speed range."""
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.3, 0.0), 15.0, t0=t)
+    hi_before = core.vl_hi
+    assert hi_before is not None and hi_before < 0.45
+    plant.x += 0.035                # 3.5 cm ICP jump: +0.35 m/s for one tick
+    _, t = drive(core, plant, lambda s: (0.3, 0.0), 2.0, t0=t)
+    assert core.vl_hi < 0.45, core.vl_hi
+
+
+def test_persisted_positive_drag_is_projected_on_load():
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    d = core.state()
+    d['longitudinal'] = [2.194, -0.024, 2.739, -0.700]     # the 12:49 file
+    d['n_lon'] = 18237
+    d['spans']['qd'] = [-0.42, 0.50]
+    d['spans']['vl'] = [-0.6, 0.6]
+    assert core.load_state(d)
+    m = core.model
+    v = core.policy.env_speed
+    assert m.b2 == 0.0
+    assert -(m.b1 + m.b3) / m.b0 == pytest.approx(
+        -(-0.024 + 2.739 * v * v - 0.700) / 2.194, abs=1e-6)
 
 
 def test_self_accelerating_throttle_model_is_not_a_vehicle():
