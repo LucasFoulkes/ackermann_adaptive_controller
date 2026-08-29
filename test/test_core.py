@@ -1229,8 +1229,13 @@ def test_steering_gain_is_identified_through_a_real_delay():
 
 
 def test_unaligned_regression_is_worse_on_a_delayed_plant():
-    """Control: the same plant with lat_delay = 0 must identify worse."""
+    """Control: the same plant with lat_delay = 0 (a single candidate, no
+    alignment) must identify worse. Judged on the SPAN a0 + a2 v^2 the
+    controller inverts, not a0 alone: at one speed the split is arbitrary,
+    and the unaligned fit once landed a0 within 2% by dumping the
+    misalignment into a2 (-1.22 for a true -0.30)."""
     res = {}
+    v = 0.45
     for d in (0.0, 0.40):
         core = AdaptiveCore(Policy(lat_delay=d))
         plant = Plant(pose_noise=0.002)
@@ -1240,7 +1245,9 @@ def test_unaligned_regression_is_worse_on_a_delayed_plant():
               lambda s: (0.45 + 0.15 * math.sin(2.0 * math.pi * 0.03 * s),
                          0.6 * math.sin(2.0 * math.pi * 0.10 * s)),
               150.0, t0=t)
-        res[d] = abs(core.model.a0 - plant.a0)
+        m = core.model
+        truth = plant.a0 + plant.a2 * v * v
+        res[d] = abs(m.a0 + m.a2 * v * v - truth)
     assert res[0.40] < res[0.0], res
 
 
@@ -2417,3 +2424,66 @@ def test_launch_floor_never_exceeds_the_lowest_breakaway_seen():
     assert core2.deadband.confirmed(1.0)
     core2._run(0.0, 0.3, 0.0, 0.1)
     assert core2._floor == pytest.approx(core2.deadband.fwd.value)
+
+
+# -- directional forgetting: no covariance windup at one cruise speed -------
+
+def test_directional_forgetting_keeps_unexcited_information():
+    """Excite one direction only: information along it settles at a bound
+    instead of winding up, and the orthogonal direction's covariance is
+    untouched -- scalar forgetting would have inflated it by 1/lam^n."""
+    rls = RLS([0.0, 0.0], p0=1.0, p_max=1e6)
+    lam = 0.98
+    for _ in range(500):
+        rls.update([1.0, 0.0], 0.5, lam)
+    assert rls.P[1][1] == pytest.approx(1.0)          # never re-measured
+    assert rls.P[0][0] < 0.1                          # bounded, not 1/lam^500
+    assert rls.theta[0] == pytest.approx(0.5, abs=1e-3)
+    # the P-form is the information-matrix form R <- R - (1-lam) phi phi^T
+    # / (phi^T P phi) + phi phi^T
+    import random
+    rng = random.Random(5)
+    rls = RLS([0.0, 0.0, 0.0], p0=4.0, p_max=1e6)
+    R = [[0.25 if i == j else 0.0 for j in range(3)] for i in range(3)]
+    for _ in range(40):
+        phi = [rng.uniform(-1, 1) for _ in range(3)]
+        pphi = [sum(rls.P[i][j] * phi[j] for j in range(3)) for i in range(3)]
+        s = sum(a * b for a, b in zip(phi, pphi))
+        rls.update(phi, rng.uniform(-1, 1), lam)
+        R = [[R[i][j] - (1 - lam) * phi[i] * phi[j] / s + phi[i] * phi[j]
+              for j in range(3)] for i in range(3)]
+        for i in range(3):
+            for j in range(3):
+                rp = sum(R[i][k] * rls.P[k][j] for k in range(3))
+                assert rp == pytest.approx(1.0 if i == j else 0.0, abs=1e-6)
+
+
+def test_the_fit_does_not_drift_at_one_cruise_speed():
+    """Scalar forgetting walked b0 4.29 -> -2.2 in 60 s of cruise on this
+    plant (08-29 bench): at one speed qd, 1, v|v| and sgn(v) are collinear
+    and every direction was being discounted. A direction that is not
+    being re-measured must keep what it learned: five minutes of cruise
+    after a good fit may move b0 by a fifth, not erase it."""
+    core = AdaptiveCore(Policy(prior_a0=0.12, prior_b0=4.0))
+    plant = Plant(a=(0.12, 0.0, -0.002), b=(4.0, 0.0, -0.6), tau_s=0.5,
+                  pose_noise=0.002)
+    plant.delay = 1.0
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((0.6, 1.4, 1.0, 1.8), 10, 0.20, 0.04),
+                 240.0, t0=t)
+    b0_fit = core.model.b0
+    assert b0_fit == pytest.approx(plant.b0, rel=0.35)
+    _, t = drive(core, plant, lambda s: (1.6, 0.05 * math.sin(0.5 * s)),
+                 300.0, t0=t)
+    assert core.model.b0 == pytest.approx(b0_fit, rel=0.20), (b0_fit, core.model)
+    assert core.lon_plausible()
+    # and this robot's own scale: 08-23 plant, 5 min at Nav2's 0.32 m/s
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((0.2, 0.45, 0.3, 0.55), 10, 0.5, 0.12),
+                 120.0, t0=t)
+    b0_fit = core.model.b0
+    assert b0_fit == pytest.approx(plant.b0, rel=0.35)
+    _, t = drive(core, plant, lambda s: (0.32, 0.0), 300.0, t0=t)
+    assert core.model.b0 == pytest.approx(b0_fit, rel=0.20), (b0_fit, core.model)

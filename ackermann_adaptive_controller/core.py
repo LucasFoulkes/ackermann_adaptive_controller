@@ -612,9 +612,40 @@ class RLS:
         if not finite(y, lam, *phi) or lam <= 0.0:
             return False
 
-        # Pphi = P @ phi
-        pphi = [sum(self.P[i][j] * phi[j] for j in range(self.n))
-                for i in range(self.n)]
+        # DIRECTIONAL forgetting (Kulhavy & Karny 1984, "restricted
+        # exponential forgetting"): discount the information only along
+        # the direction this sample excites, then add the sample with no
+        # discount. P <- P + ((1-lam)/lam) (P phi)(P phi)^T / (phi^T P phi),
+        # which in information terms is R <- R - (1-lam) phi phi^T /
+        # (phi^T P phi), followed by the usual R <- R + phi phi^T. Scalar
+        # forgetting (R <- lam R + phi phi^T) discounts EVERY direction
+        # every sample, so under one cruise speed -- where qd, 1, v|v| and
+        # sgn(v) are collinear -- the unexcited directions lose their
+        # information (covariance windup), the gain grows there, and every
+        # sample's noise walks the fit along the null space: b0 4.29 ->
+        # -2.2 with b1 rising to keep b0*qd + b1 fixed, in 60 s of a
+        # synthetic 4 m/s^2 vehicle at cruise (08-29 bench), and the
+        # b2 = +2.74 split of the 12:49 run. Here a direction that is not
+        # being re-measured keeps what it learned, and the information
+        # along the excited one settles at phi^T P phi ~ 1-lam instead
+        # of growing without bound.
+        if lam < 1.0:
+            pphi0 = [sum(self.P[i][j] * phi[j] for j in range(self.n))
+                     for i in range(self.n)]
+            s = sum(a * b for a, b in zip(phi, pphi0))
+            if finite(s) and s > 1e-12:
+                c = (1.0 - lam) / (lam * s)
+                for i in range(self.n):
+                    for j in range(self.n):
+                        self.P[i][j] += c * pphi0[i] * pphi0[j]
+                lam = 1.0
+                # (P + c u u^T) phi = u (1 + c s) with u = P phi
+                pphi = [u * (1.0 + c * s) for u in pphi0]
+            else:
+                pphi = pphi0
+        else:
+            pphi = [sum(self.P[i][j] * phi[j] for j in range(self.n))
+                    for i in range(self.n)]
         denom = lam + sum(phi[i] * pphi[i] for i in range(self.n))
         if not finite(denom) or abs(denom) < 1e-9:
             return False
@@ -686,9 +717,21 @@ class DelayBank:
     """
 
     def __init__(self, theta0, p0, p_max, delays, ew_tau, margin,
-                 bounds=None, absorber=None, gain_idx=(0,), min_count=0):
+                 bounds=None, absorber=None, gain_idx=(0,), min_count=0,
+                 gains=None):
         self.delays = list(delays)
         self.prior = list(theta0)
+        # ``gains(theta)`` -> per-cell IDENTIFIABLE gains, the veto on a
+        # switch: the peak is ranked on the bare coefficients at gain_idx
+        # (alignment shows there -- on a slow slalom the identifiable span
+        # barely differs between candidates), but a challenger whose
+        # identifiable gain is smaller than the incumbent's is a split
+        # artefact, not a better alignment: after a fault re-opened every
+        # covariance, the 2.28 s candidate once won on a0 alone with a0
+        # high and a2 very negative -- the same span, a different address
+        # (08-29 bench, recovery test). The lateral bank passes the span
+        # a0 + a2 v_op^2 per cell; the default is the bare coefficients.
+        self.gains = gains or (lambda th: [th[k] for k in gain_idx])
         self.bank = [RLS(list(theta0), p0, p_max, bounds, absorber)
                      for _ in self.delays]
         self.score = [None] * len(self.delays)
@@ -710,10 +753,19 @@ class DelayBank:
         """The candidate's fitted gain, signed against the incumbent."""
         if signs is None:
             signs = self._signs()
-        return sum(self.bank[i].theta[k] * s
-                   for k, s in zip(self.gain_idx, signs))
+        th = self.bank[i].theta
+        return sum(th[k] * s for k, s in zip(self.gain_idx, signs))
+
+    def identifiable_gain(self, i, signs=None):
+        if signs is None:
+            signs = self._signs()
+        return sum(g * s for g, s in zip(self.gains(self.bank[i].theta),
+                                         signs))
 
     def _signs(self):
+        # From the BARE cells, not the span: a span's sign flips when a2
+        # is large, and signs taken from it hopped the bank between
+        # candidates with inverted cells (08-29 bench).
         act = self.bank[self.active]
         return [sgn(act.theta[k]) or sgn(self.prior[k]) or 1.0
                 for k in self.gain_idx]
@@ -748,7 +800,11 @@ class DelayBank:
                 best, best_gain = i, g
         if best != self.active and finite(cur) \
                 and best_gain * self.margin > cur:
-            self.active = best
+            span_cur = self.identifiable_gain(self.active, signs)
+            span_best = self.identifiable_gain(best, signs)
+            if finite(span_cur, span_best) \
+                    and span_best >= self.margin * span_cur:
+                self.active = best
         return accepted
 
     def inflate(self, p0):
@@ -1140,7 +1196,13 @@ class AdaptiveCore:
                                   _delays(p.lat_delay), p.delay_ew_tau,
                                   p.delay_switch_margin,
                                   gain_idx=(0, 1, 2, 3),
-                                  min_count=p.ready_lat_samples)
+                                  min_count=p.ready_lat_samples,
+                                  # a2 <= 0 is physics (see _run); an
+                                  # unphysical positive a2 may not buy a
+                                  # candidate a larger span
+                                  gains=lambda th: [
+                                      th[k] + min(th[5], 0.0) * self.v_op ** 2
+                                      for k in range(4)])
         self.lat_bank.set_delay(p.lat_delay)
         # Drag opposes motion: b2 <= 0 is physics, enforced IN the fit.
         # At one cruise speed b1/b2/b3 are collinear and only their sum is
@@ -1740,6 +1802,20 @@ class AdaptiveCore:
         settled = (self.rolling and self._roll_since is not None
                    and self.now - self._roll_since
                    >= self.lon_bank.delay + self.policy.tau_d)
+        # The speed in the regressor: the raw sample only when it is a
+        # TRANSIENT (further from the held median than three sigma of the
+        # SENSE noise), the held median otherwise. At cruise the raw
+        # sample's deviation from the median IS the odometry noise, and a
+        # noisy regressor biases its own coefficient toward zero
+        # (errors-in-variables): b2 -> 0 and, b0 and b2 being collinear at
+        # one cruise, b0 with it. Measured on the bench (08-29): five
+        # minutes at cruise walked b0 3.18 -> 2.16 with the noise on and
+        # not at all with it off, forgetting or no forgetting; the median
+        # alone held it (1.75 -> 1.74) but its lag in the speed steps cost
+        # the transient fit (3.18 -> 1.75). Each regime gets the estimate
+        # that is unbiased in it.
+        held = self._held_speed()
+        v_reg = v if abs(v - held) > 3.0 * self.sigma_v else held
         if settled and abs(self.vdot) < a_gate and abs(v) > self.gate_d:
             def phi_lon(delay):
                 d = self._delayed_cmd(delay)
@@ -1760,7 +1836,7 @@ class AdaptiveCore:
                            if w.vals else 0.0)
                     if 0.0 < abs(d[1]) < thr:
                         return None
-                return [d[1], 1.0, v * abs(v), sgn(v)]
+                return [d[1], 1.0, v_reg * abs(v_reg), sgn(v)]
             if self.lon_bank.update(phi_lon, self.vdot, self.lam, self.dt):
                 ok = True
                 self.qd_lo, self.qd_hi = _span(self.qd_lo, self.qd_hi,
@@ -1782,7 +1858,13 @@ class AdaptiveCore:
                                           self._dir_since or self._roll_since)
                        >= self.lat_bank.delay + self.policy.tau_s)
         if settled_lat and abs(v) > self.gate_s and abs(self.psidot) < 4.0:
-            kappa = self.psidot / v
+            # Same instrument for the lateral fit: the a2 term's v^2 and
+            # the division that makes curvature of the yaw rate both use
+            # the held speed (the raw sample's noise would otherwise sit
+            # in both the regressor and the target).
+            v_k = v_reg if abs(v_reg) > self.gate_s and sgn(v_reg) == sgn(v) \
+                else v
+            kappa = self.psidot / v_k
             def phi_lat(delay):
                 d = self._delayed_cmd(delay)
                 if d is None:
@@ -1794,8 +1876,8 @@ class AdaptiveCore:
                 # here, so its sign is meaningful).
                 qsp, qsn = max(d[0], 0.0), min(d[0], 0.0)
                 if v >= 0.0:
-                    return [qsp, qsn, 0.0, 0.0, 1.0, d[0] * v * v]
-                return [0.0, 0.0, qsp, qsn, 1.0, d[0] * v * v]
+                    return [qsp, qsn, 0.0, 0.0, 1.0, d[0] * v_k * v_k]
+                return [0.0, 0.0, qsp, qsn, 1.0, d[0] * v_k * v_k]
             accepted_lat = self.lat_bank.update(phi_lat, kappa, self.lam,
                                                 self.dt)
             if accepted_lat:
@@ -1962,7 +2044,11 @@ class AdaptiveCore:
         else:
             a0_dir = a0l_rev if knet >= 0.0 else a0r_rev
         span = a0_dir + a2 * v_eff * v_eff
-        if abs(a0_dir) > p.den_min:
+        # Collapsed means the EFFECTIVE gain at this speed, not a0 alone:
+        # a dead servo's fit lands wherever the collinear a0/a2 split
+        # happens to sit (a0l 0.06 with a2 -0.24 cancelling it at 0.5 m/s
+        # on the bench, 08-29) -- the same zero, a different address.
+        if abs(a0_dir) > p.den_min and abs(span) > p.den_min:
             self.steering_fault = False
             # Understeer may reduce the gain but not erase it, and certainly
             # not invert it -- an inverted denominator steers the wrong way.
