@@ -492,6 +492,21 @@ class Policy:
     odom_glitch_margin: float = 2.0
     odom_glitch_trip: int = 3
     odom_recover_time: float = 1.0
+    # An implausible stream is answered with the neutral wire for this
+    # long before it is declared failed (zero output). odom_glitch_trip
+    # samples in a row was 0.3 s: right for the 11:56 dead LiDAR link,
+    # wrong for a scan-matcher excursion, which is over in a second --
+    # zeroing the wire inside it is itself a step in the motion. What is
+    # NOT gated, deliberately: this LiDAR odometry reads 0.5-1.1 m/s
+    # against a 0.32 command on 7-16% of commanded ticks in every session
+    # since 08-23 -- sustained excursions, not spikes -- and a ratio gate
+    # on them (1.5 x v_op) could not be told from a real launch lunge,
+    # which peaks at 2.3x the command 1.2 s after breakaway on the sticky
+    # plant, or from the controller's own push after a phantom dip; it
+    # turned lunges into stops (08-29 bench). The excursions are a sensor
+    # problem: the gyro-fused odometry (use_ekf) showed 0-4% in the 08-28
+    # sessions against 13-24% for raw MOLA.
+    odom_glitch_hold: float = 1.0
 
     # Dead-man: no odometry for this many nominal steps stops the actuators.
     odom_timeout_steps: float = 3.0
@@ -1320,6 +1335,7 @@ class AdaptiveCore:
         self._kappa_changed_t = None
         self.odom_ok = True
         self._glitch_run = 0
+        self._glitch_since = 0.0
         self._sane_run = 0
         # Start floor, re-applied AFTER the slew: stepping the wire straight
         # to the learned breakaway IS the controlled launch; ramping to it
@@ -1336,6 +1352,9 @@ class AdaptiveCore:
         # integrator pinning under the cap as "against something".
         self._shaped = 0.0
         self._clip = 0.0
+        # The feedforward-only throttle for the current command (no PI):
+        # what an implausible odometry sample is answered with.
+        self._ff_wire = None
         self.envelope = CurvatureEnvelope(p)
         self._roll_dir = 0.0
         self._dir_since = None
@@ -1495,6 +1514,12 @@ class AdaptiveCore:
                     r.theta[k] = signed
         self.lat_bank.prior = [signed] * 4 + list(self.lat_bank.prior[4:])
 
+    def _settled(self):
+        """Past the settling window after the last (re-)breakaway."""
+        return (self.rolling and self._roll_since is not None
+                and self.now - self._roll_since
+                >= self.lon_bank.delay + self.policy.tau_d)
+
     def _speed_up_limit(self, since):
         """Largest plausible gain in |v| since the last accepted sample
         (``since`` seconds ago), or None while the launch transient is
@@ -1507,10 +1532,7 @@ class AdaptiveCore:
         time since the last accepted sample so a held tick cannot chain:
         every later sample is judged against a frozen v_prev."""
         p = self.policy
-        settled = (self.rolling and self._roll_since is not None
-                   and self.now - self._roll_since
-                   >= self.lon_bank.delay + p.tau_d)
-        if not settled:
+        if not self._settled():
             return None
         noise = max(self.sigma_v, self.tick)
         if noise <= 0.0:
@@ -1710,13 +1732,21 @@ class AdaptiveCore:
             # coasting into a cusp, and the full-throttle bound (1 m/s per
             # tick) let every one of them through into v_op, the delay
             # banks and the a2 fit.
-            up_lim = self._speed_up_limit(t - self._v_prev_t)
+            # Every bound is per second SINCE THE LAST ACCEPTED SAMPLE, not
+            # per tick: a held tick freezes v_prev, and judged per tick every
+            # later sample failed against it -- a chain to a fault that only
+            # the old 0.3 s trip had hidden (08-29 bench, 2 m/s cruise).
+            since = max(t - self._v_prev_t, dt)
+            up_lim = self._speed_up_limit(since)
             gained = abs(v) - abs(self.v_prev)
-            if abs(v - self.v_prev) > a_lim * dt or abs(psidot_raw) > w_lim \
+            if abs(v - self.v_prev) > a_lim * since or abs(psidot_raw) > w_lim \
                     or (up_lim is not None and gained > up_lim):
                 self._sane_run = 0
+                if self._glitch_run == 0:
+                    self._glitch_since = t
                 self._glitch_run += 1
-                if self._glitch_run >= self.policy.odom_glitch_trip:
+                if self._glitch_run >= self.policy.odom_glitch_trip \
+                        and t - self._glitch_since >= self.policy.odom_glitch_hold:
                     self.odom_ok = False
                 if not self.odom_ok:
                     # Once the stream is distrusted, judge it on its own
@@ -2459,6 +2489,9 @@ class AdaptiveCore:
             # +0.25 cruise, the car never left the launch floor).
             motion = sgn(v) if abs(v) > self.gate_d else 0.0
             ud = self.deadband.compensate(a_des / p.prior_b0, motion)
+            # no model feedforward yet: an implausible sample holds the
+            # last wire (see _hold_output)
+            self._ff_wire = None
         else:
             # Invert the model EXACTLY as fitted: whatever the (partly
             # arbitrary) split between b1, b2 and b3, inverting their sum
@@ -2492,8 +2525,10 @@ class AdaptiveCore:
             # a_des/b0 goes through the bounded b0_fb (above): there b0 is
             # a loop gain, not a vehicle property.
             ud = a_des / b0_fb
+            ff = -(b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
+            self._ff_wire = clamp(ff, -1.0, 1.0) if not reversing else 0.0
             if not reversing:
-                ud -= (b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
+                ud += ff
         if p.enable_dither and self.dither > 0.0:
             ud += self.dither * math.sin(2.0 * math.pi * 0.7 * self.now)
         raw = ud + self.iv
@@ -2660,9 +2695,15 @@ class AdaptiveCore:
         return prev + clamp(target - prev, -limit, limit)
 
     def _hold_output(self):
-        """A single implausible sample: keep the wire where it was."""
+        """An implausible sample: steer as before, and on the throttle put
+        the wire that HOLDS the commanded speed (the model feedforward,
+        _ff_wire) -- neither chase the reading nor keep pushing. Holding
+        the last wire through a genuine overshoot kept the lunge wire on
+        and ran a sticky plant away to 0.9 m/s (08-29 bench)."""
         m = self.model
-        return Output(steer=self.prev_us, drive=self.prev_wire,
+        drive = self._ff_wire if self._ff_wire is not None else self.prev_wire
+        self.prev_ud = self.prev_wire = drive
+        return Output(steer=self.prev_us, drive=drive,
                       phase=self.phase, v=self.v, psidot=self.psidot,
                       dt=self.dt, model=m,
                       min_turning_radius=self.envelope.min_turning_radius(m),

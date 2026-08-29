@@ -2737,3 +2737,41 @@ def test_a_mid_segment_stiction_release_is_neither_learned_nor_a_glitch():
     assert core.odom_ok
     assert core.model.n_lon == n_stall                  # not learned from
     assert core.model.b0 == pytest.approx(b0_before, rel=0.05)
+
+
+# -- 08-29 16:59 drive: sustained scan-matcher excursions -----------------------
+
+def test_an_implausible_stream_is_answered_neutrally_and_fails_only_after_the_hold():
+    """A scan-matcher excursion is over in a second; zeroing the wire on
+    the third implausible tick was itself a step in the motion. While the
+    stream is implausible the throttle is the model feedforward for the
+    command (neither chased nor pushed); a dead link still fails, after
+    odom_glitch_hold."""
+    import random
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.002)
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((0.25, 0.55, 0.35, 0.65), 15, 0.3, 0.12),
+                 120.0, t0=t)
+    assert core.ready_lon
+    _, t = drive(core, plant, lambda s: (0.32, 0.0), 10.0, t0=t)
+    ff = core._ff_wire
+    assert ff is not None and 0.0 < ff < 0.6
+    x, y, psi = plant.observe()
+    rng = random.Random(1)
+    failed_at = None
+    held = []                                # (drive, ff at that tick)
+    for i in range(30):
+        t += 0.1
+        gl = core._glitch_run
+        out = core.step(t, x + rng.uniform(-0.3, 0.3), y + rng.uniform(-0.3, 0.3),
+                        psi + rng.uniform(-0.3, 0.3), 0.32, 0.0)
+        if core._glitch_run > gl and core.odom_ok:
+            held.append((out.drive, core._ff_wire))
+        if not core.odom_ok and failed_at is None:
+            failed_at = i
+    hold = core.policy.odom_glitch_hold
+    assert failed_at is not None and failed_at >= int(hold / 0.1) - 1, failed_at
+    assert len(held) >= 5
+    assert all(abs(d - f) < 1e-9 and d > 0.0 for d, f in held), held
+    assert core.prev_wire == 0.0                                # failed: zero
