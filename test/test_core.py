@@ -339,14 +339,34 @@ def test_standstill_yaw_command_does_not_divide_by_zero():
 
 # -- calibration -----------------------------------------------------------
 
+def run_cal(core, plant, t, max_s=40.0, dt=0.1):
+    """Drive with no command until CAL hands over to RUN; returns t and
+    the stages seen, in order."""
+    stages = []
+    end = t + max_s
+    while core.phase == CAL and t < end:
+        if core._cal_stage and (not stages or stages[-1] != core._cal_stage):
+            stages.append(core._cal_stage)
+        _, t = drive(core, plant, lambda s: (0.0, 0.0), dt, t0=t, dt=dt)
+    return t, stages
+
+
 def test_calibration_phase_runs_and_exits():
     core = AdaptiveCore(Policy(enable_calibration=True))
     plant = Plant()
     t = settle_sense(core, plant)
     assert core.phase == CAL
-    _, t = drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
+    t, stages = run_cal(core, plant, t)
     assert core.phase == RUN
+    assert stages == ['signs', 'gains', 'reverse'], stages
     assert 0.03 <= core.dither <= 0.12
+    # what the stages bought: a locked sign, a lateral fit ready to be
+    # inverted, and reverse data so b3 and b1 are separable
+    assert core.steer_sign == 1.0
+    assert core.ready_lat
+    assert core.vl_lo is not None and core.vl_lo < 0.0, core.vl_lo
+    # (this plant has no Coulomb friction, so the final stop stage runs to
+    # its timeout while the car coasts; a real car stops on b3)
 
 
 def test_calibration_is_off_by_default():
@@ -2275,11 +2295,13 @@ def test_calibration_establishes_an_inverted_steering_sign_and_defends_it():
     plant = Plant(a=(-1.30, 0.04, 0.30))
     t = settle_sense(core, plant)
     assert core.phase == CAL and core.steer_sign is None
-    out, t = drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
+    t, stages = run_cal(core, plant, t)
     assert core.phase == RUN
     assert not core.drive_fault
-    # the wiggle alone is enough: the sign is known before the first leg
+    # the signs stage alone is enough: the sign is known before the first
+    # leg, and the stages ran to completion
     assert core.steer_sign == -1.0, (core._sign_n, core._sign_num, core.model)
+    assert stages == ['signs', 'gains', 'reverse'], stages
     assert core.prior_a0 < 0.0
     # persisted, and a tie in the file resolves to the established sign
     saved = core.state()
@@ -2343,8 +2365,9 @@ def test_calibration_refuses_an_inverted_or_dead_throttle():
         core = AdaptiveCore(Policy(enable_calibration=True))
         plant = Plant(b=b)
         t = settle_sense(core, plant)
-        out, t = drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
+        t, stages = run_cal(core, plant, t)
         assert core.phase == RUN
+        assert stages == ['signs'], stages            # aborted at the check
         assert core.drive_fault, label
         assert (label in core.drive_fault) or ('no motion' in core.drive_fault)
         out, t = drive(core, plant, lambda s: (0.5, 0.0), 5.0, t0=t)
@@ -2356,7 +2379,7 @@ def test_calibration_refuses_an_inverted_or_dead_throttle():
     core = AdaptiveCore(Policy(enable_calibration=True))
     plant = Plant()
     t = settle_sense(core, plant)
-    drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
+    run_cal(core, plant, t)
     assert core.phase == RUN and not core.drive_fault
 
 

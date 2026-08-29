@@ -72,7 +72,7 @@ POLICY_PARAMS = (
     'sign_agreement', 'ready_lon_samples',
     'ready_lon_qd_span', 'ready_lon_v_span_frac', 'stall_time',
     'blocked_retries', 'blocked_hold', 'odom_timeout_steps',
-    'cal_steer', 'cal_drive',
+    'cal_steer', 'cal_drive', 'cal_reverse',
     'delay_spread', 'delay_min', 'delay_max', 'delay_ew_tau',
     'delay_switch_margin', 'iw_freeze_frac',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
@@ -962,6 +962,8 @@ class AckermannAdaptiveController(Node):
                            else f'established {self.core.steer_sign:+.0f}'),
             'throttle': self.core.drive_fault or 'ok',
             'calibration': ('pending (fresh vehicle)' if self._cal_pending
+                            else f'stage {self.core._cal_stage}'
+                            if self.core.phase == CAL
                             else 'done' if self.core.dither > 0.0
                             else 'not run'),
             'model_plausible': str(self.core.plausible()),

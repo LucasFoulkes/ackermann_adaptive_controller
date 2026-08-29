@@ -199,7 +199,16 @@ class Policy:
 
     # Phase timing.
     t_sense: float = 2.0
+    # CAL is staged, each stage exiting on its own evidence (AdaptiveCore
+    # _cal): signs (the steering-sign witness locks), gains (the lateral
+    # fit is ready to be inverted), then a brake and one bounded reverse
+    # pulse so the Coulomb term b3 and the bias b1 are separable at all
+    # (one-sided data cannot split them) and the reverse cells and dead
+    # band get their first samples. t_cal is the TIMEOUT per stage, the
+    # 7 s the whole one-shot wiggle used to run for; cal_reverse the
+    # length of the reverse pulse (about a metre on this robot).
     t_cal: float = 7.0
+    cal_reverse: float = 2.0
     cal_steer: float = 0.30
     cal_drive: float = 0.42
     enable_calibration: bool = False
@@ -1303,6 +1312,9 @@ class AdaptiveCore:
         # to the sign the linkage was ASSUMED to have. Persisted. A reset
         # forgets it: that is what a reset is for.
         self.steer_sign = None
+        self._cal_stage = None   # 'signs' | 'gains' | 'reverse'
+        self._cal_t0 = None      # when the current stage began
+        self._cal_sub = None     # reverse: 'brake' | 'pulse' | 'stop'
         self._sign_num = 0.0     # sum of qs * kappa over accepted samples
         self._sign_den = 0.0     # sum of |qs * kappa|
         self._sign_n = 0
@@ -1326,6 +1338,9 @@ class AdaptiveCore:
         """
         self._enter(CAL, None)
         self.drive_fault = ''
+        self._cal_stage = 'signs'
+        self._cal_t0 = None
+        self._cal_sub = None
 
     @property
     def prior_a0(self):
@@ -1670,8 +1685,8 @@ class AdaptiveCore:
 
         # ---------- PHASE 2: CAL ------------------------------------------
         if self.phase == CAL:
-            us, ud = self._cal(elapsed)
-            if elapsed > p.t_cal:
+            us, ud, done = self._cal(t)
+            if done:
                 self._finish_cal(t)
             return self._publish(us, ud, learning, False, dt)
 
@@ -1709,7 +1724,10 @@ class AdaptiveCore:
             self.alpha = clamp(self.dt / p.sensor_tau, 0.05, 0.6)
             self.lam = math.exp(math.log(0.5) * self.dt / p.t_forget)
             self.v_prev = v
-            self._enter(CAL if p.enable_calibration else RUN, t)
+            if p.enable_calibration:
+                self.start_cal()
+            else:
+                self._enter(RUN, t)
         return self._safe_output()
 
     def _update_scale(self, cmd_v):
@@ -1920,34 +1938,78 @@ class AdaptiveCore:
                     self._sign_n += 1
         return ok
 
-    def _cal(self, tc):
-        """Scripted wiggle. Time-based, so it is identical at any odom rate."""
+    def _cal(self, t):
+        """Staged wiggle; returns (us, ud, done). Time-based within a stage
+        so it is identical at any odometry rate; stages exit on evidence,
+        with t_cal as the timeout.
+
+        signs    throttle ramps 0.10 -> 0.60 over 2 s, then holds cal_drive
+                 under a cal_steer wiggle until the steering-sign witness
+                 locks. On exit the held speed says which way the car
+                 answered a positive wire: backwards or not at all is a
+                 throttle fault and CAL ends here (RUN, actuators zero).
+        gains    the same wiggle at twice the amplitude (at most full
+                 lock), until the lateral fit is ready to be inverted.
+        reverse  brake to a stop, one cal_reverse-second pulse of
+                 -cal_drive straight back, brake again.
+        """
         p = self.policy
-        if tc < 2.0:
-            return 0.0, 0.10 + 0.25 * tc
-        us = (p.cal_steer * math.sin(2.0 * math.pi * 0.55 * tc)
-              + 0.16 * math.sin(2.0 * math.pi * 0.19 * tc))
-        return us, p.cal_drive
+        if self._cal_t0 is None:
+            self._cal_t0 = t
+        tc = t - self._cal_t0
+        stage = self._cal_stage
+
+        def next_stage(name):
+            self._cal_stage, self._cal_t0, self._cal_sub = name, t, None
+
+        def wiggle(amp):
+            return (amp * math.sin(2.0 * math.pi * 0.55 * tc)
+                    + 0.16 * math.sin(2.0 * math.pi * 0.19 * tc))
+
+        if stage == 'signs':
+            if tc < 2.0:
+                return 0.0, 0.10 + 0.25 * tc, False
+            # the witness needs wiggle samples: at least one settling
+            # window past the ramp before its verdict can count
+            settled = tc >= 2.0 + self.lat_bank.delay + p.tau_s
+            if (settled and self.steer_sign is not None) or tc > p.t_cal:
+                v = self._held_speed()
+                if abs(v) <= self.gate_d:
+                    self.drive_fault = 'no motion from +%.2f wire' % p.cal_drive
+                elif v < 0.0:
+                    self.drive_fault = ('inverted: +%.2f wire drove %.2f m/s'
+                                        % (p.cal_drive, v))
+                if self.drive_fault:
+                    return 0.0, 0.0, True
+                next_stage('gains')
+                return wiggle(p.cal_steer), p.cal_drive, False
+            return wiggle(p.cal_steer), p.cal_drive, False
+
+        if stage == 'gains':
+            if self.ready_lat or tc > p.t_cal:
+                next_stage('reverse')
+                self._cal_sub = 'brake'
+                return 0.0, 0.0, False
+            return wiggle(min(1.0, 2.0 * p.cal_steer)), p.cal_drive, False
+
+        # stage == 'reverse'
+        if self._cal_sub == 'brake':
+            if not self.rolling or tc > p.t_cal:
+                self._cal_sub, self._cal_t0 = 'pulse', t
+            return 0.0, 0.0, False
+        if self._cal_sub == 'pulse':
+            if tc > p.cal_reverse:
+                self._cal_sub, self._cal_t0 = 'stop', t
+                return 0.0, 0.0, False
+            return 0.0, -p.cal_drive, False
+        # 'stop': done once the car has come to rest (or the timeout)
+        return 0.0, 0.0, (not self.rolling) or tc > p.t_cal
 
     def _finish_cal(self, t):
-        """Establish the signs, then size the dither from measurements,
-        seen THROUGH the learned gain.
-
-        Throttle: the wiggle has held cal_drive on the wire for five
-        seconds by now, so the held speed says which way the car answers a
-        positive wire. Backwards is an inverted drive; under the motion
-        gate is a car that did not move (dead motor, dead band above
-        cal_drive, or a brake). Neither is learnable, both are a fault.
-        """
-        v = self._held_speed()
-        if abs(v) <= self.gate_d:
-            self.drive_fault = 'no motion from +%.2f wire' % self.policy.cal_drive
-        elif v < 0.0:
-            self.drive_fault = 'inverted: +%.2f wire drove %.2f m/s' % (
-                self.policy.cal_drive, v)
-        else:
-            self.drive_fault = ''
+        """Size the dither from measurements, seen THROUGH the learned
+        gain, and enter RUN. The signs were settled by the stages."""
         self._establish_sign()
+        self._cal_stage = self._cal_sub = None
         b0 = self.rls_lon.theta[0]
         self.dither = clamp(
             5.0 * max(self.tick, self.sigma_v) * 4.4 / max(abs(b0), 1.0),
