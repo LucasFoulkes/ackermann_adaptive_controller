@@ -759,6 +759,7 @@ class DelayBank:
         self.margin = margin
         self.gain_idx = tuple(gain_idx)
         self.min_count = min_count
+        self._lead = (None, 0)     # (candidate, consecutive ticks leading)
 
     @property
     def rls(self):
@@ -819,11 +820,32 @@ class DelayBank:
                 best, best_gain = i, g
         if best != self.active and finite(cur) \
                 and best_gain * self.margin > cur:
+            # The challenger must identify at least as much gain at the
+            # operating speed as the incumbent (0.8x let the 0.06 s
+            # candidate in with a0 inflated and a2 at -2.74, 08-29 drive),
+            # and must have led for a full readiness window of ticks: a
+            # lead born in one rotation artefact is not an alignment.
             span_cur = self.identifiable_gain(self.active, signs)
             span_best = self.identifiable_gain(best, signs)
-            if finite(span_cur, span_best) \
-                    and span_best >= self.margin * span_cur:
-                self.active = best
+            if finite(span_cur, span_best) and span_best >= span_cur:
+                # A leaky net count: +1 per tick this candidate leads, -1
+                # per tick it does not (never below zero), the switch at
+                # min_count net ticks. Noise that flips the leader every
+                # other tick never accumulates; a real alignment that
+                # leads most ticks takes over within a readiness window.
+                who, n = self._lead
+                if who == best:
+                    self._lead = (best, n + 1)
+                elif n <= 1:
+                    self._lead = (best, 1)
+                else:
+                    self._lead = (who, n - 1)
+                if self._lead[0] == best and self._lead[1] >= max(self.min_count, 1):
+                    self.active = best
+                    self._lead = (None, 0)
+                return accepted
+        who, n = self._lead
+        self._lead = (who, n - 1) if n > 1 else (None, 0)
         return accepted
 
     def inflate(self, p0):
@@ -842,6 +864,32 @@ class DelayBank:
     def set_delay(self, delay):
         self.active = min(range(len(self.delays)),
                           key=lambda i: abs(self.delays[i] - delay))
+
+    def peak(self):
+        """The candidate at the cross-correlation peak, span-vetoed: the
+        largest aligned gain among candidates with enough samples whose
+        identifiable gain is not below the incumbent's. What CAL trusts at
+        once (a designed excitation); RUN only follows a sustained lead."""
+        signs = self._signs()
+        cur_span = self.identifiable_gain(self.active, signs)
+        best, best_gain = self.active, self.aligned_gain(self.active, signs)
+        for i, r in enumerate(self.bank):
+            if r.count < self.min_count:
+                continue
+            g = self.aligned_gain(i, signs)
+            sp = self.identifiable_gain(i, signs)
+            # Loose veto here (a tenth): at one speed every candidate's
+            # a0/a2 split is arbitrary within noise, and the strict veto
+            # RUN uses for a switch hid a genuine 1.0 s peak behind a
+            # 3% smaller span. What it still blocks is the gross artefact
+            # (a0 up 30%, a2 -2.74, span down: 08-29 16:16).
+            if finite(g, sp) and g > best_gain and sp >= 0.9 * cur_span:
+                best, best_gain = i, g
+        return best
+
+    def jump_to_peak(self):
+        self.active = self.peak()
+        self._lead = (None, 0)
 
 
 class TwistEstimator:
@@ -1001,10 +1049,20 @@ class CurvatureEnvelope:
             (model.a0l, model.a0r, model.a0l_rev, model.a0r_rev),
             self.prior_a0)
         vv = model.a2 * v * v
-        cells = [abs(model.a1 + a0l + vv), abs(model.a1 - a0r - vv)]
+
+        def span(a0c):
+            # Understeer may reduce the gain but not erase it (the same
+            # floor _run inverts through): an a2 of -2.74 quoted the
+            # planner 2.9 m on a car that turns in 0.57 (08-29 drive).
+            eff = a0c + vv
+            floor = self.p.span_floor * abs(a0c)
+            return eff if abs(eff) >= floor and eff * a0c > 0.0 \
+                else sgn(a0c) * floor
+
+        cells = [abs(model.a1 + span(a0l)), abs(model.a1 - span(a0r))]
         if not forward:
-            cells += [abs(model.a1 + a0l_rev + vv),
-                      abs(model.a1 - a0r_rev - vv)]
+            cells += [abs(model.a1 + span(a0l_rev)),
+                      abs(model.a1 - span(a0r_rev))]
         extrapolated = min(cells)
         if not finite(extrapolated):
             extrapolated = 0.0
@@ -1165,6 +1223,7 @@ class AdaptiveCore:
         self.v = 0.0
         self.v_fb = 0.0
         self.v_prev = 0.0
+        self._v_prev_t = 0.0     # stamp of the sample v_prev came from
         self.vdot = 0.0
         self.psidot = 0.0
 
@@ -1388,6 +1447,41 @@ class AdaptiveCore:
                     r.theta[k] = signed
         self.lat_bank.prior = [signed] * 4 + list(self.lat_bank.prior[4:])
 
+    def _speed_up_limit(self, since):
+        """Largest plausible gain in |v| since the last accepted sample
+        (``since`` seconds ago), or None while the launch transient is
+        exempt. margin x b0 (prior-bounded) x the largest effective wire
+        in the direction of travel over the settling window, plus five
+        sigma. The LARGEST wire over the window, not the wire one learned
+        delay ago: the true delay is only known to the bank's grid, and a
+        stick-slip release answers a wire 0.3 s old while the 0.45 s-old
+        one still read the pre-launch value (bench, 08-29). Scaled by the
+        time since the last accepted sample so a held tick cannot chain:
+        every later sample is judged against a frozen v_prev."""
+        p = self.policy
+        settled = (self.rolling and self._roll_since is not None
+                   and self.now - self._roll_since
+                   >= self.lon_bank.delay + p.tau_d)
+        if not settled:
+            return None
+        noise = max(self.sigma_v, self.tick)
+        if noise <= 0.0:
+            return None     # no measured noise floor: no scale for "impossible"
+        direction = sgn(self.v_prev)
+        if not direction:
+            return None
+        window = self.now - (self.lon_bank.delay + p.tau_d) - since
+        u_same = 0.0
+        for stamp, _us, ud in reversed(self._cmd_hist):
+            if stamp < window:
+                break
+            u_same = max(u_same, ud * direction)
+        w = self.deadband._win(direction)
+        band = w.value if w.confirmed else 0.0
+        u_eff = max(u_same - band, 0.0)
+        b0 = clamp(self.rls_lon.theta[0], p.prior_b0, 2.0 * p.prior_b0)
+        return p.odom_glitch_margin * b0 * u_eff * since + 5.0 * noise
+
     def _a_limit(self):
         """Physics bound on plausible acceleration, from the learned model
         but BOUNDED. The unbounded form was circular: the 02:15 session's
@@ -1540,6 +1634,7 @@ class AdaptiveCore:
             # pre-gap command when odometry returns.
             self.now = t
             self.v_prev = self.v_fb = self.v_fast = v
+            self._v_prev_t = t
             self._wire = None
             return self._safe_output()
 
@@ -1555,7 +1650,21 @@ class AdaptiveCore:
                 * self.envelope.max_curvature(self.model, self.v_prev)
                 * max(abs(self.v_prev), self.gate_d),
                 1.5)
-            if abs(v - self.v_prev) > a_lim * dt or abs(psidot_raw) > w_lim:
+            # Speeding UP is bounded by the wire, not by full throttle: the
+            # car cannot gain speed faster than the throttle actually on
+            # it (delayed, past the dead band) can push, plus the noise.
+            # Slowing down is free (friction, a brake, a wall). Exempt
+            # until settled after breakaway: stiction release is real
+            # acceleration the wire did not put in. This is the gate the
+            # 08-29 drive needed -- 212 ticks read 0.4-0.78 m/s against a
+            # 0.32 command, mostly 0.5-0.65 on a 0.11-0.22 wire while
+            # coasting into a cusp, and the full-throttle bound (1 m/s per
+            # tick) let every one of them through into v_op, the delay
+            # banks and the a2 fit.
+            up_lim = self._speed_up_limit(t - self._v_prev_t)
+            gained = abs(v) - abs(self.v_prev)
+            if abs(v - self.v_prev) > a_lim * dt or abs(psidot_raw) > w_lim \
+                    or (up_lim is not None and gained > up_lim):
                 self._sane_run = 0
                 self._glitch_run += 1
                 if self._glitch_run >= self.policy.odom_glitch_trip:
@@ -1567,6 +1676,7 @@ class AdaptiveCore:
                     # failing. (Frozen against the pre-failure speed, a sane
                     # returning stream could never look plausible again.)
                     self.v_prev = v
+                    self._v_prev_t = t
                 self.now = t
                 # One spike: hold the last command rather than jerk to zero.
                 # A failed stream: stop, and learn nothing from any of it.
@@ -1577,6 +1687,7 @@ class AdaptiveCore:
                 self._sane_run += 1
                 self.now = t
                 self.v_prev = v      # track sane samples so the checks work
+                self._v_prev_t = t
                 if self._sane_run * self.dt >= self.policy.odom_recover_time:
                     self.odom_ok = True
                     self._sane_run = 0
@@ -1601,6 +1712,7 @@ class AdaptiveCore:
         self.vdot += self.alpha * (vdot_raw - self.vdot)
         self.psidot += self.alpha * (psidot_raw - self.psidot)
         self.v_prev = v
+        self._v_prev_t = t
         self.v = v
         self._v_hist.append(v)
         tau = self.policy.v_fb_tau
@@ -1676,7 +1788,7 @@ class AdaptiveCore:
         self.qd += (ud_app - self.qd) * (1.0 - math.exp(-dt / p.tau_d))
 
         # ---------- the operating speed, and everything scaled by it ------
-        self._update_scale(cmd_v)
+        self._update_scale(cmd_v, applied is not None)
 
         # ---------- learn, gated by MEASURED noise ------------------------
         learning = self._learn(v)
@@ -1724,19 +1836,26 @@ class AdaptiveCore:
             self.alpha = clamp(self.dt / p.sensor_tau, 0.05, 0.6)
             self.lam = math.exp(math.log(0.5) * self.dt / p.t_forget)
             self.v_prev = v
+            self._v_prev_t = t
             if p.enable_calibration:
                 self.start_cal()
             else:
                 self._enter(RUN, t)
         return self._safe_output()
 
-    def _update_scale(self, cmd_v):
+    def _update_scale(self, cmd_v, passive):
         """Track the operating speed and re-derive what depends on it.
 
         The scale is what the vehicle is being ASKED to do -- Nav2's
         commands, when this controller drives -- with the held speed as
-        the fallback for PASSIVE (the joystick's commands are not seen as
-        speeds) and CAL. Forgetting runs only while driving, see reset().
+        the fallback ONLY where there is no command to read: PASSIVE (the
+        joystick's commands are not speeds) and CAL. Never while this
+        controller drives: between two Nav2 segments the car is coasting
+        into a cusp, which is exactly where this LiDAR odometry reads
+        0.5-0.65 m/s on a sub-dead-band wire (scan matching through the
+        rotation), and the held median of that set v_op 0.32 -> 0.53 and
+        the planner's radius with it (16:13, 08-29 drive). Forgetting
+        runs only while driving, see reset().
         """
         # The command IS the regime when there is one; the held speed
         # stands in only when nobody is commanding through this controller
@@ -1746,8 +1865,10 @@ class AdaptiveCore:
         # zero, and a scale of 7 mm/s would put the gates under the noise.
         if cmd_v != 0.0:
             seen = abs(cmd_v)
+        elif (passive or self.phase == CAL) and self.rolling:
+            seen = abs(self._held_speed())
         else:
-            seen = abs(self._held_speed()) if self.rolling else 0.0
+            seen = 0.0
         if seen > 0.0 or self.rolling:
             self.v_op = max(seen, self.v_op * self.lam)
         self.envelope.v_op = self.v_op
@@ -2007,8 +2128,18 @@ class AdaptiveCore:
 
     def _finish_cal(self, t):
         """Size the dither from measurements, seen THROUGH the learned
-        gain, and enter RUN. The signs were settled by the stages."""
+        gain, and enter RUN. The signs were settled by the stages.
+
+        The delay banks jump to their cross-correlation peak here: the
+        wiggle is a DESIGNED excitation (0.55 Hz, a quarter turn of phase
+        per 0.45 s of delay) that separates the candidates as ordinary
+        driving does not, and it is free of the rotation artefacts that
+        made a Nav2-driven switch untrustworthy (08-29 drive). In RUN the
+        banks only follow a sustained lead (DelayBank.update).
+        """
         self._establish_sign()
+        self.lat_bank.jump_to_peak()
+        self.lon_bank.jump_to_peak()
         self._cal_stage = self._cal_sub = None
         b0 = self.rls_lon.theta[0]
         self.dither = clamp(

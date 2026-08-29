@@ -8,7 +8,7 @@ import math
 
 import pytest
 
-from ackermann_adaptive_controller.core import (CAL, RUN, SENSE, AdaptiveCore,
+from ackermann_adaptive_controller.core import (CAL, RUN, SENSE, AdaptiveCore, DelayBank,
                                             Policy, RLS, TwistEstimator, clamp,
                                             lon_sane, sane_gain_cells)
 from plant import Plant, drive, settle_sense
@@ -1527,9 +1527,35 @@ def test_the_command_to_response_delay_is_learned():
     drive(slow, ps,
           lambda s: (0.55, 0.7 * math.sin(2.0 * math.pi * 0.15 * s)),
           120.0, t0=t)
-    assert fast.lat_bank.delay < slow.lat_bank.delay
+    # The banks KNOW: the cross-correlation peak sits at a shorter delay
+    # for the snappy plant. Neither ACTIVE delay moves on a slalom -- the
+    # peak is shallow (a few %) and RUN follows only a sustained lead of
+    # delay_switch_margin, which is what keeps a rotation artefact from
+    # moving the alignment on the robot (08-29 drive). CAL, a designed
+    # excitation, is where a bank jumps to its peak (next test).
+    assert fast.lat_bank.delays[fast.lat_bank.peak()] \
+        < slow.lat_bank.delays[slow.lat_bank.peak()]
+    assert fast.lat_bank.delay == slow.lat_bank.delay == fast.policy.lat_delay
     assert fast.model.a0 == pytest.approx(pf.a0, rel=0.4)
     assert slow.model.a0 == pytest.approx(ps.a0, rel=0.4)
+
+
+def test_calibration_puts_the_banks_on_their_delay_peak():
+    """A 0.4 s transport delay on top of the actuator and sensor filters:
+    the wiggle must leave the lateral bank past the 0.45 prior."""
+    core = AdaptiveCore(Policy(enable_calibration=True))
+    plant = Plant(pose_noise=0.002)
+    plant.delay = 0.40
+    t = settle_sense(core, plant)
+    run_cal(core, plant, t)
+    assert core.phase == RUN and not core.drive_fault
+    assert core.lat_bank.delay > core.policy.lat_delay, core.lat_bank.delay
+    # and a snappy plant is left at or below it
+    core2 = AdaptiveCore(Policy(enable_calibration=True))
+    plant2 = Plant(pose_noise=0.002)
+    t = settle_sense(core2, plant2)
+    run_cal(core2, plant2, t)
+    assert core2.lat_bank.delay <= core2.policy.lat_delay
 
 
 def test_start_feedforward_is_the_learned_breakaway_not_a_preset():
@@ -1747,8 +1773,15 @@ def test_measured_twist_survives_fast_jittery_poses():
     rng = random.Random(3)
     core = AdaptiveCore()
     plant = Plant(pose_noise=0.0)
-    t = settle_sense(core, plant)
+    # SENSE sees the measured twist too, as the EKF source provides it:
+    # a sensor characterised as noiseless gives the gates no scale
+    t = 0.0
     x0, y0, psi0 = plant.observe()
+    while core.phase == SENSE:
+        t += 0.02
+        core.step(t, x0 + rng.gauss(0.0, 0.005), y0 + rng.gauss(0.0, 0.005),
+                  psi0 + rng.gauss(0.0, 0.002), 0.0, 0.0,
+                  v_meas=rng.gauss(0.0, 0.01), psidot_meas=rng.gauss(0.0, 0.004))
     failed = 0
     for _ in range(50 * 60):
         t += 0.02
@@ -2225,9 +2258,12 @@ def test_large_fast_vehicle_learns_and_tracks():
     assert m.a0 == pytest.approx(plant.a0, rel=0.35), m
     assert core.ready_lon and core.ready_lat
     # 1.0 s of transport plus the 0.3 s actuator and 0.3 s response
-    # filters: the aligned candidate is 1.52 s, and both banks reach it
+    # filters: the aligned candidate is 1.52 s. The throttle bank reaches
+    # it from the speed steps (the loop gains depend on it); the lateral
+    # bank's peak is there too, but a 0.04 Hz slalom leaves it shallow
+    # and the active stays at the prior until a CAL or a sustained lead
     assert core.lon_bank.delay >= 1.0, core.lon_bank.delay
-    assert core.lat_bank.delay >= 1.0, core.lat_bank.delay
+    assert core.lat_bank.delays[core.lat_bank.peak()] >= 0.9
     r = core.envelope.min_turning_radius(m)
     assert r == pytest.approx(1.0 / (plant.a0 + plant.a2 * core.v_op ** 2),
                               rel=0.35), r
@@ -2402,8 +2438,9 @@ def test_loop_gains_follow_the_learned_delay():
                   pose_noise=0.0005)
     plant.delay = 1.0
     t = settle_sense(core, plant)
-    _, t = drive(core, plant, _course((1.2, 2.0, 1.6, 2.4), 10, 0.2, 0.04),
+    _, t = drive(core, plant, _course((0.6, 1.4, 1.0, 1.8), 10, 0.2, 0.04),
                  160.0, t0=t)
+    assert core.lon_bank.delay >= 1.0                 # the gains follow it
     speeds = []
     for _ in range(200):
         t += 0.1
@@ -2575,3 +2612,87 @@ def test_authority_is_earned_by_a_ready_plausible_model():
     core.odom_ok = True
     core.drive_fault = 'inverted'
     assert core.authority() == 0.0
+
+
+# -- 08-29 drive: rotation artefacts must not reach v_op, the banks, the radius --
+
+def test_v_op_ignores_the_held_speed_while_this_controller_drives():
+    """Between two Nav2 segments the car coasts into a cusp and this LiDAR
+    odometry reads 0.5-0.65 m/s on a sub-dead-band wire; the held median
+    of that set v_op 0.32 -> 0.53 and the planner radius with it."""
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.32, 0.0), 20.0, t0=t)
+    assert core.v_op == pytest.approx(0.32, abs=0.01)
+    # command drops to zero (segment end); the pose stream lies fast
+    for i in range(30):
+        t += 0.1
+        x, y, psi = plant.observe()
+        core.step(t, x + 0.06 * i, y, psi, 0.0, 0.0)   # 0.6 m/s "coast"
+    assert core.v_op == pytest.approx(0.32, abs=0.01)
+    # PASSIVE (someone else drives): the held speed is the only scale
+    core2 = AdaptiveCore()
+    plant2 = Plant()
+    t = settle_sense(core2, plant2)
+    for _ in range(80):
+        t += 0.1
+        plant2.step(0.0, 0.5, 0.1)
+        x, y, psi = plant2.observe()
+        core2.step(t, x, y, psi, 0.0, 0.0, applied=(0.0, 0.5))
+    assert core2.v_op > 0.3
+
+
+def test_a_speed_gain_the_wire_cannot_afford_is_a_glitch():
+    """0.30 -> 0.5 m/s in a tick on a 0.17 wire (below the 0.24 dead band)
+    is the scan matcher, not the car: 212 such ticks on the 08-29 drive
+    went through the full-throttle bound into the learner."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.deadband = 0.24
+    t = settle_sense(core, plant)
+    for x in (0.26, 0.25, 0.27, 0.26):
+        core.deadband.observe(1.0, x)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 20.0, t0=t)
+    assert core.rolling and abs(core.v - 0.30) < 0.08
+    n = core.model.n_lon
+    up = core._speed_up_limit(0.1)
+    assert up is not None and up < 0.16, up
+    # a jump the wire cannot explain: held, not learned from
+    x, y, psi = plant.observe()
+    out = core.step(t + 0.1, x + 0.05, y, psi, 0.30, 0.0)   # +0.5 m/s
+    assert core._glitch_run == 1 and core.model.n_lon == n
+    assert out.drive == core.prev_wire                      # rode through
+    # ...while a genuine speed-up under real wire is not a glitch
+    core._glitch_run = 0
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 2.0, t0=t + 0.2)
+    _, t = drive(core, plant, lambda s: (0.60, 0.0), 6.0, t0=t)
+    assert core.odom_ok and abs(core.v - 0.60) < 0.1
+    assert core.model.n_lon > n
+
+
+def test_bank_switch_needs_a_sustained_lead_and_no_smaller_span():
+    bank = DelayBank([1.0, 0.0], 10.0, 1e4, [0.1, 0.5], 30.0, 0.8,
+                     gain_idx=(0,), min_count=5, gains=lambda th: [th[0] + th[1]])
+    bank.set_delay(0.1)
+    bank.bank[0].theta = [1.0, 0.0]; bank.bank[0].count = 100
+    bank.bank[1].theta = [2.0, -1.5]; bank.bank[1].count = 100   # bigger a0, smaller span
+    for _ in range(10):
+        bank.update(lambda d: None, 0.0, 1.0, 0.1)
+    assert bank.delay == 0.1                                     # vetoed on span
+    bank.bank[1].theta = [2.0, -0.5]                             # span 1.5 >= 1.0
+    for k in range(4):
+        bank.update(lambda d: None, 0.0, 1.0, 0.1)
+        assert bank.delay == 0.1                                 # leading, not yet
+    bank.update(lambda d: None, 0.0, 1.0, 0.1)
+    assert bank.delay == 0.5                                     # fifth tick
+
+
+def test_envelope_quote_is_floored_like_the_inversion():
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.v_op = core.envelope.v_op = 0.55
+    core.rls_lat.theta = [2.0, 2.0, 2.0, 2.0, 0.0, -2.74]      # the 16:16 fit
+    r = core.envelope.min_turning_radius(core.model)
+    assert r <= 1.0 / (core.policy.span_floor * 2.0) + 1e-9, r
+    assert r < 2.5
