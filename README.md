@@ -252,6 +252,12 @@ envelope. `/diagnostics` reports `deadband`.
   of delay gets a correspondingly slower loop. `tau_s`/`tau_d` are declared
   actuator-class priors (the delay bank's peak already absorbs the actuator
   smear). `/diagnostics` reports `gains`.
+- **Anti-windup.** The throttle integrator holds whenever the last published
+  wire was shaped by the slew limit or the ±1 clamp in the direction the
+  error would wind it (it may always unwind); the steering trim already holds
+  at the standstill clamp, at lock, and during the settling window after a
+  curvature change. The launch floor and cap are exempt on purpose: the
+  blocked reflex reads the integrator pinning under the cap.
 - **Drag needs varied speeds.** At one constant speed the regressor
   `[qd, 1, v|v|]` is rank-deficient and `b0`/`b1`/`b2` cannot be separated —
   the prediction stays right but the split is arbitrary. A cruise teaches the

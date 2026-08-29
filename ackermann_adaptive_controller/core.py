@@ -1234,6 +1234,15 @@ class AdaptiveCore:
         self._floor = 0.0
         self._floor_dir = 0.0
         self._cap = 0.0
+        # Anti-windup for the throttle integrator: the direction in which
+        # the last published throttle fell short of what the loop asked
+        # (+1: less than asked, -1: more), because the +-1 clamp or the
+        # slew limit shaped it. While that holds, the integrator does not
+        # wind further INTO the limit (it may always unwind). The launch
+        # floor and cap are deliberately NOT shaping: the reflex reads the
+        # integrator pinning under the cap as "against something".
+        self._shaped = 0.0
+        self._clip = 0.0
         self.envelope = CurvatureEnvelope(p)
         self._roll_dir = 0.0
         self._dir_since = None
@@ -2118,7 +2127,11 @@ class AdaptiveCore:
         # demand is clamped to it (it was a typed 2.5 m/s^2).
         b0_fb = clamp(b0, 0.5 * p.prior_b0, 2.0 * p.prior_b0)
         a_des = clamp(self.kp_v * err, -b0_fb, b0_fb)
-        self.iv = clamp(self.iv + self.ki_v * err * dt, -p.iv_max, p.iv_max)
+        # Conditional integration (see _shaped in reset): no winding into
+        # a limit the actuator is already at.
+        if not (self._shaped and sgn(err) == self._shaped):
+            self.iv = clamp(self.iv + self.ki_v * err * dt,
+                            -p.iv_max, p.iv_max)
         # A MOVING reversal -- the command points against the car's travel
         # while it is still measurably rolling -- is braking, not a launch.
         # Everything sized for a start from rest is wrong here: the new
@@ -2187,7 +2200,9 @@ class AdaptiveCore:
                 ud -= (b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
         if p.enable_dither and self.dither > 0.0:
             ud += self.dither * math.sin(2.0 * math.pi * 0.7 * self.now)
-        ud = clamp(ud + self.iv, -1.0, 1.0)
+        raw = ud + self.iv
+        ud = clamp(raw, -1.0, 1.0)
+        self._clip = sgn(raw - ud)
         self._floor = 0.0
         self._floor_dir = 0.0
         self._cap = 0.0
@@ -2306,7 +2321,10 @@ class AdaptiveCore:
         # breakaway is bounded by how quickly the controller can back off
         # once the wheels turn, and nothing is gained by ramping DOWN slowly.
         rate = p.max_drive_rate * (2.0 if abs(ud) < abs(self.prev_ud) else 1.0)
+        asked = ud
         ud = self._slew(self.prev_ud, ud, rate * dt)
+        # What shaped the wire this tick, for the integrator (reset()).
+        self._shaped = self._clip or sgn(asked - ud)
         if self._floor > 0.0 and self._floor_dir:
             # the launch floor bypasses the slew: see reset() note
             ud = self._floor_dir * max(ud * self._floor_dir, self._floor)

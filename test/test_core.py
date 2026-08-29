@@ -2487,3 +2487,45 @@ def test_the_fit_does_not_drift_at_one_cruise_speed():
     assert b0_fit == pytest.approx(plant.b0, rel=0.35)
     _, t = drive(core, plant, lambda s: (0.32, 0.0), 300.0, t0=t)
     assert core.model.b0 == pytest.approx(b0_fit, rel=0.20), (b0_fit, core.model)
+
+
+# -- anti-windup: no winding into a limit the actuator is already at --------
+
+def test_throttle_integrator_does_not_wind_while_the_slew_or_clamp_shapes_the_wire():
+    """A 0..0.6 m/s step: the slew limit paces the wire up for several
+    ticks, and a large error has the +-1 clamp binding. During either the
+    integrator must hold, not wind into the limit (it was winding all
+    the way through, then had to unwind after the step -- overshoot).
+    Unwinding is always allowed, and the launch cap is exempt: the blocked
+    reflex reads the integrator pinning under it."""
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.0)
+    settle_sense(core, plant)
+    core.v_op = 0.6
+    core.rolling = True                          # past the launch logic
+    core.v = core.v_fb = 0.3
+    core._floor = 0.0
+    # ask for far more than the slew allows in one tick
+    core.prev_ud = 0.0
+    core._run(0.3, 0.6, 0.0, 0.1)
+    out = core._publish(0.0, 1.0, True, False, 0.1)
+    assert out.drive == pytest.approx(core.policy.max_drive_rate * 0.1)
+    assert core._shaped == 1.0                   # published < asked
+    iv = core.iv
+    core.v = core.v_fb = 0.3
+    core._run(0.3, 0.6, 0.0, 0.1)                # err > 0 into the limit
+    assert core.iv == pytest.approx(iv)          # held
+    core._run(0.3, 0.1, 0.0, 0.1)                # err < 0: may unwind
+    assert core.iv < iv
+    # wire published as asked: integration resumes
+    core._publish(0.0, core.prev_ud, True, False, 0.1)
+    assert core._shaped == 0.0
+    iv = core.iv
+    core._run(0.3, 0.6, 0.0, 0.1)
+    assert core.iv > iv
+    # the +-1 clamp binding counts as shaping too
+    core.iv = 0.0
+    core.v = core.v_fb = 0.0
+    core.rolling = True
+    core._run(0.0, 5.0, 0.0, 0.1)                # a_des saturates the wire
+    assert core._clip == 1.0
