@@ -258,6 +258,12 @@ envelope. `/diagnostics` reports `deadband`.
   at the standstill clamp, at lock, and during the settling window after a
   curvature change. The launch floor and cap are exempt on purpose: the
   blocked reflex reads the integrator pinning under the cap.
+- **Authority is earned.** While either fit is still a prior (not ready to be
+  inverted, not physically a vehicle, or a steering fault holding the
+  fallback) the node publishes `nav2_msgs/SpeedLimit` on `/speed_limit` at
+  `authority_floor` (50 %) of Nav2's speed; 100 % once both fits have earned
+  inversion. A fresh or just-faulted vehicle is never fast while ignorant.
+  `/diagnostics` reports `authority`.
 - **Drag needs varied speeds.** At one constant speed the regressor
   `[qd, 1, v|v|]` is rank-deficient and `b0`/`b1`/`b2` cannot be separated —
   the prediction stays right but the split is arbitrary. A cruise teaches the

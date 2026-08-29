@@ -40,6 +40,7 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import (Twist, TwistStamped,
                                TwistWithCovarianceStamped)
 from nav_msgs.msg import Odometry
+from nav2_msgs.msg import SpeedLimit
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Bool, Float32, Int8
 from rcl_interfaces.srv import SetParameters
@@ -75,6 +76,7 @@ POLICY_PARAMS = (
     'delay_spread', 'delay_min', 'delay_max', 'delay_ew_tau',
     'delay_switch_margin', 'iw_freeze_frac',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
+    'authority_floor',
 )
 _DEFAULTS = Policy()
 
@@ -204,6 +206,12 @@ class AckermannAdaptiveController(Node):
             # running, so mind the SD card on long soak tests. The file is
             # rotated automatically when the column set changes.
             ('flight_log', os.path.expanduser('~/.ros/ackermann_flight.csv')),
+            # Authority earned by confidence -> Nav2. controller_server
+            # subscribes to this topic by default (speed_limit_topic) and
+            # scales its speeds by the percentage; empty disables. The
+            # limit reflects the LEARNING state only (core.authority):
+            # faults that hold the actuators at zero need no limit.
+            ('speed_limit_topic', '/speed_limit'),
         ])
         g = {d.name: d.value for d in p}
 
@@ -310,6 +318,11 @@ class AckermannAdaptiveController(Node):
             DiagnosticArray, '/diagnostics', 1)
         self.pub_radius = self.create_publisher(
             Float32, '~/min_turning_radius', 1)
+        self.speed_limit_topic = str(g['speed_limit_topic'])
+        self.pub_speed_limit = (
+            self.create_publisher(SpeedLimit, self.speed_limit_topic, 1)
+            if self.speed_limit_topic else None)
+        self._speed_limit_sent = None
 
         # Actuator taps. In PASSIVE the joystick owns these topics, and the
         # tapped values are what the learner must regress on.
@@ -367,6 +380,7 @@ class AckermannAdaptiveController(Node):
 
         self.create_timer(1.0 / PUBLISH_HZ, self.on_publish_tick)
         self.create_timer(1.0, self.on_diagnostics)
+        self.create_timer(1.0, self.on_authority_tick)
         self.create_timer(float(g['radius_push_period']), self.on_radius_tick)
         self.create_timer(float(g['save_period']), self.save_state)
 
@@ -610,6 +624,28 @@ class AckermannAdaptiveController(Node):
         return resp
 
     # -- learned turning radius -> Nav2 -----------------------------------
+
+    def on_authority_tick(self):
+        """Tell Nav2 how fast the map has earned the right to go."""
+        if self.pub_speed_limit is None:
+            return
+        a = self.core.authority()
+        # 0 means "no limit" to Nav2, and the controller's zero-output
+        # faults need none: publish the floor instead, and full when earned.
+        pct = 100.0 * max(a, self.core.policy.authority_floor)
+        if self._speed_limit_sent is not None \
+                and abs(pct - self._speed_limit_sent) < 0.5:
+            return
+        m = SpeedLimit()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.percentage = True
+        m.speed_limit = pct
+        self.pub_speed_limit.publish(m)
+        if self._speed_limit_sent is not None or pct < 100.0:
+            self.get_logger().info(
+                f'authority {pct:.0f}% of Nav2 speed '
+                f'({"earned" if a >= 1.0 else "map is a prior"})')
+        self._speed_limit_sent = pct
 
     def on_radius_tick(self):
         """Push the learned turning radius to Nav2 when it has moved enough.
@@ -929,6 +965,7 @@ class AckermannAdaptiveController(Node):
                             else 'done' if self.core.dither > 0.0
                             else 'not run'),
             'model_plausible': str(self.core.plausible()),
+            'authority': f'{100.0 * self.core.authority():.0f}%',
             'radius_pushed_to_nav2':
                 'none' if self.pushed_radius is None
                 else f'{self.pushed_radius:.3f}',

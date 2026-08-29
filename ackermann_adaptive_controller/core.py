@@ -487,6 +487,16 @@ class Policy:
     # Dead-man: no odometry for this many nominal steps stops the actuators.
     odom_timeout_steps: float = 3.0
 
+    # Authority earned by confidence (AdaptiveCore.authority): the fraction
+    # of its operating speed the vehicle may be commanded while the map is
+    # still a prior -- either fit not ready to be inverted, or a steering
+    # fault holding the fallback. Half: on this robot 0.16 m/s, above the
+    # learning gates, so the car keeps gathering the data that earns the
+    # rest; a fresh or just-faulted vehicle is never fast while ignorant.
+    # Published to Nav2 as a speed limit by the node; the controller's own
+    # zero-output faults (odometry, throttle) need no limit.
+    authority_floor: float = 0.5
+
     # -- derived from the two declared priors (not fields, not parameters) --
 
     @property
@@ -2421,6 +2431,21 @@ class AdaptiveCore:
                 and min(spans) > self.policy.den_min
                 and consistent
                 and not self.steering_fault)
+
+    def authority(self):
+        """Fraction of the operating speed the vehicle may be commanded.
+
+        1.0 once both fits have earned inversion and are physically a
+        vehicle; Policy.authority_floor while the controller is steering
+        or driving on a prior (not ready, not plausible, or a steering
+        fault); 0.0 outside RUN and while the odometry or the throttle is
+        faulted -- states in which the actuators are already held at zero.
+        """
+        if self.phase != RUN or not self.odom_ok or self.drive_fault:
+            return 0.0
+        earned = (self.ready_lat and self.ready_lon and self.plausible()
+                  and self.lon_plausible() and not self.steering_fault)
+        return 1.0 if earned else self.policy.authority_floor
 
     def stop_horizon(self):
         """How long a follower should project a command for collisions.

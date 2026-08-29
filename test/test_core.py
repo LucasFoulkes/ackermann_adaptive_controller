@@ -2529,3 +2529,26 @@ def test_throttle_integrator_does_not_wind_while_the_slew_or_clamp_shapes_the_wi
     core.rolling = True
     core._run(0.0, 5.0, 0.0, 0.1)                # a_des saturates the wire
     assert core._clip == 1.0
+
+
+# -- authority earned by confidence ---------------------------------------------
+
+def test_authority_is_earned_by_a_ready_plausible_model():
+    core = AdaptiveCore()
+    plant = Plant()
+    assert core.authority() == 0.0                       # SENSE
+    t = settle_sense(core, plant)
+    floor = core.policy.authority_floor
+    assert core.authority() == floor                     # a prior, not a map
+    _, t = drive(core, plant, _course((0.25, 0.55, 0.35, 0.65), 15, 0.5, 0.12),
+                 120.0, t0=t)
+    assert core.ready_lat and core.ready_lon
+    assert core.authority() == 1.0
+    core.steering_fault = True
+    assert core.authority() == floor
+    core.steering_fault = False
+    core.odom_ok = False
+    assert core.authority() == 0.0                       # actuators at zero anyway
+    core.odom_ok = True
+    core.drive_fault = 'inverted'
+    assert core.authority() == 0.0
