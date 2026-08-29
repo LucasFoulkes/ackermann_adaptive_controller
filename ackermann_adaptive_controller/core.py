@@ -123,7 +123,7 @@ def sane_gain_cells(cells, prior):
     return [c if c * s > 0.0 else s * abs(prior) for c in cells]
 
 
-def lon_sane(b, vl_lo, vl_hi, policy):
+def lon_sane(b, vl_lo, vl_hi, policy, v_op):
     """Is a longitudinal fit ``[b0, b1, b2, b3]`` physically a vehicle?
 
     Two signs are physics, not tuning: more throttle means more
@@ -131,7 +131,7 @@ def lon_sane(b, vl_lo, vl_hi, policy):
     not brake -- drag and friction oppose motion, a flat floor does not
     push. The second is judged where the inversion is actually evaluated:
     the feedforward wire ``-(b1 + b2*v|v| + b3*sgn(v)) / b0`` at the
-    planning speed (``env_speed``, clamped into the fitted span, per
+    operating speed (``v_op``, clamped into the fitted span, per
     direction with evidence only -- a span that never reversed says
     nothing about reverse). It is judged on the SUM, never on b2 or b3
     alone (at one cruise speed only their sum is data-pinned: the
@@ -153,12 +153,14 @@ def lon_sane(b, vl_lo, vl_hi, policy):
     if not finite(b0, b1, b2, b3) or b0 <= policy.b0_min:
         return False
     tol = policy.launch_floor
+    if not finite(v_op) or v_op < 0.0:
+        return False
     if vl_hi is not None and finite(vl_hi) and vl_hi > 0.0:
-        v = min(policy.env_speed, vl_hi)
+        v = min(v_op, vl_hi)
         if -(b1 + b2 * v * v + b3) / b0 < -tol:
             return False
     if vl_lo is not None and finite(vl_lo) and vl_lo < 0.0:
-        v = -min(policy.env_speed, -vl_lo)
+        v = -min(v_op, -vl_lo)
         # reverse: the wire needed is negative; "less than -tol" mirrors
         if -(b1 + b2 * v * abs(v) - b3) / b0 > tol:
             return False
@@ -167,7 +169,26 @@ def lon_sane(b, vl_lo, vl_hi, policy):
 
 @dataclass
 class Policy:
-    """The only hand-chosen numbers. These encode risk, not the vehicle."""
+    """The only hand-chosen numbers. These encode risk, not the vehicle.
+
+    Two kinds live here, and the distinction is what lets the same code
+    drive a different vehicle. RISK constants (watchdogs, evidence counts,
+    margins, per-second loop gains) are dimensionless or in seconds and
+    carry over unchanged. SCALE-RELATIVE constants are fractions of a
+    learned quantity -- ``v_op``, the operating speed the controller sees
+    itself being driven at (see :meth:`AdaptiveCore._update_scale`) -- or
+    ratios of one of the two declared priors, ``prior_a0`` and
+    ``prior_b0``. Nothing here is in m/s, 1/m or m/s^2 any more: the
+    2026-08-29 audit found ten such numbers (a 0.15 m/s learning-gate
+    floor, a 0.24 m/s cap, a 0.12 m/s curvature floor, 0.25/8 m radius
+    bounds, a 0.12/m trim clamp, a 0.05 m/s "motion wanted" threshold, a
+    0.15 m/s speed-span requirement, gain floors of 0.05 and 0.3) that
+    together pinned the controller to a 0.3 m/s, 0.28 m-wheelbase car: a
+    0.1 m/s crawler could never accept a single learning sample, and an
+    8 m-radius vehicle had its true envelope clamped. Each was replaced by
+    the fraction that reproduces this robot's hand value at its measured
+    scale (test_derived_values_reproduce_this_robots_hand_tuning).
+    """
 
     # Phase timing.
     t_sense: float = 2.0
@@ -189,12 +210,16 @@ class Policy:
     # model inversion normalizes the plant away.
     kp_v: float = 0.6  # loop gain sized to ~0.35 s of actuator+odometry delay; at 1.6 the loop limit-cycled 0..0.9 m/s on a 0.32 command
     ki_v: float = 0.25  # same reason; the integrator still unsticks the robot, just without overshooting past the dead band
-    # Curvature trim. The effective gain is ki_w / v_signed (at least 2*ki_w
-    # per second) against ~0.75 s of steering delay plus yaw filter: at 1.5 a
-    # single 0.45 rad/s step wound the trim to its clamp before the car had
-    # responded, and the flight log had it pinned 30% of the time with a sign
-    # that agreed with the command only half the time -- noise, not trim.
-    ki_w: float = 0.3
+    # Curvature trim. The yaw-rate error is converted to a curvature
+    # correction by dividing by the speed, floored at the OPERATING speed
+    # v_op, so the effective per-second gain is at most ki_w / v_op --
+    # against ~0.75 s of steering delay plus yaw filter. History: at an
+    # effective 3/s a single 0.45 rad/s step wound the trim to its clamp
+    # before the car had responded, and the flight log had it pinned 30%
+    # of the time with a sign that agreed with the command only half the
+    # time -- noise, not trim; 0.6/s (then written as 0.3 over a typed
+    # 0.5 m/s floor) has been quiet since 08-23. 0.2 / 0.32 m/s keeps it.
+    ki_w: float = 0.2
 
     # Priors. Without these, steering never excites (no steering -> no yaw ->
     # nothing to learn from), so RUN could never bootstrap without CAL.
@@ -213,19 +238,28 @@ class Policy:
     # actually covered a range of commands and speeds.
     ready_lon_samples: int = 80
     ready_lon_qd_span: float = 0.15
-    ready_lon_v_span: float = 0.15
+    # Speed coverage, as a fraction of the operating speed (0.15 m/s of
+    # this robot's 0.32): the fit must have seen the car at speeds spread
+    # over nearly half its range before b1/b2 are separable at all.
+    ready_lon_v_span_frac: float = 0.45
     ready_lat_samples: int = 60
     ready_lat_qs_span: float = 0.40
 
     # Inversion guards and limits.
-    # Floor on the speed used to convert a yaw-rate command to curvature.
-    # MUST sit well below the operating speed: at 0.4 with Nav2 cruising at
-    # 0.22 m/s the floor dominated and the controller delivered 55% of the
-    # curvature the path follower asked for -- the follower kept asking
-    # harder, the trim integrator wound to its clamp and overshot: weaving.
-    v_eff_floor: float = 0.12
-    den_min: float = 0.05
-    b0_min: float = 0.3
+    # Floor on the speed used to convert a yaw-rate command to curvature,
+    # as a fraction of the operating speed. MUST sit well below it: at a
+    # typed 0.4 m/s with Nav2 cruising at 0.22 the floor dominated and the
+    # controller delivered 55% of the curvature the path follower asked
+    # for -- the follower kept asking harder, the trim integrator wound to
+    # its clamp and overshot: weaving. 0.35 x 0.32 m/s is the 0.12 that
+    # has been quiet since.
+    v_eff_floor_frac: float = 0.35
+    # Gain floors, as fractions of the declared priors: a steering gain
+    # below den_min_frac x prior_a0 is a dead actuator, not a vehicle
+    # (0.04 x 1.25 = 0.05/m per unit command); a throttle gain below
+    # b0_min_frac x prior_b0 likewise (0.15 x 2.0 = 0.3 m/s^2).
+    den_min_frac: float = 0.04
+    b0_min_frac: float = 0.15
     # Understeer cannot cancel the steering entirely: full lock always buys
     # SOME curvature, so the speed term may not null the static gain.
     span_floor: float = 0.25
@@ -237,13 +271,21 @@ class Policy:
     # the learner produced confident nonsense.
     lat_delay: float = 0.45
     lon_delay: float = 0.30
-    # Ceiling on the lateral learning gate. The gates scale with the noise
-    # measured in SENSE (10 sigma), and on LiDAR odometry that measurement
-    # varies 2x between boots on the same floor: one session measured
-    # sigma_v = 0.028, which put gate_s at 0.45 m/s -- above the 0.38 m/s
-    # Nav2 is allowed to command -- and the steering model took 23 samples
-    # in ten minutes. The cap ties the gate to the operating speed instead.
-    gate_s_max: float = 0.24
+    # Learning gates, as fractions of the operating speed. gate_d is 10 x
+    # the velocity noise measured in SENSE, clamped into
+    # [gate_floor_frac, gate_cap_frac] x v_op. The CAP: on LiDAR odometry
+    # the rest measurement varies 2x between boots on the same floor; one
+    # session measured sigma_v = 0.028, which put gate_s at 0.45 m/s --
+    # above the 0.38 m/s Nav2 is allowed to command -- and the steering
+    # model took 23 samples in ten minutes. The FLOOR: the at-rest sigma
+    # under-reads the moving noise (MOLA at rest p99 1.5 cm; under motion
+    # 10% of commanded ticks read 0.2 m/s above the command, 08-29 12:04),
+    # so a quiet boot must not open the gate to spikes. On this robot both
+    # land on the 0.15 m/s that was typed here until 08-29 (0.35..0.45 x
+    # 0.32 m/s); the noise measurement only matters inside that band. The
+    # gates are recomputed every tick as v_op moves.
+    gate_floor_frac: float = 0.35
+    gate_cap_frac: float = 0.45
     # Invert the learned longitudinal model once ready_lon holds. This was
     # OFF for a long time because the fit itself was poisoned: a linear gain
     # regressed against a dead-band + friction actuator averages "high
@@ -289,16 +331,20 @@ class Policy:
     enable_dither: bool = True
 
     # Stall / blocked detection.
-    # "Is motion being asked for at all", not "is a lot of motion asked for".
-    # At 0.25 this exactly equalled the velocity smoother's reverse limit, so
+    # "Is motion being asked for at all", not "is a lot of motion asked for":
+    # a fraction of the operating speed (0.15 x 0.32 = 0.05 m/s). At a typed
+    # 0.25 this exactly equalled the velocity smoother's reverse limit, so
     # the strict > test never fired and the robot could stall forever.
-    stall_cmd_min: float = 0.05
+    stall_cmd_frac: float = 0.15
     stall_time: float = 0.6
     # Integrator authority. Stiction is handled by the integrator ramping
     # until the wheels turn; this is how far it may go, and hitting it while
     # stalled is the cue that the robot is against something.
     iv_max: float = 0.45
-    iw_max: float = 0.12           # curvature trim authority (1/m)
+    # Curvature trim authority as a fraction of the prior full-lock
+    # curvature (0.1 x 1.25 = 0.125/m): the trim may correct a tenth of
+    # the lock, never steer the car by itself.
+    iw_max_frac: float = 0.10
     blocked_retries: int = 3       # failed attempts before a long hold
     blocked_hold: float = 5.0      # s, after that many failures
     # Feedback speed filter time constant. The raw pose-differenced speed
@@ -318,9 +364,13 @@ class Policy:
     env_qs_threshold: float = 0.55   # |qs| above which a sample is envelope evidence
     env_evidence: int = 12           # samples needed before observation is trusted
     env_derate: float = 0.6          # trust in raw model extrapolation, pre-evidence
-    env_speed: float = 0.35          # speed the planner radius is quoted at
-    radius_floor: float = 0.25
-    radius_ceiling: float = 8.0
+    # The radius is quoted at the learned operating speed v_op (it was a
+    # typed 0.35 m/s until 08-29). Its bounds are ratios of the prior's
+    # radius 1/prior_a0: the learned envelope may sit anywhere from a
+    # third of the declared lock to ten times it (0.24..8 m here) --
+    # tighter is an implausible fit, wider is a collapsed cell.
+    radius_floor_ratio: float = 0.3
+    radius_ceiling_ratio: float = 10.0
 
     # Throttle dead band -- LEARNED, from every start. The wire command that
     # was applied lon_delay seconds before the wheels first turned is the one
@@ -344,14 +394,22 @@ class Policy:
     # creeps up on its own output.
     deadband_slow_start: float = 0.8
 
-    # Delay learning. lat_delay / lon_delay above are INITIAL estimates:
-    # each axis runs a bank of estimators at (delay/spread, delay,
-    # delay*spread) and control follows the one with the lowest
-    # exponentially-weighted prediction error (time constant delay_ew_tau).
-    # A challenger must beat the incumbent by the margin to take over, so
-    # noise cannot flap the alignment. Estimation constants, not vehicle
-    # properties -- the delay itself is measured.
+    # Delay learning. lat_delay / lon_delay above are only the STARTING
+    # candidates: each axis runs a bank of estimators at delays spaced by
+    # delay_spread from the prior out to [delay_min, delay_max], and
+    # control follows the one with the largest aligned gain -- the
+    # cross-correlation peak (see DelayBank). A challenger must beat the
+    # incumbent's gain by 1/margin to take over, so noise cannot flap the
+    # alignment; delay_ew_tau times the per-candidate prediction-error
+    # score kept for diagnostics. The bounds are what any ground vehicle's actuator +
+    # odometry chain can plausibly span; before 08-29 the bank was three
+    # candidates within x1.5 of the typed prior, so a 1 s vehicle could
+    # never be aligned and its steering fit was confident nonsense (the
+    # same failure as regressing on the instantaneous command). Estimation
+    # constants, not vehicle properties -- the delay itself is measured.
     delay_spread: float = 1.5
+    delay_min: float = 0.05
+    delay_max: float = 2.5
     delay_ew_tau: float = 30.0
     delay_switch_margin: float = 0.8
 
@@ -377,6 +435,28 @@ class Policy:
 
     # Dead-man: no odometry for this many nominal steps stops the actuators.
     odom_timeout_steps: float = 3.0
+
+    # -- derived from the two declared priors (not fields, not parameters) --
+
+    @property
+    def radius_floor(self):
+        return self.radius_floor_ratio / abs(self.prior_a0)
+
+    @property
+    def radius_ceiling(self):
+        return self.radius_ceiling_ratio / abs(self.prior_a0)
+
+    @property
+    def iw_max(self):
+        return self.iw_max_frac * abs(self.prior_a0)
+
+    @property
+    def den_min(self):
+        return self.den_min_frac * abs(self.prior_a0)
+
+    @property
+    def b0_min(self):
+        return self.b0_min_frac * abs(self.prior_b0)
 
 
 @dataclass
@@ -524,25 +604,48 @@ class RLS:
 
 
 class DelayBank:
-    """Identical RLS estimators at candidate delays; the best one drives.
+    """Identical RLS estimators at candidate delays; the best-aligned drives.
 
     The command-to-response delay was measured by hand once (scanning lags
     against flight logs until r-squared peaked). This does the same thing
-    continuously: every accepted sample updates all candidates, each scored
-    by the exponentially-weighted square of its one-step prediction error,
-    and control follows the current winner. A challenger must be clearly
-    better (margin) so odometry noise cannot flap the alignment.
+    continuously: every accepted sample updates all candidates, and control
+    follows the one whose fitted GAIN is largest -- the cross-correlation
+    peak. The regression coefficient of the response on a shifted copy of
+    the same command is cov(y, u_d) / var(u), and var(u) is the same for
+    every shift, so the largest coefficient is the best-aligned shift: a
+    candidate that is early sees the response smeared and fits a smaller
+    gain, one that is late sees it inverted and fits a negative one (a
+    synthetic 4 m/s^2 vehicle at 1.0 s: 0.5 at 0.06 s, 1.8 at 1.0 s, 3.2
+    at 1.5 s, -2.4 at 2.3 s). The gain is taken SIGNED against the
+    incumbent's sign, so a late candidate's inverted gain loses rather
+    than wins on magnitude, and an inverted servo (all candidates
+    negative) is compared consistently.
+
+    Why not the prediction error, the criterion this bank used until
+    08-29: on a steady wire every candidate explains the data equally
+    well (only the split of the gain against the bias differs), so the
+    exponentially-weighted errors sat within 1-5% of each other, the
+    hysteresis margin was never met, and whichever candidate the launch
+    transient had favoured kept a misaligned fit whose gain had drifted
+    toward zero. The measured delay on this robot (0.45 s lat, r-squared
+    0.1 at lag 0 to 0.8 at 0.4-0.5 s) is exactly such a peak. A
+    challenger must beat the incumbent by the margin (1/margin x its
+    gain) and have as many samples as the model needs to be believed at
+    all, so noise and a fresh candidate's prior cannot flap the alignment.
     """
 
     def __init__(self, theta0, p0, p_max, delays, ew_tau, margin,
-                 bounds=None, absorber=None):
+                 bounds=None, absorber=None, gain_idx=(0,), min_count=0):
         self.delays = list(delays)
+        self.prior = list(theta0)
         self.bank = [RLS(list(theta0), p0, p_max, bounds, absorber)
                      for _ in self.delays]
         self.score = [None] * len(self.delays)
         self.active = len(self.delays) // 2
         self.ew_tau = ew_tau
         self.margin = margin
+        self.gain_idx = tuple(gain_idx)
+        self.min_count = min_count
 
     @property
     def rls(self):
@@ -552,11 +655,26 @@ class DelayBank:
     def delay(self):
         return self.delays[self.active]
 
+    def aligned_gain(self, i, signs=None):
+        """The candidate's fitted gain, signed against the incumbent."""
+        if signs is None:
+            signs = self._signs()
+        return sum(self.bank[i].theta[k] * s
+                   for k, s in zip(self.gain_idx, signs))
+
+    def _signs(self):
+        act = self.bank[self.active]
+        return [sgn(act.theta[k]) or sgn(self.prior[k]) or 1.0
+                for k in self.gain_idx]
+
     def update(self, phi_fn, y, lam, dt):
         """One sample for every candidate. Returns True if the active
         estimator accepted it. ``phi_fn(delay)`` builds the regressor from
-        that candidate's delayed command, or None if history is too short."""
+        that candidate's delayed command, or None if history is too short.
+        The exponentially-weighted prediction error is kept per candidate
+        for diagnostics."""
         accepted = False
+        a = clamp(dt / self.ew_tau, 0.0, 1.0)
         for i, (d, r) in enumerate(zip(self.delays, self.bank)):
             phi = phi_fn(d)
             if phi is None:
@@ -565,15 +683,20 @@ class DelayBank:
             if r.update(phi, y, lam) and finite(inn):
                 if i == self.active:
                     accepted = True
-                a = clamp(dt / self.ew_tau, 0.0, 1.0)
                 e = inn * inn
-                self.score[i] = e if self.score[i] is None                     else self.score[i] + a * (e - self.score[i])
-        best = self.active
-        for i, s in enumerate(self.score):
-            if s is not None and (self.score[best] is None
-                                  or s < self.score[best]):
-                best = i
-        if best != self.active and self.score[self.active] is not None                 and self.score[best] < self.margin * self.score[self.active]:
+                self.score[i] = e if self.score[i] is None \
+                    else self.score[i] + a * (e - self.score[i])
+        signs = self._signs()
+        cur = self.aligned_gain(self.active, signs)
+        best, best_gain = self.active, cur
+        for i, r in enumerate(self.bank):
+            if i == self.active or r.count < self.min_count:
+                continue
+            g = self.aligned_gain(i, signs)
+            if finite(g) and g > best_gain:
+                best, best_gain = i, g
+        if best != self.active and finite(cur) \
+                and best_gain * self.margin > cur:
             self.active = best
         return accepted
 
@@ -691,6 +814,11 @@ class CurvatureEnvelope:
         self.p = policy
         self.left = _Window(policy.env_evidence)
         self.right = _Window(policy.env_evidence)
+        # The speed the envelope is quoted at when none is given: the
+        # learned operating speed, kept current by the core. Zero (nothing
+        # driven yet) quotes the kinematic lock, which is the right answer
+        # for a car that has not moved.
+        self.v_op = 0.0
 
     @staticmethod
     def predict(model, qs, v):
@@ -733,7 +861,7 @@ class CurvatureEnvelope:
         ``forward=True`` takes the worst of the two FORWARD cells only. For
         the follower's lookahead, not the planner: see the node's push.
         """
-        v = self.p.env_speed if v is None else v
+        v = self.v_op if v is None else v
         # Worst of ALL FOUR cells: Smac plans forward and reverse arcs with
         # ONE minimum_turning_radius, so the quoted envelope must be
         # feasible in whichever cell the maneuver lands in -- and on this
@@ -910,20 +1038,48 @@ class AdaptiveCore:
         self.tick = 0.0
         self.sigma_psi = 0.0
 
-        # Derived, never tuned.
-        self.gate_d = 0.15
-        self.gate_s = 0.24
+        # Derived, never tuned. The gates are set from the SENSE noise
+        # measurement and re-scaled every tick against v_op (below).
+        self.gate_d = 0.0
+        self.gate_s = 0.0
         self.alpha = 0.33
         self.lam = 0.999
         self.dither = 0.0
+        # The operating speed: the one learned SCALE every speed-shaped
+        # threshold is a fraction of. A high-water mark of what the vehicle
+        # is commanded (ACTIVE) or seen to hold (PASSIVE, CAL), forgotten at
+        # t_forget's half-life -- but only while being driven: a car parked
+        # for an hour has not become a slower car, and letting the gates
+        # decay under a parked car would open them to odometry noise. Zero
+        # until the first motion; persisted (see state()).
+        self.v_op = 0.0
 
         def _delays(center):
-            return (center / p.delay_spread, center, center * p.delay_spread)
+            """Log-spaced candidates from the prior out to the bounds.
+
+            The prior is always on the grid (so a persisted delay restores
+            exactly) and is the starting candidate. A non-positive centre
+            means "no alignment": the single candidate 0, which is what a
+            test of the alignment itself needs as its control."""
+            if center <= 0.0 or p.delay_spread <= 1.0:
+                return [max(center, 0.0)]
+            below, d = [], center
+            while d / p.delay_spread >= p.delay_min:
+                d /= p.delay_spread
+                below.insert(0, d)
+            above, d = [], center
+            while d * p.delay_spread <= p.delay_max:
+                d *= p.delay_spread
+                above.append(d)
+            return below + [center] + above
         # All four gain cells start at the same prior; the data splits them.
         self.lat_bank = DelayBank([p.prior_a0] * 4 + [0.0, 0.0],
                                   p.p0, p.p_max,
                                   _delays(p.lat_delay), p.delay_ew_tau,
-                                  p.delay_switch_margin)
+                                  p.delay_switch_margin,
+                                  gain_idx=(0, 1, 2, 3),
+                                  min_count=p.ready_lat_samples)
+        self.lat_bank.set_delay(p.lat_delay)
         # Drag opposes motion: b2 <= 0 is physics, enforced IN the fit.
         # At one cruise speed b1/b2/b3 are collinear and only their sum is
         # pinned; left free, the split wandered to b2 = +2.74 (2026-08-29
@@ -940,7 +1096,9 @@ class AdaptiveCore:
                                   _delays(p.lon_delay), p.delay_ew_tau,
                                   p.delay_switch_margin,
                                   bounds=[None, None, (None, 0.0), None],
-                                  absorber=1)
+                                  absorber=1, gain_idx=(0,),
+                                  min_count=p.ready_lon_samples)
+        self.lon_bank.set_delay(p.lon_delay)
         self._kappa_prev = 0.0
         self._kappa_changed_t = None
         self.odom_ok = True
@@ -965,10 +1123,12 @@ class AdaptiveCore:
         self._still_since = None
         self.v_fast = 0.0
         self.qs = self.qd = 0.0
-        # (stamp, us, ud) history for delay-aligned regression
-        self._cmd_hist = deque(maxlen=64)
+        # (stamp, us, ud) history for delay-aligned regression. Deep enough
+        # for delay_max at any odometry rate this runs at (2.5 s at 400 Hz);
+        # it was 64 entries, i.e. 1.3 s at the EKF's 50 Hz.
+        self._cmd_hist = deque(maxlen=1024)
         # Sane raw speeds, for the held-speed span (see _held_speed).
-        self._v_hist = deque(maxlen=64)
+        self._v_hist = deque(maxlen=1024)
         self.iw = self.iv = 0.0
         self.prev_us = self.prev_ud = 0.0
         # Last throttle actually put on the wire (after dead-band compensation),
@@ -1040,7 +1200,34 @@ class AdaptiveCore:
         return (self.rls_lon.count >= p.ready_lon_samples
                 and self.qd_lo is not None and self.vl_lo is not None
                 and self.qd_hi - self.qd_lo >= p.ready_lon_qd_span
-                and self.vl_hi - self.vl_lo >= p.ready_lon_v_span)
+                and self.ready_lon_v_span > 0.0
+                and self.vl_hi - self.vl_lo >= self.ready_lon_v_span)
+
+    # -- speed-shaped thresholds, all fractions of the learned v_op --------
+
+    @property
+    def v_eff_floor(self):
+        return self.policy.v_eff_floor_frac * self.v_op
+
+    @property
+    def stall_cmd_min(self):
+        return self.policy.stall_cmd_frac * self.v_op
+
+    @property
+    def ready_lon_v_span(self):
+        return self.policy.ready_lon_v_span_frac * self.speed_scale
+
+    @property
+    def speed_scale(self):
+        """The operating speed, or -- for a fit restored or hand-set
+        before anything was driven -- the top of the fit's own speed span.
+        ONLY for judging the throttle fit (readiness, lon_sane, the load
+        projection), which clamp into that span anyway. Never for the
+        gates or the horizon: a persisted span can be polluted (this
+        robot's read -1.58..1.81 m/s on 08-29, ICP jumps from before
+        _held_speed, and a span never shrinks), and a scale taken from it
+        put the gates at 0.63 m/s on a 0.32 m/s car."""
+        return self.v_op or max(abs(self.vl_lo or 0.0), abs(self.vl_hi or 0.0))
 
     @property
     def ready_lat(self):
@@ -1244,6 +1431,8 @@ class AdaptiveCore:
         self.qs += (us_app - self.qs) * (1.0 - math.exp(-dt / p.tau_s))
         self.qd += (ud_app - self.qd) * (1.0 - math.exp(-dt / p.tau_d))
 
+        # ---------- the operating speed, and everything scaled by it ------
+        self._update_scale(cmd_v)
 
         # ---------- learn, gated by MEASURED noise ------------------------
         learning = self._learn(v)
@@ -1283,16 +1472,58 @@ class AdaptiveCore:
             self.sigma_psi = _stddev(self._psi_diffs) / math.sqrt(2.0)
 
             # Everything downstream is derived from the measurement.
-            self.gate_d = max(0.15, 10.0 * max(self.sigma_v, self.tick))
-            # ...but never so high that the speeds Nav2 actually drives at
-            # fall under the lateral gate (Policy.gate_s_max).
-            self.gate_d = max(0.15, min(self.gate_d, p.gate_s_max / 1.6))
-            self.gate_s = 1.6 * self.gate_d
+            self._update_gates()
             self.alpha = clamp(self.dt / 0.30, 0.05, 0.6)
             self.lam = math.exp(math.log(0.5) * self.dt / p.t_forget)
             self.v_prev = v
             self._enter(CAL if p.enable_calibration else RUN, t)
         return self._safe_output()
+
+    def _update_scale(self, cmd_v):
+        """Track the operating speed and re-derive what depends on it.
+
+        The scale is what the vehicle is being ASKED to do -- Nav2's
+        commands, when this controller drives -- with the held speed as
+        the fallback for PASSIVE (the joystick's commands are not seen as
+        speeds) and CAL. Forgetting runs only while driving, see reset().
+        """
+        # The command IS the regime when there is one; the held speed
+        # stands in only when nobody is commanding through this controller
+        # (PASSIVE, CAL, coasting) -- an overshoot is not a faster regime.
+        # And the held speed counts only while the rolling latch says the
+        # car is moving: at rest the median of the odometry noise is not
+        # zero, and a scale of 7 mm/s would put the gates under the noise.
+        if cmd_v != 0.0:
+            seen = abs(cmd_v)
+        else:
+            seen = abs(self._held_speed()) if self.rolling else 0.0
+        if seen > 0.0 or self.rolling:
+            self.v_op = max(seen, self.v_op * self.lam)
+        self.envelope.v_op = self.v_op
+        self._update_gates()
+
+    def _update_gates(self):
+        """Motion gates from the measured noise, bounded by the scale.
+
+        gate_d: below this the speed is noise, not motion. gate_s: the
+        lateral learner's stricter gate -- psidot/v amplifies noise.
+        Ten sigma of the SENSE measurement, clamped into the floor..cap
+        band of v_op once there is a v_op (Policy.gate_floor_frac and
+        gate_cap_frac say why both bounds exist).
+        """
+        p = self.policy
+        noise = max(self.sigma_v, self.tick)
+        gate = 10.0 * noise
+        if self.v_op > 0.0:
+            gate = clamp(gate, p.gate_floor_frac * self.v_op,
+                         p.gate_cap_frac * self.v_op)
+        # ...but the cap may not put the gate INSIDE the noise: a sample
+        # under five sigma is not certainly motion, whatever the regime (a
+        # 0.02 m/s crawl on a sensor with 0.007 m/s of jitter is not
+        # something to learn from). On this robot 5 sigma is 0.08-0.14,
+        # under the 0.15 cap on every boot measured so far.
+        self.gate_d = max(gate, 5.0 * noise)
+        self.gate_s = 1.6 * self.gate_d
 
     def _held_speed(self):
         """The speed the car has HELD: the median of the raw speed over one
@@ -1453,11 +1684,14 @@ class AdaptiveCore:
         # --- steering -----------------------------------------------------
         # sgn(v) is zero at standstill, which would divide by zero; fall back
         # to the commanded direction, then to forward.
-        if abs(cmd_v) > p.v_eff_floor:
+        # The floor is a fraction of the operating speed; the 1 mm/s under
+        # it only guards the division for a car that has never moved.
+        v_floor = max(self.v_eff_floor, 1e-3)
+        if abs(cmd_v) > v_floor:
             v_eff = cmd_v
         else:
             direction = sgn(v) or sgn(cmd_v) or 1.0
-            v_eff = direction * max(abs(v), p.v_eff_floor)
+            v_eff = direction * max(abs(v), v_floor)
 
         # Ask for no more curvature than the vehicle is believed to have.
         # Without this the inversion winds the trim integrator up against a
@@ -1490,7 +1724,11 @@ class AdaptiveCore:
         # correction by dividing by SIGNED v. Dividing by |v| (as the original
         # spec did) winds the trim the wrong way whenever the robot reverses:
         # the steering correction inverts exactly while driving backward.
-        v_signed = sgn(v_eff) * max(abs(v_eff), 0.5)
+        # Floored at the operating speed so the trim gain never exceeds
+        # ki_w / v_op (Policy.ki_w); v_op is at least |cmd_v|, so in normal
+        # driving this IS the divisor and the trim is a fixed-gain yaw-rate
+        # integrator -- which is what the typed 0.5 m/s floor had made it.
+        v_signed = sgn(v_eff) * max(abs(v_eff), self.v_op)
         # Standstill steering authority (applied below); computed here because
         # the anti-windup has to know what "saturated" means right now: a
         # command pinned at the standstill clamp is just as unable to act on
@@ -1598,14 +1836,23 @@ class AdaptiveCore:
         # the WRONG way for up to 4.8 s after a cusp (16 of 71 reversals in
         # the flight log took more than 2 s to change sign), because the
         # smoother's ramp through zero rarely lands on exactly 0.0.
-        direction = sgn(cmd_v) if abs(cmd_v) > p.stall_cmd_min else 0.0
+        direction = sgn(cmd_v) if abs(cmd_v) > self.stall_cmd_min else 0.0
         if direction and self._cmd_dir and direction != self._cmd_dir:
             self.iv = 0.0
         if direction:
             self._cmd_dir = direction
 
         err = cmd_v - v
-        a_des = clamp(p.kp_v * err, -2.5, 2.5)
+        # The feedback gain b0 is used PRIOR-RELATIVE: bounded to half..twice
+        # the declared full-throttle acceleration, a risk constant on how
+        # far the learned value may scale the loop. A drifted fit dilutes
+        # or triples it -- the 02:15 poisoned b0 of 6.4 cut kp's authority
+        # 3x and the overspeed ran away uncorrected, while the settling
+        # window's under-fit (0.7 in sim) would triple it. The same bounded
+        # number is what full throttle can deliver, so the acceleration
+        # demand is clamped to it (it was a typed 2.5 m/s^2).
+        b0_fb = clamp(b0, 0.5 * p.prior_b0, 2.0 * p.prior_b0)
+        a_des = clamp(p.kp_v * err, -b0_fb, b0_fb)
         self.iv = clamp(self.iv + p.ki_v * err * dt, -p.iv_max, p.iv_max)
         # A MOVING reversal -- the command points against the car's travel
         # while it is still measurably rolling -- is braking, not a launch.
@@ -1668,13 +1915,8 @@ class AdaptiveCore:
             # data-pinned, and dividing the fitted numerator by anything
             # but the fitted denominator breaks the equilibrium the data
             # actually showed (the b2-clamp lesson). The FEEDBACK part
-            # a_des/b0 is different: there b0 is a loop gain, and a drifted
-            # fit dilutes or triples it -- the 02:15 poisoned b0 of 6.4 cut
-            # kp's authority 3x and the overspeed ran away uncorrected,
-            # while the settling window's under-fit (0.7 in sim) would
-            # triple it. Bounded prior-relative, a risk constant on how far
-            # the learned value may scale the loop, not a vehicle property.
-            b0_fb = clamp(b0, 0.5 * p.prior_b0, 2.0 * p.prior_b0)
+            # a_des/b0 goes through the bounded b0_fb (above): there b0 is
+            # a loop gain, not a vehicle property.
             ud = a_des / b0_fb
             if not reversing:
                 ud -= (b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
@@ -1733,7 +1975,7 @@ class AdaptiveCore:
         """
         p = self.policy
         moving = self.rolling
-        want = abs(cmd_v) > p.stall_cmd_min
+        want = abs(cmd_v) > self.stall_cmd_min
 
         if self._blocked_until is not None:
             if self._blocked_until <= t or not want:
@@ -1872,7 +2114,7 @@ class AdaptiveCore:
         wrong-signed b0 there must not block saving a good steering model.
         """
         m = self.model
-        v2 = self.policy.env_speed ** 2
+        v2 = self.v_op ** 2
         raw = (m.a0l, m.a0r, m.a0l_rev, m.a0r_rev)
         spans = [abs(gain + m.a2 * v2) for gain in raw]
         # Deliberately does NOT require a2 <= 0. That sign is enforced at the
@@ -1905,12 +2147,11 @@ class AdaptiveCore:
         clear-costmap + replan costing 25-30 s, on a car that stops in
         ~0.35 s from 0.35 m/s (b3 = -0.95 m/s^2).
         """
-        p = self.policy
         b3 = self.rls_lon.theta[3]
-        if not (self.ready_lon and self.lon_plausible()
+        if not (self.ready_lon and self.lon_plausible() and self.v_op > 0.0
                 and finite(b3) and b3 < 0.0):
             return None
-        return self.lon_bank.delay + p.env_speed / (-b3)
+        return self.lon_bank.delay + self.v_op / (-b3)
 
     def lon_plausible(self):
         """More throttle means more acceleration, or the fit is not a vehicle.
@@ -1921,7 +2162,7 @@ class AdaptiveCore:
         """
         m = self.model
         return lon_sane((m.b0, m.b1, m.b2, m.b3), self.vl_lo, self.vl_hi,
-                        self.policy)
+                        self.policy, self.speed_scale)
 
     def state(self):
         """Everything worth carrying across a reboot.
@@ -1954,6 +2195,9 @@ class AdaptiveCore:
             'deadband': self.deadband.state(),
             'sigma_v': self.sigma_v,
             'tick': self.tick,
+            # The scale every speed-shaped gate is a fraction of. Restored
+            # so a rebooted car does not start with its gates at zero.
+            'v_op': self.v_op,
         }
 
     def load_state(self, d, inflate=1.0):
@@ -2015,6 +2259,17 @@ class AdaptiveCore:
             qd = vl = qs = (None, None)
 
         p0 = min(p.p0 * inflate, p.p_max)
+        # The operating speed, when the file has one. A file from before
+        # it was learned leaves it unknown: the gates stay at the noise
+        # measurement until the first command sets it, which is one tick.
+        # NOT inferred from the span (see speed_scale).
+        v_op = d.get('v_op')
+        self.v_op = float(v_op) if finite(v_op) and v_op > 0.0 else 0.0
+        self.envelope.v_op = self.v_op
+        self._update_gates()
+        # Where the restored throttle fit is judged: the same scale
+        # lon_sane and readiness use, clamped into the span as they are.
+        judge_v = self.v_op or max(abs(vl[0] or 0.0), abs(vl[1] or 0.0))
         # A file can carry poisoned cells (it did: 08-28, a 2-2 sign split
         # saved under the old tie rule and restored on every launch that
         # day). Seed the learner from the sanitised cells so it does not
@@ -2023,11 +2278,12 @@ class AdaptiveCore:
         self.lat_bank.seed(lat, n_lat, p0)
         self.qs_lo, self.qs_hi = qs
         if lon[2] > 0.0:
-            # Same projection as the fit's, anchored at the planning speed
-            # so the persisted cruise wire (what lon_sane judges) is kept.
-            lon[1] += lon[2] * p.env_speed ** 2
+            # Same projection as the fit's, anchored at the speed the fit
+            # is judged at so the persisted cruise wire (what lon_sane
+            # judges) is kept.
+            lon[1] += lon[2] * min(judge_v, vl[1] or judge_v) ** 2
             lon[2] = 0.0
-        if lon_sane(lon, vl[0], vl[1], p):
+        if lon_sane(lon, vl[0], vl[1], p, judge_v):
             self.lon_bank.seed(lon, n_lon, p0)
             self.qd_lo, self.qd_hi = qd
             self.vl_lo, self.vl_hi = vl

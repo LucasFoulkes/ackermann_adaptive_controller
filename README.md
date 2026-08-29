@@ -103,7 +103,8 @@ Measuring a *ratio* is what makes this speed-correct. Raw curvature at full
 lock depends heavily on speed through `a2*v^2` — on this vehicle that term
 nearly cancels the steering gain around 2 m/s — so a raw measurement taken
 while driving fast reports a far flatter envelope than the robot has at the
-0.35 m/s Nav2 plans for. `env_speed` is the speed the radius is quoted at.
+0.35 m/s Nav2 plans for. The radius is quoted at `v_op`, the learned
+operating speed (below).
 
 Robustness comes from a median over a bounded window: `env_evidence` samples
 per side are needed before the value is believed at all, one glitched sample
@@ -178,10 +179,12 @@ The Coulomb feedforward is only used in the inversion once both directions
 have fed the fit — one-sided data cannot separate `b3` from the bias `b1`.
 
 The command-to-response delay each model aligns to is not configured either:
-each axis runs a small bank of identical estimators at candidate delays
-(`lat_delay`/`lon_delay` are just the initial centers) and control follows
-whichever currently predicts best, scored by exponentially-weighted
-prediction error with switching hysteresis. The learned lateral delay also
+each axis runs a bank of identical estimators at candidate delays spaced
+`delay_spread` apart from `lat_delay`/`lon_delay` (only the starting
+candidates) out to `delay_min`..`delay_max` (0.05–2.5 s), and control follows
+the candidate with the largest fitted gain — the cross-correlation peak: an
+early candidate sees the response smeared and fits a smaller gain, a late one
+sees it inverted — with switching hysteresis and a minimum sample count. The learned lateral delay also
 sizes the trim freeze window: after the commanded curvature changes, the yaw
 error is pure transport delay for one delay + servo constant, and the trim
 integrator holds instead of winding up on it. `/diagnostics` reports
@@ -212,17 +215,29 @@ envelope. `/diagnostics` reports `deadband`.
   ~18° max steering angle. It is only a bootstrap so `RUN` works before
   anything is learned; the envelope above supersedes it once there is
   evidence. Setting it closer to the truth just shortens the transient.
-- **`v_eff_floor`** defaults to `0.12`. Curvature is `omega/v`, and this
-  floors the divisor. It must sit well below the speed Nav2 commands: at 0.4
-  against a 0.22 m/s cruise the floor dominated and only ~55% of every
-  requested turn was delivered (weaving).
-- **Learning gates vs. top speed.** `gate_d = max(0.15, 10*sigma_v)` and
-  `gate_s = 1.6*gate_d`, capped so that `gate_s <= gate_s_max` (0.24 m/s).
+- **`prior_b0`** defaults to `2.0` m/s², the full-throttle acceleration.
+  Like `prior_a0` it only bootstraps; the learned `b0` replaces it. These two
+  are the ONLY vehicle numbers declared anywhere: every other threshold in
+  `Policy` is a fraction of the learned operating speed or a ratio of one of
+  these two priors, so the same code drives a 0.1 m/s crawler and an 8 m-radius
+  vehicle (see the "scale-free" tests).
+- **`v_op`, the operating speed**, is learned: a high-water mark of what the
+  controller is commanded (or, when nobody commands through it, the speed the
+  car holds), forgotten at `t_forget`'s half-life while driving and never
+  while parked, persisted in the state file. Every speed-shaped threshold is
+  a fraction of it: the curvature divisor floor `v_eff_floor_frac` (0.35;
+  at a typed 0.4 m/s against a 0.22 m/s cruise only ~55% of every requested
+  turn was delivered — weaving), the "motion wanted" threshold
+  `stall_cmd_frac`, the speed-span readiness `ready_lon_v_span_frac`, and
+  the learning gates below. `/diagnostics` reports `v_op`.
+- **Learning gates vs. top speed.** `gate_d` is `10*sigma_v`, clamped into
+  `gate_floor_frac..gate_cap_frac` of `v_op` (0.35..0.45, which is 0.15 m/s
+  on this robot's 0.32 m/s) and never under `5*sigma_v`; `gate_s = 1.6*gate_d`.
   Without the cap a `sigma_v` of 0.028 — measured on one boot, 0.015 on the
   next, same floor — put `gate_s` at 0.45 m/s, above the 0.38 m/s the
   velocity smoother allows, and the steering model took 23 samples in ten
-  minutes. If you raise Nav2's speeds, `gate_s_max` can go up with them.
-  Check `sigma_v` and `gate_d` in `/diagnostics` after `SENSE`.
+  minutes. Raising Nav2's speeds raises `v_op` and the gates follow.
+  Check `sigma_v`, `v_op` and `gate_d` in `/diagnostics` after `SENSE`.
 - **`launch_floor`** (0.15) is a constant throttle applied while motion is
   commanded and the car is not rolling. It is below the lowest breakaway ever
   observed (0.24) so it cannot lunge; it only shortens the integrator's climb,

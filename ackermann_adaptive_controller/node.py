@@ -57,20 +57,21 @@ PUBLISH_HZ = 50.0
 POLICY_PARAMS = (
     'enable_calibration', 'enable_dither', 't_sense', 't_cal', 't_forget',
     'tau_s', 'tau_d', 'kp_v', 'ki_v', 'ki_w', 'prior_a0', 'prior_b0',
-    'v_eff_floor', 'stall_cmd_min', 'iv_max', 'iw_max', 'v_fb_tau',
-    'span_floor', 'steer_standstill', 'use_learned_lon', 'lat_delay',
-    'lon_delay', 'gate_s_max', 'launch_floor', 'launch_cap_margin',
-    'launch_cap_rate', 'max_steer_rate',
-    'max_drive_rate', 'blocked_after', 'blocked_release',
-    'env_qs_threshold', 'env_evidence', 'env_derate', 'env_speed',
-    'radius_floor', 'radius_ceiling',
+    'v_eff_floor_frac', 'stall_cmd_frac', 'iv_max', 'iw_max_frac',
+    'v_fb_tau', 'span_floor', 'steer_standstill', 'use_learned_lon',
+    'lat_delay', 'lon_delay', 'gate_floor_frac', 'gate_cap_frac',
+    'launch_floor', 'launch_cap_margin', 'launch_cap_rate',
+    'max_steer_rate', 'max_drive_rate', 'blocked_after', 'blocked_release',
+    'env_qs_threshold', 'env_evidence', 'env_derate',
+    'radius_floor_ratio', 'radius_ceiling_ratio',
     'deadband_evidence', 'deadband_trust', 'deadband_max',
-    'deadband_slow_start', 'b0_min', 'den_min', 'p0', 'p_max',
+    'deadband_slow_start', 'b0_min_frac', 'den_min_frac', 'p0', 'p_max',
     'ready_lat_samples', 'ready_lat_qs_span', 'ready_lon_samples',
-    'ready_lon_qd_span', 'ready_lon_v_span', 'stall_time',
+    'ready_lon_qd_span', 'ready_lon_v_span_frac', 'stall_time',
     'blocked_retries', 'blocked_hold', 'odom_timeout_steps',
     'cal_steer', 'cal_drive',
-    'delay_spread', 'delay_ew_tau', 'delay_switch_margin', 'iw_freeze_frac',
+    'delay_spread', 'delay_min', 'delay_max', 'delay_ew_tau',
+    'delay_switch_margin', 'iw_freeze_frac',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
 )
 _DEFAULTS = Policy()
@@ -641,7 +642,7 @@ class AckermannAdaptiveController(Node):
         # controller steers with all four; Nav2 takes one number, so the
         # planner is quoted the weakest cell x margin. Say which is which.
         m = self.core.model
-        v2 = self.core.policy.env_speed ** 2
+        v2 = self.core.speed_scale ** 2
         cells = {'fwd-L': abs(m.a1 + m.a0l + m.a2 * v2),
                  'fwd-R': abs(m.a1 - m.a0r - m.a2 * v2),
                  'rev-L': abs(m.a1 + m.a0l_rev + m.a2 * v2),
@@ -649,7 +650,7 @@ class AckermannAdaptiveController(Node):
         self.get_logger().info(
             'learned turning radii at %.2f m/s: %s -> planner gets %.2f m '
             '(weakest x %.1f)' % (
-                self.core.policy.env_speed,
+                self.core.speed_scale,
                 ', '.join(f'{k} {1.0 / c if c > 1e-3 else float("inf"):.2f}'
                           for k, c in cells.items()),
                 quoted, self.radius_margin))
@@ -830,7 +831,11 @@ class AckermannAdaptiveController(Node):
             'psidot': f'{self.core.psidot:.3f}',
             'dt': f'{self.core.dt:.4f}',
             'sigma_v': f'{self.core.sigma_v:.4f}',
+            # the learned operating speed every speed-shaped gate is a
+            # fraction of, and the gates it currently sets
+            'v_op': f'{self.core.v_op:.3f}',
             'gate_d': f'{self.core.gate_d:.3f}',
+            'gate_s': f'{self.core.gate_s:.3f}',
             # gains per (travel direction x steering side) -- unequal is
             # real: linkage geometry left/right, caster dynamics fwd/rev
             'lateral_a': (f'fwd L{m.a0l:.3f} R{m.a0r:.3f}  '

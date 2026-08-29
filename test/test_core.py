@@ -22,7 +22,8 @@ def test_sense_derives_gates_from_measured_noise():
     settle_sense(core, plant)
     assert core.phase == RUN            # calibration off by default
     assert core.sigma_v > 0.0
-    assert core.gate_d >= 0.15
+    # nothing driven yet, so no scale to bound it: the gate IS the noise
+    assert core.gate_d == pytest.approx(10.0 * max(core.sigma_v, core.tick))
     assert core.gate_s == pytest.approx(1.6 * core.gate_d)
     # lambda must give the same half-life regardless of sample rate
     assert 0.0 < core.lam < 1.0
@@ -148,8 +149,15 @@ def test_learning_is_gated_below_the_noise_floor():
     plant = Plant()
     t = settle_sense(core, plant)
     before = core.model.n_lon
-    # crawl well under gate_d: no samples may be accepted
-    drive(core, plant, lambda s: (0.02, 0.0), 5.0, t0=t)
+    # someone else creeps the car along under gate_d (a 0.02 m/s command
+    # through this controller would lunge to the launch floor, which is
+    # real motion): no samples may be accepted
+    for _ in range(50):
+        t += 0.1
+        plant.step(0.0, 0.002, 0.1)
+        x, y, psi = plant.observe()
+        core.step(t, x, y, psi, 0.0, 0.0, applied=(0.0, 0.002))
+    assert abs(core.v) < core.gate_d
     assert core.model.n_lon == before
 
 
@@ -399,7 +407,7 @@ def test_envelope_confirms_from_hard_steering_and_tightens():
     after = core.envelope.min_turning_radius(core.model)
     assert after < before                      # evidence beats a derated prior
     # the truth, quoted at the same speed the envelope quotes
-    v = core.policy.env_speed
+    v = core.v_op
     truth = 1.0 / abs(plant.a0 + plant.a2 * v * v)
     assert after == pytest.approx(truth, rel=0.30)
 
@@ -432,10 +440,11 @@ def test_envelope_is_speed_correct():
           150.0, t0=t)
 
     assert slow.envelope.confirmed and fast.envelope.confirmed
-    v = slow.policy.env_speed
+    v = slow.v_op
     truth = 1.0 / abs(pslow.a0 + pslow.a2 * v * v)
-    # both are quoted at env_speed, so both must land near the same truth
-    assert fast.envelope.min_turning_radius(fast.model) == \
+    # quoted at the SAME speed, the fast car's evidence must land on the
+    # same truth as the slow car's
+    assert fast.envelope.min_turning_radius(fast.model, v) == \
         pytest.approx(truth, rel=0.40)
 
 
@@ -477,8 +486,8 @@ def test_envelope_shrinks_when_the_model_overpromises():
         env.observe(1.0, 0.5 * env.predict(m, 1.0, v), v, m)
         env.observe(-1.0, 0.5 * env.predict(m, -1.0, v), v, m)
     assert env.fidelity() == pytest.approx(0.5, rel=0.05)
-    unconstrained = min(abs(m.a1 + m.a0 + m.a2 * env.p.env_speed ** 2),
-                        abs(m.a1 - m.a0 - m.a2 * env.p.env_speed ** 2))
+    unconstrained = min(abs(m.a1 + m.a0 + m.a2 * env.v_op ** 2),
+                        abs(m.a1 - m.a0 - m.a2 * env.v_op ** 2))
     assert env.max_curvature(m) == pytest.approx(0.5 * unconstrained, rel=0.05)
 
 
@@ -490,20 +499,24 @@ def test_evidence_never_makes_the_envelope_more_optimistic():
     for _ in range(env.p.env_evidence + 4):
         env.observe(1.0, 1.4 * env.predict(m, 1.0, v), v, m)
         env.observe(-1.0, 1.4 * env.predict(m, -1.0, v), v, m)
-    unconstrained = min(abs(m.a1 + m.a0 + m.a2 * env.p.env_speed ** 2),
-                        abs(m.a1 - m.a0 - m.a2 * env.p.env_speed ** 2))
+    unconstrained = min(abs(m.a1 + m.a0 + m.a2 * env.v_op ** 2),
+                        abs(m.a1 - m.a0 - m.a2 * env.v_op ** 2))
     assert env.max_curvature(m) <= unconstrained * 1.001
 
 
 def test_envelope_is_bounded_by_the_radius_limits():
-    core = AdaptiveCore(Policy(radius_floor=0.5, radius_ceiling=3.0,
-                               prior_a0=50.0))
+    """The bounds are ratios of the prior's radius 1/prior_a0."""
+    pol = Policy(radius_floor_ratio=0.5, radius_ceiling_ratio=3.0)
+    assert pol.radius_floor == pytest.approx(0.5 / pol.prior_a0)
+    assert pol.radius_ceiling == pytest.approx(3.0 / pol.prior_a0)
+    core = AdaptiveCore(pol)
     settle_sense(core, Plant())
-    assert core.envelope.min_turning_radius(core.model) >= 0.5
-    core2 = AdaptiveCore(Policy(radius_floor=0.5, radius_ceiling=3.0,
-                                prior_a0=1e-6))
-    settle_sense(core2, Plant())
-    assert core2.envelope.min_turning_radius(core2.model) <= 3.0
+    core.rls_lat.theta = [50.0] * 4 + [0.0, 0.0]        # 2 cm: implausible
+    assert core.envelope.min_turning_radius(core.model) == \
+        pytest.approx(pol.radius_floor)
+    core.rls_lat.theta = [1e-6] * 4 + [0.0, 0.0]        # 1000 km: collapsed
+    assert core.envelope.min_turning_radius(core.model) == \
+        pytest.approx(pol.radius_ceiling)
 
 
 def test_commanded_curvature_is_clamped_to_the_envelope():
@@ -705,7 +718,7 @@ def test_stall_reflex_fires_at_nav2_speeds():
     """The old threshold was 0.25, exactly the smoother's reverse limit, so
     `abs(cmd_v) > 0.25` was never true and the reflex never ran."""
     core = AdaptiveCore()
-    assert core.policy.stall_cmd_min < 0.25
+    assert core.policy.stall_cmd_frac < 1.0   # below any command that sets it
     plant = Sticky(breakaway=0.5)
     t = settle_sense(core, plant)
     peak = 0.0
@@ -790,7 +803,10 @@ def test_outputs_are_slew_limited():
         x, y, psi = plant.observe()
         out = core.step(t, x, y, psi, cv, cw)
         worst_s = max(worst_s, abs(out.steer - prev_s))
-        worst_d = max(worst_d, abs(out.drive - prev_d))
+        # the launch floor steps the wire to the breakaway by design (it
+        # bypasses the slew: see reset()); every other tick is slew-bound
+        if core._floor == 0.0:
+            worst_d = max(worst_d, abs(out.drive - prev_d))
         prev_s, prev_d = out.steer, out.drive
         for _ in range(5):
             plant.step(out.steer, out.drive, dt / 5)
@@ -989,7 +1005,6 @@ def test_curvature_is_not_starved_at_nav2_speeds():
     0.22 m/s Nav2 actually drives -- the follower kept asking harder and the
     robot weaved. The floor must sit below the operating speed."""
     core = AdaptiveCore()
-    assert core.policy.v_eff_floor <= 0.15
     plant = Plant()
     t = settle_sense(core, plant)
     # A gentle, ACHIEVABLE arc (kappa = 0.55, well inside the vehicle's
@@ -997,6 +1012,7 @@ def test_curvature_is_not_starved_at_nav2_speeds():
     # kappa = w/0.4 = 0.30 and delivered barely half the turn; with the
     # floor below the operating speed it computes w/v and delivers it.
     _, t = drive(core, plant, lambda s: (0.22, 0.12), 30.0, t0=t)
+    assert core.v_eff_floor < 0.22 * 0.5, core.v_eff_floor
     assert core.psidot == pytest.approx(0.12, rel=0.30), core.psidot
 
 
@@ -1284,11 +1300,13 @@ def test_direction_reversal_resets_the_throttle_integrator():
 def test_lateral_gate_is_capped_at_the_operating_speed():
     """A noisy SENSE must not put the learning gate above cruise speed."""
     core = AdaptiveCore()
-    plant = Plant(pose_noise=0.006)         # ~0.08 m/s of velocity noise
-    settle_sense(core, plant, seconds=4.0)
+    plant = Plant(pose_noise=0.002)         # sigma_v ~0.028, the noisy boot
+    t = settle_sense(core, plant, seconds=4.0)
     assert core.phase == RUN
-    assert core.sigma_v > 0.03
-    assert core.gate_s <= core.policy.gate_s_max + 1e-9
+    assert core.sigma_v > 0.02
+    drive(core, plant, lambda s: (0.35, 0.0), 3.0, t0=t)   # Nav2's regime
+    assert core.gate_s <= 1.6 * core.policy.gate_cap_frac * core.v_op + 1e-9
+    assert core.gate_s < 0.35
     assert core.gate_s == pytest.approx(1.6 * core.gate_d)
 
 
@@ -1839,7 +1857,8 @@ def test_persisted_positive_drag_is_projected_on_load():
     d['spans']['vl'] = [-0.6, 0.6]
     assert core.load_state(d)
     m = core.model
-    v = core.policy.env_speed
+    assert core.v_op == 0.0           # no saved v_op: unknown until driven
+    v = 0.6                           # judged at the span's top instead
     assert m.b2 == 0.0
     assert -(m.b1 + m.b3) / m.b0 == pytest.approx(
         -(-0.024 + 2.739 * v * v - 0.700) / 2.194, abs=1e-6)
@@ -1848,15 +1867,15 @@ def test_persisted_positive_drag_is_projected_on_load():
 def test_self_accelerating_throttle_model_is_not_a_vehicle():
     """b0 above the floor, so the old b0-only test let this through; it
     claims +0.18 m/s^2 at 0.25 m/s with the throttle at zero."""
-    pol = Policy()
-    assert not lon_sane(POISONED_LON_0828, -0.4, 0.4, pol)
-    assert lon_sane([1.7, 0.02, -0.4, -0.4], -0.4, 0.4, pol)   # healthy
+    pol, v_op = Policy(), 0.35
+    assert not lon_sane(POISONED_LON_0828, -0.4, 0.4, pol, v_op)
+    assert lon_sane([1.7, 0.02, -0.4, -0.4], -0.4, 0.4, pol, v_op)  # healthy
     # judged only where the fit has been: no reverse span, no reverse test
-    assert lon_sane([1.7, -0.3, -0.1, 0.0], None, 0.4, pol)
-    assert not lon_sane([0.2, -0.3, -0.1, 0.0], None, 0.4, pol)  # collapsed
-    # judged at the planning speed, not the span's lurch peak: the fresh
+    assert lon_sane([1.7, -0.3, -0.1, 0.0], None, 0.4, pol, v_op)
+    assert not lon_sane([0.2, -0.3, -0.1, 0.0], None, 0.4, pol, v_op)
+    # judged at the operating speed, not the span's lurch peak: the fresh
     # 22:28 fit is -0.005 wire at cruise and would read +1 m/s^2 at 0.89
-    assert lon_sane([2.02, -0.07, 1.49, -0.10], -0.5, 0.89, pol)
+    assert lon_sane([2.02, -0.07, 1.49, -0.10], -0.5, 0.89, pol, v_op)
 
     core = AdaptiveCore()
     settle_sense(core, Plant())
@@ -2015,8 +2034,214 @@ def test_stop_horizon_is_delay_plus_friction_stopping_time():
     core.rls_lon.count = 500
     core.qd_lo, core.qd_hi = -0.5, 0.5
     core.vl_lo, core.vl_hi = -0.6, 0.6
-    p = core.policy
+    core.v_op = 0.35
     assert core.stop_horizon() == pytest.approx(
-        core.lon_bank.delay + p.env_speed / 0.95)
+        core.lon_bank.delay + core.v_op / 0.95)
     core.rls_lon.theta = [6.0, 0.02, 0.9, 0.10]        # friction not found
     assert core.stop_horizon() is None
+
+
+# -- scale-free: the same code on a different vehicle -----------------------
+#
+# The goal is a controller that is handed (v*, omega*) on ANY car-steered
+# vehicle and learns to deliver them. Everything a vehicle IS is learned;
+# the only two things declared are the priors prior_a0 (tan(lock)/wheelbase)
+# and prior_b0 (full-throttle acceleration), and those only shorten the
+# transient. Every other number in Policy is a fraction of a learned scale
+# (v_op, the operating speed) or a ratio of one of those two priors. These
+# tests drive three vehicles a decade apart in size and speed through the
+# same code path, and pin the derivations to the numbers this robot was
+# hand-tuned with so nothing changes here.
+
+def test_derived_values_reproduce_this_robots_hand_tuning():
+    """The 08-2x hand values, as functions of this robot's measured scale.
+
+    sigma_v 0.0166 (state file, 08-29 13:45), v_op 0.32 (RPP's
+    desired_linear_vel; the smoother allows 0.38), prior_a0 1.25,
+    prior_b0 2.0. The hand values these must land on: gate_d 0.15,
+    gate_s 0.24, v_eff_floor 0.12, stall_cmd_min 0.05, ready_lon_v_span
+    0.15, iw_max 0.12, radius_floor 0.25, radius_ceiling 8, den_min 0.05,
+    b0_min 0.3, trim gain 0.6/s (ki_w 0.3 over a 0.5 m/s floor).
+    """
+    core = AdaptiveCore()
+    core.sigma_v, core.tick = 0.0166, 0.0002
+    core.v_op = 0.32
+    core._update_gates()
+    p = core.policy
+    assert core.gate_d == pytest.approx(0.15, rel=0.12)
+    assert core.gate_s == pytest.approx(0.24, rel=0.12)
+    assert core.v_eff_floor == pytest.approx(0.12, rel=0.12)
+    assert core.stall_cmd_min == pytest.approx(0.05, rel=0.12)
+    assert core.ready_lon_v_span == pytest.approx(0.15, rel=0.12)
+    assert p.iw_max == pytest.approx(0.12, rel=0.12)
+    assert p.radius_floor == pytest.approx(0.25, rel=0.12)
+    assert p.radius_ceiling == pytest.approx(8.0, rel=0.12)
+    assert p.den_min == pytest.approx(0.05, rel=0.12)
+    assert p.b0_min == pytest.approx(0.30, rel=0.12)
+    assert p.ki_w / core.v_op == pytest.approx(0.6, rel=0.12)
+    # the delay grid still contains the measured 0.45 s and spans a decade
+    # each way of it
+    assert 0.45 in core.lat_bank.delays
+    assert min(core.lat_bank.delays) <= 0.1
+    assert max(core.lat_bank.delays) >= 1.5
+
+
+def test_operating_speed_is_learned_from_what_is_commanded():
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.kinetic = 0.3                          # so "parked" means stopped
+    t = settle_sense(core, plant)
+    assert core.v_op == 0.0                      # nothing driven yet
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 10.0, t0=t)
+    assert core.v_op == pytest.approx(0.30, abs=0.02)
+    _, t = drive(core, plant, lambda s: (0.60, 0.0), 10.0, t0=t)
+    assert core.v_op == pytest.approx(0.60, abs=0.02)
+    # it forgets at t_forget's half-life while driving, never while parked
+    _, t = drive(core, plant, lambda s: (0.0, 0.0), 300.0, t0=t)
+    assert core.v_op == pytest.approx(0.60, abs=0.02)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0),
+                 0.5 * core.policy.t_forget, t0=t)
+    assert core.v_op == pytest.approx(0.60 * 0.5 ** 0.5, abs=0.03)
+    # and it rides in the state file
+    assert core.state()['v_op'] == pytest.approx(core.v_op)
+    fresh = AdaptiveCore()
+    assert fresh.load_state(core.state())
+    assert fresh.v_op == pytest.approx(core.v_op)
+
+
+def test_gates_follow_the_operating_speed_not_a_constant():
+    """A noisy SENSE must not put the learning gate above cruise speed --
+    on ANY vehicle. The old cap was a typed 0.24 m/s."""
+    for cruise in (0.10, 0.35, 2.0):
+        core = AdaptiveCore(Policy(kp_v=1.6, ki_v=0.8))
+        # the same sensor-to-speed ratio at every scale: the noisy boot's
+        # sigma_v of 0.028 on the 0.35 m/s car (10 sigma above the cap)
+        plant = Plant(pose_noise=0.002 * cruise / 0.35)
+        t = settle_sense(core, plant, seconds=4.0)
+        assert core.sigma_v > 0.02 * cruise / 0.35
+        drive(core, plant, lambda s, u=cruise: (u, 0.0), 5.0, t0=t)
+        p = core.policy
+        assert core.gate_s <= 1.6 * p.gate_cap_frac * core.v_op + 1e-9
+        assert core.gate_s < cruise
+        assert core.gate_s == pytest.approx(1.6 * core.gate_d)
+
+
+def _course(speeds, block, amp, hz):
+    """A steering slalom over speed STEPS every ``block`` seconds: the
+    throttle regressor is rank-deficient at one speed (README, "Drag needs
+    varied speeds") and a delay is only visible in a transition, so a fair
+    course excites both axes the way Nav2's segment starts and stops do."""
+    return lambda s: (speeds[int(s // block) % len(speeds)],
+                      amp * math.sin(2.0 * math.pi * hz * s))
+
+
+def test_slow_small_vehicle_learns_and_tracks():
+    """A 10 cm-wheelbase crawler: full lock 5/m, 0.3 m/s^2 at full
+    throttle, cruise 0.10 m/s.
+
+    Under the hand-tuned constants this vehicle could never learn: the
+    0.15 m/s gate floor sat above its cruise (no sample ever accepted),
+    the 0.12 m/s v_eff floor delivered 80% of every turn, and the 0.15 m/s
+    speed-span requirement made the throttle model unready forever.
+
+    What it can and cannot learn: the steering converges; the throttle
+    GAIN does not, and that is the sensor, not the controller -- the
+    whole wire range buys 0.3 m/s^2, so a Nav2-sized speed step is a
+    0.01 m/s^2 signal under 0.014 m/s^2 of 10 Hz differentiation noise.
+    The PI carries it (tracking is exact), and what the fit does produce
+    must stay a vehicle the inversion cannot be hurt by.
+    """
+    core = AdaptiveCore(Policy(prior_a0=5.0, prior_b0=0.3))
+    plant = Plant(a=(5.0, 0.0, -1.0), b=(0.3, 0.0, -3.0), pose_noise=0.0001)
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((0.06, 0.10, 0.08, 0.12), 10, 0.35, 0.12),
+                 160.0, t0=t)
+    m = core.model
+    assert m.n_lon > 100 and m.n_lat > 100, m
+    assert m.a0 == pytest.approx(plant.a0, rel=0.35), m
+    assert core.ready_lat
+    assert core.lon_plausible(), m
+    assert 0.0 < m.b0 < 2.0 * plant.b0, m
+    # and it tracks: a gentle arc at cruise, delivered
+    out, t = drive(core, plant, lambda s: (0.10, 0.25), 30.0, t0=t)
+    assert core.v == pytest.approx(0.10, rel=0.15), core.v
+    assert core.psidot == pytest.approx(0.25, rel=0.15), core.psidot
+
+
+def test_large_fast_vehicle_learns_and_tracks():
+    """A 3 m-wheelbase vehicle: full lock 0.12/m (8 m radius), cruise
+    2 m/s, a full second of actuation delay.
+
+    The hand-tuned constants failed it twice over: the 8 m radius ceiling
+    clamped its true envelope, and the delay bank searched 0.3-0.68 s
+    around a typed 0.45, so the regressors could never align.
+    """
+    core = AdaptiveCore(Policy(prior_a0=0.12, prior_b0=4.0))
+    plant = Plant(a=(0.12, 0.0, -0.002), b=(4.0, 0.0, -0.6),
+                  tau_s=0.5, pose_noise=0.002)
+    plant.delay = 1.0
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((1.2, 2.0, 1.6, 2.4), 10, 0.20, 0.04),
+                 240.0, t0=t)
+    m = core.model
+    assert m.b0 == pytest.approx(plant.b0, rel=0.35), m
+    assert m.a0 == pytest.approx(plant.a0, rel=0.35), m
+    assert core.ready_lon and core.ready_lat
+    # 1.0 s of transport plus the 0.3 s actuator and 0.3 s response
+    # filters: the aligned candidate is 1.52 s, and both banks reach it
+    assert core.lon_bank.delay >= 1.0, core.lon_bank.delay
+    assert core.lat_bank.delay >= 1.0, core.lat_bank.delay
+    r = core.envelope.min_turning_radius(m)
+    assert r == pytest.approx(1.0 / (plant.a0 + plant.a2 * core.v_op ** 2),
+                              rel=0.35), r
+    out, t = drive(core, plant, lambda s: (2.0, 0.15), 40.0, t0=t)
+    assert core.v == pytest.approx(2.0, rel=0.25), core.v
+    assert core.psidot == pytest.approx(0.15, rel=0.30), core.psidot
+
+
+def test_long_delay_is_found_from_a_wide_bank():
+    """This robot's own scale, but a 1.2 s command-to-response delay: the
+    bank must reach it without anyone retyping lat_delay."""
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.002)
+    plant.delay = 1.2
+    t = settle_sense(core, plant)
+    drive(core, plant,
+          lambda s: (0.45 + 0.15 * math.sin(2.0 * math.pi * 0.03 * s),
+                     0.6 * math.sin(2.0 * math.pi * 0.06 * s)),
+          200.0, t0=t)
+    assert core.lat_bank.delay >= 1.0, core.lat_bank.delay
+    assert core.model.a0 == pytest.approx(plant.a0, rel=0.35), core.model.a0
+
+
+def test_old_state_file_with_a_polluted_span_does_not_set_the_gates():
+    """This robot's own state file, 08-29 13:45: no v_op yet, and a held-
+    speed span of -1.58..1.81 m/s left by ICP jumps from before
+    _held_speed (a span never shrinks). Taking the scale from that span
+    put gate_d at 0.63 m/s on a 0.32 m/s car -- nothing would ever have
+    been learned again. Unknown must stay unknown until the first command.
+    """
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    core.sigma_v, core.tick = 0.0166, 0.0002
+    d = core.state()
+    del d['v_op']
+    d['longitudinal'] = [3.737, 0.026, -0.428, -0.755]
+    d['n_lon'] = 18696
+    d['spans']['qd'] = [-0.71, 0.61]
+    d['spans']['vl'] = [-1.58, 1.81]
+    fresh = AdaptiveCore()
+    assert fresh.load_state(d)                # as the node does, before SENSE
+    t = settle_sense(fresh, plant)
+    fresh.sigma_v, fresh.tick = 0.0166, 0.0002   # this robot's measurement
+    fresh._update_gates()
+    assert fresh.v_op == 0.0
+    assert fresh.gate_d == pytest.approx(0.166, abs=0.01)   # 10 sigma
+    assert fresh.stop_horizon() is None                    # not yet driven
+    assert fresh.ready_lon and fresh.lon_plausible()       # the fit is kept
+    # the first Nav2 command sets the scale, and the gates land on the
+    # hand-tuned 0.15 within a tick
+    fresh.step(t + 0.1, *plant.observe(), 0.32, 0.0)
+    assert fresh.v_op == pytest.approx(0.32)
+    assert fresh.gate_d == pytest.approx(0.15, rel=0.05)
