@@ -56,7 +56,8 @@ PUBLISH_HZ = 50.0
 # a core default of 0.12 -- the value the comments blame for weaving.
 POLICY_PARAMS = (
     'enable_calibration', 'enable_dither', 't_sense', 't_cal', 't_forget',
-    'tau_s', 'tau_d', 'kp_v', 'ki_v', 'ki_w', 'prior_a0', 'prior_b0',
+    'tau_s', 'tau_d', 'kp_delay_product', 'ti_delay_ratio',
+    'kw_delay_product', 'sensor_tau', 'prior_a0', 'prior_b0',
     'v_eff_floor_frac', 'stall_cmd_frac', 'iv_max', 'iw_max_frac',
     'v_fb_tau', 'span_floor', 'steer_standstill', 'use_learned_lon',
     'lat_delay', 'lon_delay', 'gate_floor_frac', 'gate_cap_frac',
@@ -884,6 +885,10 @@ class AckermannAdaptiveController(Node):
             'learned_delays':
                 f'lat={self.core.lat_bank.delay:.2f}s '
                 f'lon={self.core.lon_bank.delay:.2f}s',
+            # loop gains derived from those delays (Policy.kp_delay_product)
+            'gains': (f'kp_v={self.core.kp_v:.2f} ki_v={self.core.ki_v:.3f} '
+                      f'ki_w={self.core.ki_w:.3f} '
+                      f'(L_lon={self.core.L_lon:.2f}s L_lat={self.core.L_lat:.2f}s)'),
             'samples': f'lat={m.n_lat} lon={m.n_lon}',
             'min_turning_radius':
                 f'{self.core.envelope.min_turning_radius(m):.3f}',

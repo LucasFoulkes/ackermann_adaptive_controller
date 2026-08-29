@@ -209,24 +209,44 @@ class Policy:
     t_forget: float = 170.0   # s half-life: how fast the world changes
     p_max: float = 1.0e4      # covariance windup bound
 
-    # Actuator-class filter constants (tested tau in [0.1, 0.75]).
+    # Actuator time constants: DECLARED priors of the actuator class (a
+    # hobby servo, a brushed motor behind an H-bridge; tested tau in
+    # [0.1, 0.75]), alongside prior_a0 / prior_b0. Not learned: the delay
+    # bank's cross-correlation peak already lands on the EFFECTIVE delay
+    # (transport plus the first-order smear), so the fits are aligned
+    # regardless; these only size the settling windows and the command
+    # filters, and learning them would mean a second bank dimension for a
+    # second-order effect. A much slower actuator shortens those windows
+    # relative to the truth -- a degradation, not a failure.
     tau_s: float = 0.18
     tau_d: float = 0.30
-
-    # Per-second loop gains: rate-invariant, and plant-invariant because the
-    # model inversion normalizes the plant away.
-    kp_v: float = 0.6  # loop gain sized to ~0.35 s of actuator+odometry delay; at 1.6 the loop limit-cycled 0..0.9 m/s on a 0.32 command
-    ki_v: float = 0.25  # same reason; the integrator still unsticks the robot, just without overshooting past the dead band
-    # Curvature trim. The yaw-rate error is converted to a curvature
-    # correction by dividing by the speed, floored at the OPERATING speed
-    # v_op, so the effective per-second gain is at most ki_w / v_op --
-    # against ~0.75 s of steering delay plus yaw filter. History: at an
-    # effective 3/s a single 0.45 rad/s step wound the trim to its clamp
-    # before the car had responded, and the flight log had it pinned 30%
-    # of the time with a sign that agreed with the command only half the
-    # time -- noise, not trim; 0.6/s (then written as 0.3 over a typed
-    # 0.5 m/s floor) has been quiet since 08-23. 0.2 / 0.32 m/s keeps it.
-    ki_w: float = 0.2
+    # Loop gains, DERIVED from the loop's dead time (AdaptiveCore.kp_v,
+    # ki_v, ki_w): the learned delay plus the actuator constant plus the
+    # feedback filter. A P loop on an integrating plant with dead time L
+    # is well damped at kp = 1/(2L) (IMC with the closure time equal to
+    # the dead time) and limit-cycles past kp*L ~ 1.57. This robot: L_lon
+    # 0.45 + 0.30 + 0.10 = 0.85 s, kp 0.59 -- the 0.6 typed here until
+    # 08-29, which was sized by hand to "~0.35 s of delay" and had
+    # limit-cycled 0..0.9 m/s on a 0.32 command at 1.6 (kp*L 1.4).
+    kp_delay_product: float = 0.5
+    # Integral time as a multiple of L. SIMC puts it at 8L for an
+    # integrating process; this integrator doubles as the stiction ramp
+    # (see _run) and at 8L a launch took three times longer, so 2.8L -- the
+    # 2.4 s (ki 0.25) that has been quiet since 08-23.
+    ti_delay_ratio: float = 2.8
+    # Curvature trim: an integral-only loop, yaw-rate error converted to a
+    # curvature correction by dividing by the speed floored at v_op (so the
+    # per-second loop gain is ki_w * v / v_op, at most ki_w). Against
+    # L_lat = delay + servo constant + yaw filter (0.45 + 0.18 + 0.30 =
+    # 0.93 s here): at an effective 0.9/s a single 0.45 rad/s step wound
+    # the trim to its clamp before the car had responded (08-23 log, pinned
+    # 30% of the time with a sign agreeing with the command only half the
+    # time -- noise, not trim); 0.2/s has been quiet since. 0.19 / 0.93.
+    kw_delay_product: float = 0.19
+    # Smoothing of the differenced sensor signals (vdot, psidot), in
+    # seconds: fixed bandwidth so it is the same at any odometry rate. It
+    # is the "yaw filter" in L_lat.
+    sensor_tau: float = 0.30
 
     # Priors. Without these, steering never excites (no steering -> no yaw ->
     # nothing to learn from), so RUN could never bootstrap without CAL.
@@ -294,7 +314,9 @@ class Policy:
     # command against a response that arrives half a second later is how
     # the learner produced confident nonsense.
     lat_delay: float = 0.45
-    lon_delay: float = 0.30
+    # 0.30 until 08-29; the bank has sat at 0.45 on every session since
+    # 08-28 (state file), and the derived loop gains start from this.
+    lon_delay: float = 0.45
     # Learning gates, as fractions of the operating speed. gate_d is 10 x
     # the velocity noise measured in SENSE, clamped into
     # [gate_floor_frac, gate_cap_frac] x v_op. The CAP: on LiDAR odometry
@@ -332,10 +354,15 @@ class Policy:
     max_steer_rate: float = 4.0
     max_drive_rate: float = 2.0
     # Throttle applied whenever motion is commanded and the car is not yet
-    # rolling. A CONSTANT, deliberately below the lowest breakaway ever
-    # observed (0.24), so it cannot lunge; it only shortens the integrator's
-    # climb, which at Nav2's approach speed was 5-8 s per launch and left a
-    # third of the flight log "stalled". Zero disables it.
+    # rolling. A PRIOR in wire units, deliberately below the lowest
+    # breakaway this robot had shown (0.24), so it cannot lunge; it only
+    # shortens the integrator's climb, which at Nav2's approach speed was
+    # 5-8 s per launch and left a third of the flight log "stalled". Zero
+    # disables it. On another vehicle it holds only until the first start
+    # has been measured: from then on the bootstrap is capped at
+    # deadband_trust x the LOWEST breakaway seen (DeadBand.lowest), so a
+    # car whose motor breaks free at 0.05 lunges once, not four times
+    # (the confirmed median takes over at deadband_evidence starts).
     launch_floor: float = 0.15
     # Launch wire CAP, the floor's counterpart. While motion is commanded
     # and the car has not broken free, the wire may not exceed the launch
@@ -974,6 +1001,13 @@ class DeadBand:
             return 0.0
         return clamp(self.p.deadband_trust * w.value, 0.0, self.p.deadband_max)
 
+    def lowest(self, direction):
+        """The lowest breakaway seen in this direction, or None. Every
+        sample reads high by ramp x latency, so this is an UPPER bound on
+        the true breakaway -- what a bootstrap floor must stay under."""
+        w = self._win(direction)
+        return min(w.vals) if w.vals else None
+
     def compensate(self, ud, motion=0.0):
         """Map a controller command onto the live part of the actuator.
 
@@ -1293,6 +1327,30 @@ class AdaptiveCore:
                 and self.ready_lon_v_span > 0.0
                 and self.vl_hi - self.vl_lo >= self.ready_lon_v_span)
 
+    # -- loop gains, from the loop's dead time (Policy.kp_delay_product) --
+
+    @property
+    def L_lon(self):
+        p = self.policy
+        return self.lon_bank.delay + p.tau_d + p.v_fb_tau
+
+    @property
+    def L_lat(self):
+        p = self.policy
+        return self.lat_bank.delay + p.tau_s + p.sensor_tau
+
+    @property
+    def kp_v(self):
+        return self.policy.kp_delay_product / self.L_lon
+
+    @property
+    def ki_v(self):
+        return self.kp_v / (self.policy.ti_delay_ratio * self.L_lon)
+
+    @property
+    def ki_w(self):
+        return self.policy.kw_delay_product / self.L_lat
+
     # -- speed-shaped thresholds, all fractions of the learned v_op --------
 
     @property
@@ -1567,7 +1625,7 @@ class AdaptiveCore:
 
             # Everything downstream is derived from the measurement.
             self._update_gates()
-            self.alpha = clamp(self.dt / 0.30, 0.05, 0.6)
+            self.alpha = clamp(self.dt / p.sensor_tau, 0.05, 0.6)
             self.lam = math.exp(math.log(0.5) * self.dt / p.t_forget)
             self.v_prev = v
             self._enter(CAL if p.enable_calibration else RUN, t)
@@ -1862,7 +1920,7 @@ class AdaptiveCore:
         saturated = abs(self.prev_us) >= 0.95 * lim
         if not saturated and not settling and abs(v) > 0.5 * self.gate_d:
             self.iw = clamp(
-                self.iw + p.ki_w * (cmd_w - self.psidot)
+                self.iw + self.ki_w * (cmd_w - self.psidot)
                 / v_signed * dt, -p.iw_max, p.iw_max)
         # Physically impossible coefficients are clamped HERE rather than in
         # the estimator: projecting every RLS update biases the fit, but a
@@ -1973,8 +2031,8 @@ class AdaptiveCore:
         # number is what full throttle can deliver, so the acceleration
         # demand is clamped to it (it was a typed 2.5 m/s^2).
         b0_fb = clamp(b0, 0.5 * p.prior_b0, 2.0 * p.prior_b0)
-        a_des = clamp(p.kp_v * err, -b0_fb, b0_fb)
-        self.iv = clamp(self.iv + p.ki_v * err * dt, -p.iv_max, p.iv_max)
+        a_des = clamp(self.kp_v * err, -b0_fb, b0_fb)
+        self.iv = clamp(self.iv + self.ki_v * err * dt, -p.iv_max, p.iv_max)
         # A MOVING reversal -- the command points against the car's travel
         # while it is still measurably rolling -- is braking, not a launch.
         # Everything sized for a start from rest is wrong here: the new
@@ -2054,10 +2112,15 @@ class AdaptiveCore:
             # LEARNED median breakaway -- applied only until the wheels
             # turn, so it cannot over-floor a cruise. Until there is
             # evidence, launch_floor is the bootstrap, as prior_a0 is for
-            # the envelope.
-            floor = (self.deadband._win(direction).value
-                     if self.deadband.confirmed(direction)
-                     else p.launch_floor)
+            # the envelope -- capped, from the first measured start on, by
+            # the lowest breakaway seen (Policy.launch_floor).
+            if self.deadband.confirmed(direction):
+                floor = self.deadband._win(direction).value
+            else:
+                floor = p.launch_floor
+                seen = self.deadband.lowest(direction)
+                if seen is not None:
+                    floor = min(floor, p.deadband_trust * seen)
             if floor > 0.0:
                 ud = direction * max(ud * direction, floor)
                 self._floor, self._floor_dir = floor, direction

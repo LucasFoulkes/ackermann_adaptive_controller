@@ -238,10 +238,20 @@ envelope. `/diagnostics` reports `deadband`.
   velocity smoother allows, and the steering model took 23 samples in ten
   minutes. Raising Nav2's speeds raises `v_op` and the gates follow.
   Check `sigma_v`, `v_op` and `gate_d` in `/diagnostics` after `SENSE`.
-- **`launch_floor`** (0.15) is a constant throttle applied while motion is
-  commanded and the car is not rolling. It is below the lowest breakaway ever
-  observed (0.24) so it cannot lunge; it only shortens the integrator's climb,
-  which at Nav2's approach speed was 5–8 s per launch.
+- **`launch_floor`** (0.15) is the throttle applied while motion is commanded
+  and the car is not rolling, until the dead band is measured. A prior: below
+  the lowest breakaway this robot had shown (0.24) so it cannot lunge; it only
+  shortens the integrator's climb, which at Nav2's approach speed was 5–8 s
+  per launch. From the first measured start it is capped at `deadband_trust`
+  × the lowest breakaway seen, so another vehicle lunges at most once.
+- **Loop gains are derived, not typed.** `kp_v = kp_delay_product / L_lon`
+  with `L_lon` = learned throttle delay + `tau_d` + `v_fb_tau`; `ki_v =
+  kp_v / (ti_delay_ratio · L_lon)`; `ki_w = kw_delay_product / L_lat` with
+  `L_lat` = learned steering delay + `tau_s` + `sensor_tau`. On this robot
+  that is the 0.6 / 0.25 / 0.2 that were hand-tuned; a vehicle with a second
+  of delay gets a correspondingly slower loop. `tau_s`/`tau_d` are declared
+  actuator-class priors (the delay bank's peak already absorbs the actuator
+  smear). `/diagnostics` reports `gains`.
 - **Drag needs varied speeds.** At one constant speed the regressor
   `[qd, 1, v|v|]` is rank-deficient and `b0`/`b1`/`b2` cannot be separated —
   the prediction stays right but the split is arbitrary. A cruise teaches the

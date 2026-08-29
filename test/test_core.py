@@ -429,7 +429,7 @@ def test_envelope_is_speed_correct():
     # this test's premise is a genuinely FAST run; the production throttle
     # gains are sized for a 0.3 m/s robot and would not reach 1.8 m/s in
     # the window, so give the fast core stronger gains
-    fast = AdaptiveCore(Policy(kp_v=1.6, ki_v=0.8))
+    fast = AdaptiveCore(Policy(kp_delay_product=1.1))   # kp ~1.6 at L 0.7
     pfast = Plant()
     t = settle_sense(fast, pfast)
     # a0 and a2 differ only by v^2: sweep the speed or they are not
@@ -1199,7 +1199,7 @@ def test_ready_throttle_model_is_inverted_and_unready_is_not():
     assert not core.ready_lon
     core.now += 10.0
     _, ud = core._run(0.1, 0.32, 0.0, 0.1)
-    prior_based = core.policy.kp_v * (0.32 - 0.1) / core.policy.prior_b0
+    prior_based = core.kp_v * (0.32 - 0.1) / core.policy.prior_b0
     assert ud == pytest.approx(prior_based, abs=0.02), ud
     # spans covered: ready -> the learned gain takes over
     core.qd_lo, core.qd_hi = 0.0, 0.8
@@ -1207,7 +1207,7 @@ def test_ready_throttle_model_is_inverted_and_unready_is_not():
     assert core.ready_lon
     core.prev_ud = 0.0
     _, ud = core._run(0.1, 0.32, 0.0, 0.1)
-    a_des = core.policy.kp_v * (0.32 - 0.1)
+    a_des = core.kp_v * (0.32 - 0.1)
     expected = (a_des - (-0.4) * 1.0) / 3.0  # Coulomb feedforward included
     assert ud == pytest.approx(expected, abs=0.03), ud
 
@@ -2078,7 +2078,14 @@ def test_derived_values_reproduce_this_robots_hand_tuning():
     assert p.radius_ceiling == pytest.approx(8.0, rel=0.12)
     assert p.den_min == pytest.approx(0.05, rel=0.12)
     assert p.b0_min == pytest.approx(0.30, rel=0.12)
-    assert p.ki_w / core.v_op == pytest.approx(0.6, rel=0.12)
+    # loop gains from the learned delays (0.45 s both axes, state file):
+    # kp_v 0.6, ki_v 0.25, ki_w 0.2 (0.6/s over the 0.32 m/s floor)
+    core.lon_bank.set_delay(0.45)
+    core.lat_bank.set_delay(0.45)
+    assert core.kp_v == pytest.approx(0.6, rel=0.12)
+    assert core.ki_v == pytest.approx(0.25, rel=0.12)
+    assert core.ki_w == pytest.approx(0.2, rel=0.12)
+    assert core.ki_w / core.v_op == pytest.approx(0.6, rel=0.12)
     # the delay grid still contains the measured 0.45 s and spans a decade
     # each way of it
     assert 0.45 in core.lat_bank.delays
@@ -2113,7 +2120,7 @@ def test_gates_follow_the_operating_speed_not_a_constant():
     """A noisy SENSE must not put the learning gate above cruise speed --
     on ANY vehicle. The old cap was a typed 0.24 m/s."""
     for cruise in (0.10, 0.35, 2.0):
-        core = AdaptiveCore(Policy(kp_v=1.6, ki_v=0.8))
+        core = AdaptiveCore(Policy(kp_delay_product=1.1))
         # the same sensor-to-speed ratio at every scale: the noisy boot's
         # sigma_v of 0.028 on the 0.35 m/s car (10 sigma above the cap)
         plant = Plant(pose_noise=0.002 * cruise / 0.35)
@@ -2181,7 +2188,10 @@ def test_large_fast_vehicle_learns_and_tracks():
                   tau_s=0.5, pose_noise=0.002)
     plant.delay = 1.0
     t = settle_sense(core, plant)
-    _, t = drive(core, plant, _course((1.2, 2.0, 1.6, 2.4), 10, 0.20, 0.04),
+    # a course with throttle headroom: this plant tops out at 2.6 m/s and
+    # a wire pinned near 1.0 teaches nothing (the rank-deficient fit
+    # drifts, README "Drag needs varied speeds")
+    _, t = drive(core, plant, _course((0.6, 1.4, 1.0, 1.8), 10, 0.20, 0.04),
                  240.0, t0=t)
     m = core.model
     assert m.b0 == pytest.approx(plant.b0, rel=0.35), m
@@ -2194,8 +2204,8 @@ def test_large_fast_vehicle_learns_and_tracks():
     r = core.envelope.min_turning_radius(m)
     assert r == pytest.approx(1.0 / (plant.a0 + plant.a2 * core.v_op ** 2),
                               rel=0.35), r
-    out, t = drive(core, plant, lambda s: (2.0, 0.15), 40.0, t0=t)
-    assert core.v == pytest.approx(2.0, rel=0.25), core.v
+    out, t = drive(core, plant, lambda s: (1.6, 0.15), 40.0, t0=t)
+    assert core.v == pytest.approx(1.6, rel=0.25), core.v
     assert core.psidot == pytest.approx(0.15, rel=0.30), core.psidot
 
 
@@ -2341,3 +2351,69 @@ def test_calibration_refuses_an_inverted_or_dead_throttle():
     t = settle_sense(core, plant)
     drive(core, plant, lambda s: (0.0, 0.0), 9.0, t0=t)
     assert core.phase == RUN and not core.drive_fault
+
+
+# -- step 3: gains from the learned delay, launch floor from evidence -------
+
+def test_loop_gains_follow_the_learned_delay():
+    """A vehicle with a full second of actuation delay must get a slower
+    loop than this robot, not the same 0.6/0.25 -- kp*L was 1.4 when the
+    0.32 m/s car limit-cycled at kp 1.6, and 0.6 x 1.4 s is 0.84."""
+    core = AdaptiveCore()
+    kp0, ki0, kw0 = core.kp_v, core.ki_v, core.ki_w
+    core.lon_bank.set_delay(1.0)
+    core.lat_bank.set_delay(1.0)
+    assert core.kp_v < 0.7 * kp0 and core.ki_v < 0.5 * ki0 and core.ki_w < 0.7 * kw0
+    assert core.kp_v * core.L_lon == pytest.approx(core.policy.kp_delay_product)
+    # and the derived gains hold a 1 s-delay vehicle at cruise without a
+    # limit cycle: speed steady within 5% over the last 10 s
+    core = AdaptiveCore(Policy(prior_a0=0.12, prior_b0=4.0))
+    plant = Plant(a=(0.12, 0.0, -0.002), b=(4.0, 0.0, -0.6), tau_s=0.5,
+                  pose_noise=0.0005)
+    plant.delay = 1.0
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((1.2, 2.0, 1.6, 2.4), 10, 0.2, 0.04),
+                 160.0, t0=t)
+    speeds = []
+    for _ in range(200):
+        t += 0.1
+        out = core.step(t, *plant.observe(), 2.0, 0.0)
+        for _ in range(5):
+            plant.step(out.steer, out.drive, 0.02)
+        speeds.append(plant.v)
+    tail = speeds[-100:]
+    assert max(tail) - min(tail) < 0.05 * 2.0, (min(tail), max(tail))
+    assert sum(tail) / len(tail) == pytest.approx(2.0, rel=0.05)
+
+
+def test_launch_floor_never_exceeds_the_lowest_breakaway_seen():
+    """A motor that breaks free at 0.05 wire must not be launched at the
+    0.15 prior four times over before the median is trusted."""
+    core = AdaptiveCore()
+    p = core.policy
+    settle_sense(core, Plant())
+    core.v_op = 0.3
+    core.v = core.v_fb = 0.0
+    core.rolling = False
+    # no evidence: the prior floor
+    core._run(0.0, 0.3, 0.0, 0.1)
+    assert core._floor == pytest.approx(p.launch_floor)
+    # one measured start at 0.06: the bootstrap drops under it at once
+    core.deadband.observe(1.0, 0.06)
+    core._run(0.0, 0.3, 0.0, 0.1)
+    assert core._floor == pytest.approx(p.deadband_trust * 0.06)
+    assert core._floor < p.launch_floor
+    # this robot's starts (state file 08-29: lowest 0.18) leave the prior
+    # nearly where it was, and the confirmed median takes over at evidence
+    core2 = AdaptiveCore()
+    settle_sense(core2, Plant())
+    core2.v_op = 0.3
+    core2.v = core2.v_fb = 0.0
+    for x in (0.19, 0.18, 0.20):
+        core2.deadband.observe(1.0, x)
+    core2._run(0.0, 0.3, 0.0, 0.1)
+    assert core2._floor == pytest.approx(min(p.launch_floor, 0.7 * 0.18))
+    core2.deadband.observe(1.0, 0.26)
+    assert core2.deadband.confirmed(1.0)
+    core2._run(0.0, 0.3, 0.0, 0.1)
+    assert core2._floor == pytest.approx(core2.deadband.fwd.value)
