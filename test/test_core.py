@@ -2599,7 +2599,9 @@ def test_throttle_integrator_does_not_wind_while_the_slew_or_clamp_shapes_the_wi
 # -- authority earned by confidence ---------------------------------------------
 
 def test_authority_is_earned_by_a_ready_plausible_model():
-    core = AdaptiveCore()
+    # the mechanism, on a vehicle that may be slowed (this robot's floor is
+    # 1.0: slowing it puts it in the stall-attraction zone)
+    core = AdaptiveCore(Policy(authority_floor=0.5))
     plant = Plant()
     assert core.authority() == 0.0                       # SENSE
     t = settle_sense(core, plant)

@@ -543,12 +543,15 @@ class Policy:
     # Authority earned by confidence (AdaptiveCore.authority): the fraction
     # of its operating speed the vehicle may be commanded while the map is
     # still a prior -- either fit not ready to be inverted, or a steering
-    # fault holding the fallback. Half: on this robot 0.16 m/s, above the
-    # learning gates, so the car keeps gathering the data that earns the
-    # rest; a fresh or just-faulted vehicle is never fast while ignorant.
-    # Published to Nav2 as a speed limit by the node; the controller's own
-    # zero-output faults (odometry, throttle) need no limit.
-    authority_floor: float = 0.5
+    # fault holding the fallback. Published to Nav2 as a speed limit by
+    # the node. ONE on this robot, deliberately: slower is not safer on a
+    # stiction-dominated car. At 0.5 the 08-29 19:25 drive ran at exactly
+    # 0.16 m/s (0.32 x 50%), inside the stall-attraction zone below
+    # ~0.3 m/s where cruise degenerates into stick-slip (nav2_params.yaml)
+    # -- stuck on 28% of commanded ticks with the wire at the dead band,
+    # 46 stall ticks, "moves in steps". A vehicle without stiction may
+    # lower this; it stays a risk constant, not a vehicle property.
+    authority_floor: float = 1.0
 
     # -- derived from the two declared priors (not fields, not parameters) --
 
