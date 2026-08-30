@@ -82,10 +82,16 @@ POLICY_PARAMS = (
 _DEFAULTS = Policy()
 
 
+def _fmt_span(lo, hi):
+    return 'none' if lo is None or hi is None else f'{lo:+.2f}..{hi:+.2f}'
+
+
 def _spans(qd_lo, qd_hi, v_lo, v_hi):
-    if qd_lo is None:
-        return 'none'
-    return (f'qd {qd_lo:+.2f}..{qd_hi:+.2f}  v {v_lo:+.2f}..{v_hi:+.2f}')
+    """Each span may be absent on its own: a state file can carry the wire
+    span with the speed span cleared (the 08-29 restore did), and a None
+    reaching a float format killed the node from the diagnostics timer one
+    second after launch (08-30 10:53, 11:00)."""
+    return f'qd {_fmt_span(qd_lo, qd_hi)}  v {_fmt_span(v_lo, v_hi)}'
 
 
 def yaw_from_quat(q):
