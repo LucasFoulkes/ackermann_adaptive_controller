@@ -553,6 +553,17 @@ class Policy:
     # lower this; it stays a risk constant, not a vehicle property.
     authority_floor: float = 1.0
 
+    # Samples faster than this multiple of the operating speed do not
+    # teach: they are lunges or scan-matcher excursions, not the regime
+    # the model is inverted in. (Control is deliberately NOT gated on it;
+    # a lunge is real and must be braked, see odom_glitch_hold.) The 08-30
+    # 11:23 drive: six launches on a 0.15 m/s command peaked at 0.9-1.4
+    # m/s, and their decays -- 1.3 -> 0.3 m/s on a low wire -- taught the
+    # fit "friction is enormous" (b3 -0.96 -> -1.47 in 60 s), which raised
+    # the next launch's friction feedforward to 0.38 wire, which lunged
+    # harder: a feedback loop between the lunge and the Coulomb term.
+    learn_overspeed_ratio: float = 1.5
+
     # -- derived from the two declared priors (not fields, not parameters) --
 
     @property
@@ -2107,7 +2118,10 @@ class AdaptiveCore:
         # that is unbiased in it.
         held = self._held_speed()
         v_reg = v if abs(v - held) > 3.0 * self.sigma_v else held
-        if settled and abs(self.vdot) < a_gate and abs(v) > self.gate_d:
+        in_regime = (self.v_op <= 0.0
+                     or abs(v) <= self.policy.learn_overspeed_ratio * self.v_op)
+        if settled and in_regime and abs(self.vdot) < a_gate \
+                and abs(v) > self.gate_d:
             def phi_lon(delay):
                 d = self._delayed_cmd(delay)
                 if d is None:
@@ -2154,7 +2168,8 @@ class AdaptiveCore:
                        and self.now - max(self._roll_since,
                                           self._dir_since or self._roll_since)
                        >= self.lat_bank.delay + self.policy.tau_s)
-        if settled_lat and abs(v) > self.gate_s and abs(self.psidot) < 4.0:
+        if settled_lat and in_regime and abs(v) > self.gate_s \
+                and abs(self.psidot) < 4.0:
             # Same instrument for the lateral fit: the a2 term's v^2 and
             # the division that makes curvature of the yaw rate both use
             # the held speed (the raw sample's noise would otherwise sit
@@ -2557,7 +2572,17 @@ class AdaptiveCore:
             # a_des/b0 goes through the bounded b0_fb (above): there b0 is
             # a loop gain, not a vehicle property.
             ud = a_des / b0_fb
-            ff = -(b1 + b2 * v_ff * abs(v_ff) + b3 * s_dir) / b0
+            # The friction part of the feedforward may not exceed the wire
+            # that MEASURABLY breaks the car free (the dead-band median):
+            # static friction is at least kinetic, so a fit asking more
+            # wire for friction than the breakaway is the fit, not the car
+            # -- b3/b0 0.46 against a 0.22 breakaway launched a 0.15 m/s
+            # command to 1.3 m/s (08-30 11:23). Unjudged without evidence.
+            coulomb = -b3 * s_dir / b0
+            w = self.deadband._win(s_dir) if s_dir else None
+            if w is not None and w.confirmed:
+                coulomb = clamp(coulomb, -w.value, w.value)
+            ff = -(b1 + b2 * v_ff * abs(v_ff)) / b0 + coulomb
             self._ff_wire = clamp(ff, -1.0, 1.0) if not reversing else 0.0
             if not reversing:
                 ud += ff

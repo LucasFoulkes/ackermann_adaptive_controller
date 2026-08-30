@@ -2814,3 +2814,46 @@ def test_a_collapsed_steering_cell_is_replaced_by_its_siblings():
     settle_sense(core, Plant())
     core.rls_lat.theta = [2.43, 0.15, 2.18, 1.66, 0.0, -0.3]
     assert core.envelope.min_turning_radius(core.model) < 1.2     # was 11 m
+
+
+# -- 08-30 11:23: the lunge that teaches the next lunge --------------------------
+
+def test_lunge_decays_do_not_teach_friction_and_the_friction_feedforward_is_bounded():
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.002)
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((0.25, 0.55, 0.35, 0.65), 15, 0.3, 0.12),
+                 120.0, t0=t)
+    assert core.ready_lon
+    b3 = core.model.b3
+    n = core.model.n_lon
+    # a lunge: the plant is shoved to 3x the operating speed and decays on
+    # its own friction while the command is small -- none of it is learned
+    core.v_op = 0.32
+    plant.v = 1.0
+    for _ in range(25):
+        t += 0.1
+        core.step(t, *plant.observe(), 0.15, 0.0)
+        for _ in range(5):
+            plant.step(0.0, 0.0, 0.02)          # coasting down, wire off
+        if abs(plant.v) < 0.5:
+            break
+    assert core.model.n_lon == n, (n, core.model.n_lon)
+    assert core.model.b3 == pytest.approx(b3)
+    # the friction feedforward is capped at the measured breakaway
+    for x in (0.22, 0.21, 0.24, 0.22):
+        core.deadband.observe(1.0, x)
+    # (the 11:23 fit itself, b3/b0 0.46, is rejected outright by lon_sane's
+    # breakaway check; this one passes it and still asks 0.33 for friction)
+    core.rls_lon.theta = [4.0, 0.05, 0.0, -1.3]
+    core.qd_lo, core.qd_hi = -0.7, 0.6
+    core.vl_lo, core.vl_hi = -0.3, 0.35
+    assert core.lon_plausible()
+    core.rolling = True
+    core.v = core.v_fb = 0.15
+    core._floor = 0.0
+    core.iv = 0.0
+    core._run(0.15, 0.15, 0.0, 0.1)
+    assert core._ff_wire is not None
+    assert core._ff_wire <= core.deadband.fwd.value + 0.05 / 4.0 + 1e-9
+    assert core._ff_wire < 1.3 / 4.0
