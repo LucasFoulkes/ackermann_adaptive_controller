@@ -1289,6 +1289,129 @@ class DeadBand:
         return True
 
 
+class GainProbe:
+    """Direct wire-to-acceleration measurement, free of the regression.
+
+    The RLS throttle fit can be junk for minutes from cold: its own
+    exclusion gates (overspeed, settling) reject exactly the transients a
+    misbehaving loop produces, so a wrong fit and a hot loop sustain each
+    other. The 08-31 01:08 from-zero run limit-cycled at STEADY command
+    for six minutes that way -- surge to 0.5 m/s on a 0.30 command, wire
+    cut, friction stall, relaunch, 1.7 s period -- while b0 sat at a junk
+    0.63 on a plant whose trace measures ~5 (accel ~1.5 m/s^2 over
+    friction at 0.28 wire; coast decel ~1.0 m/s^2).
+
+    So the two numbers the CONTROL LAW actually needs are measured here
+    as themselves, by medians (one glitch cannot move them, old surfaces
+    age out), from the actuator state reconstructed by passing the
+    delayed wire through the declared actuator constant:
+
+      eq   per direction, the wire that HOLDS a speed (acceleration
+           within measurement noise while rolling) -- the bootstrap
+           feedforward, observed directly instead of reconstructed from
+           a fit's b1/b2/b3 split.
+      b0   the local wire-to-acceleration slope, from PAIRS of samples a
+           few actuator constants apart: differencing cancels friction
+           AND any dead-zone offset, the two things a single-sample
+           quotient would have to guess at.
+    """
+
+    def __init__(self, policy):
+        self.p = policy
+        # Same evidence count as the dead band, for the same reason: a
+        # handful of honest samples before anything downstream leans on
+        # the number.
+        self.eq_fwd = _Window(policy.deadband_evidence, span=4)
+        self.eq_rev = _Window(policy.deadband_evidence, span=4)
+        self.gain = _Window(policy.deadband_evidence, span=4)
+        self._qd = None            # reconstructed actuator state
+        self._t = None
+        self._hist = deque(maxlen=64)   # (t, qd, vdot) accepted samples
+
+    def eq(self, direction):
+        """The cruise wire toward ``direction``, or None. Coulomb
+        friction is near-symmetric, so the other side's measured cruise
+        wire is a better bootstrap than nothing when this side has never
+        cruised."""
+        first = self.eq_fwd if direction > 0.0 else self.eq_rev
+        second = self.eq_rev if direction > 0.0 else self.eq_fwd
+        for w in (first, second):
+            if w.confirmed:
+                return w.value
+        return None
+
+    @property
+    def b0(self):
+        """Median measured wire gain (m/s^2 per wire), or None."""
+        return self.gain.value if self.gain.confirmed else None
+
+    def observe(self, t, direction, ud_delayed, vdot, dt, at_eq):
+        """One rolling, settled, physics-plausible tick.
+
+        ``ud_delayed`` is what the wire carried one estimated transport
+        delay ago; the first-order lag below turns it into the actuator
+        state the plant is actually responding to, so a mid-ramp tick
+        pairs the acceleration with the torque that caused it rather
+        than with a command still in flight.
+        """
+        p = self.p
+        if self._t is not None and t - self._t > 3.0 * dt:
+            # a gap (stall, reversal, implausible ticks): the lag state
+            # and any pending pair partner are stale
+            self._qd = None
+            self._hist.clear()
+        self._t = t
+        q = self._qd
+        q = ud_delayed if q is None \
+            else q + (ud_delayed - q) * (1.0 - math.exp(-dt / p.tau_d))
+        self._qd = q
+        if q * direction > 0.0 and at_eq:
+            (self.eq_fwd if direction > 0.0 else self.eq_rev).add(abs(q))
+        # Theil-Sen, one pair per tick: the current sample against the
+        # oldest one within a few actuator constants. Far enough apart
+        # that the actuator state has genuinely moved, near enough that
+        # the speed, battery and patch of floor are the same maneuver.
+        pair = None
+        for pt, pq, pv in self._hist:
+            if t - pt <= 4.0 * p.tau_d:
+                pair = (pt, pq, pv)
+                break
+        self._hist.append((t, q, vdot))
+        if pair is None:
+            return
+        _pt, pq, pv = pair
+        # Below half the launch floor (the smallest wire that provably
+        # moves a car) the slope's denominator is mostly noise.
+        if abs(q - pq) < 0.5 * p.launch_floor:
+            return
+        b = (vdot - pv) / (q - pq)
+        if b > 0.0:
+            # a negative slope is a mis-paired transient (a stiction
+            # release, an odometry wobble), not a car that slows under
+            # throttle
+            self.gain.add(b)
+
+    def state(self):
+        return {'eq_fwd': list(self.eq_fwd.vals),
+                'eq_rev': list(self.eq_rev.vals),
+                'gain': list(self.gain.vals)}
+
+    def load(self, d):
+        if not isinstance(d, dict):
+            return False
+        # File-corruption guard only: live samples are already gated by
+        # the acceleration plausibility bound at observation time, so the
+        # windows never legitimately hold anything near these limits.
+        for key, win in (('eq_fwd', self.eq_fwd), ('eq_rev', self.eq_rev),
+                         ('gain', self.gain)):
+            vals = d.get(key)
+            if not isinstance(vals, list) or not all(
+                    finite(v) and 0.0 < v < 1000.0 for v in vals):
+                return False
+            win.vals = deque(vals[-win.vals.maxlen:], maxlen=win.vals.maxlen)
+        return True
+
+
 @dataclass
 class Output:
     """One control step's result."""
@@ -1432,6 +1555,7 @@ class AdaptiveCore:
         self._floor = 0.0
         self._floor_dir = 0.0
         self._cap = 0.0
+        self._floor_pinned = False
         self._post_latch_until = 0.0
         # Anti-windup for the throttle integrator: the direction in which
         # the last published throttle fell short of what the loop asked
@@ -1449,6 +1573,7 @@ class AdaptiveCore:
         self._roll_dir = 0.0
         self._dir_since = None
         self.deadband = DeadBand(p)
+        self.gain_probe = GainProbe(p)
 
         # Launch/rolling latch for the breakaway kick, with hysteresis so
         # odometry noise cannot flicker it.
@@ -1457,6 +1582,7 @@ class AdaptiveCore:
         self._roll_since = None
         self._below_gate = False
         self._still_since = None
+        self._calm_since = None    # |vdot| within noise since (gain probe eq)
         self.v_fast = 0.0
         self.qs = self.qd = 0.0
         # (stamp, us, ud) history for delay-aligned regression. Deep enough
@@ -1483,7 +1609,6 @@ class AdaptiveCore:
         self.qd_lo = self.qd_hi = None
         self.vl_lo = self.vl_hi = None
         self.qs_lo = self.qs_hi = None
-        self.breakaway = 0.0
         self._capped_since = None
         self._blocked_until = None
         self.blocked = False
@@ -1671,9 +1796,23 @@ class AdaptiveCore:
         p = self.policy
         # Both spans checked: a hand-edited state file can restore one span
         # without the other (each degrades to None independently on load).
+        # The wire-span bar scales with the vehicle: ready_lon_qd_span was
+        # typed for THIS robot (cruise wire ~0.2), and an easy vehicle
+        # whose entire operating range lives under 0.1 wire can never
+        # span it -- well-behaved control keeps the wire NEAR its
+        # equilibrium, so the identifiable range is proportional to the
+        # measured cruise wire (the eq itself plus half again: driving
+        # that has both braked below and pushed above its equilibrium by
+        # half of it has excited the affine fit across the operating
+        # point). The typed value stays as the ceiling so a small
+        # measured eq cannot lower the bar to nothing on a vehicle where
+        # 0.15 is genuinely available.
+        eq = self.gain_probe.eq(1.0)
+        span_needed = min(p.ready_lon_qd_span,
+                          1.5 * eq) if eq else p.ready_lon_qd_span
         return (self.rls_lon.count >= p.ready_lon_samples
                 and self.qd_lo is not None and self.vl_lo is not None
-                and self.qd_hi - self.qd_lo >= p.ready_lon_qd_span
+                and self.qd_hi - self.qd_lo >= span_needed
                 and self.ready_lon_v_span > 0.0
                 and self.vl_hi - self.vl_lo >= self.ready_lon_v_span)
 
@@ -1922,6 +2061,26 @@ class AdaptiveCore:
                 # the direction the car actually moved. Works in PASSIVE too
                 # (the history holds the joystick's commands there).
                 d = self._delayed_cmd(self.policy.lon_delay)
+                # The stall is over: whatever the wire carried at unstick
+                # was a bid against STATIC friction, and carried whole
+                # into the rolling regime it was the relaxation oscillator
+                # that kept the 08-31 limit cycle going (~0.2 extra wire
+                # at breakaway, ~2 s of overspeed to unwind). Once a
+                # MEASURED equilibrium wire exists the feedforward carries
+                # the cruise and the integrator restarts from zero; before
+                # that it restarts from the unstick wire DERATED by
+                # deadband_trust -- the same static-to-kinetic derate the
+                # dead-band offset uses -- because some feedforward must
+                # carry the car until the probe has one (with nothing
+                # carrying, every bootstrap launch collapsed back into a
+                # stall two ticks after the latch).
+                d_dir = sgn(self.v_fast) or 1.0
+                if self.gain_probe.eq(d_dir) is not None:
+                    self.iv = 0.0
+                elif d is not None and sgn(d[1]) == d_dir:
+                    cap_iv = self._static_wire_cap(d_dir)
+                    self.iv = d_dir * min(
+                        self.policy.deadband_trust * abs(d[1]), cap_iv)
                 slow = (self._wire_on_since is not None
                         and t - self._wire_on_since
                         > self.policy.deadband_slow_start)
@@ -2180,6 +2339,42 @@ class AdaptiveCore:
         v_reg = v if abs(v - held) > 3.0 * self.sigma_v else held
         in_regime = (self.v_op <= 0.0
                      or abs(v) <= self.policy.learn_overspeed_ratio * self.v_op)
+        # ---- gain probe: direct measurement, no regressor -----------------
+        # Deliberately NOT behind in_regime: the overspeed exclusion
+        # protects the RLS from teaching surges as cruise, but the surges
+        # are exactly the honest transients that reveal the true wire gain
+        # -- excluding them everywhere is how a junk fit and the limit
+        # cycle it caused sustained each other for six minutes (08-31
+        # 01:08). The physics bound (a_gate) still applies: an ICP jump is
+        # not a transient. `settled` too: a stiction release is energy the
+        # wire did not put in, for the probe as for the fit.
+        if settled and abs(v) > self.gate_d and abs(self.vdot) < a_gate:
+            d = self._delayed_cmd(self.lon_bank.delay)
+            if d is not None:
+                # "Holding a speed" judged against the measurement noise
+                # itself: the raw vdot difference carries sqrt(2)*sigma_v
+                # per dt, the EMA keeps alpha/(2-alpha) of that variance,
+                # and three sigma is the usual glitch line. And SUSTAINED
+                # for the actuator's own constant: the reconstructed
+                # state q only means "this wire holds this speed" if the
+                # wire has actually been holding for tau_d, while a
+                # lunge's vdot crossing zero at its peak (wire already
+                # cut) spends less than that inside the noise band --
+                # those single ticks taught eq ~0.06 on a plant whose
+                # true cruise wire is 0.21, and a full plant memory
+                # (delay + tau_d) rejected every honest quasi-plateau the
+                # bench run had.
+                sig_a = (math.sqrt(2.0 * self.alpha / (2.0 - self.alpha))
+                         * self.sigma_v / max(self.dt, 1e-3))
+                if abs(self.vdot) > 3.0 * sig_a:
+                    self._calm_since = None
+                elif self._calm_since is None:
+                    self._calm_since = self.now
+                at_eq = (self._calm_since is not None
+                         and self.now - self._calm_since
+                         >= self.policy.tau_d)
+                self.gain_probe.observe(self.now, sgn(v), d[1], self.vdot,
+                                        self.dt, at_eq)
         if settled and in_regime and abs(self.vdot) < a_gate \
                 and abs(v) > self.gate_d:
             def phi_lon(delay):
@@ -2377,6 +2572,46 @@ class AdaptiveCore:
             0.03, 0.12)
         self._enter(RUN, t)
 
+    def _lon_divisor(self, b0, lon_ok):
+        """What one m/s^2 of PI demand costs in wire: demand / this.
+
+        Ranked by how directly the number was measured:
+
+        1. The gain probe's live wire-to-acceleration quotient -- a direct
+           measurement of the plant as it is right now.
+        2. The last fitted b0 that passed every sanity gate (persisted or
+           restored) -- vetted, but a fit, and possibly from another
+           battery or floor.
+        3. Nothing measured yet: TWICE the declared prior, the top of the
+           same factor-two band a measured anchor is granted. kp is
+           derived to put the loop at half its delay margin when this
+           divisor equals the true gain; a divisor N times too SMALL
+           multiplies the loop gain N times (the 08-31 01:08 from-zero
+           limit cycle: divisor floored at 1.0, plant measuring ~5),
+           while one too large merely answers slowly and is corrected by
+           the probe within its first steady window. Under total
+           ignorance, err on strong.
+
+        A plausible live fit may then scale the anchor by the usual
+        factor-two trust band; an implausible one gets no vote (clamping
+        junk INTO the band still dragged the divisor to its floor).
+        """
+        p = self.policy
+        ref = self.gain_probe.b0 or self._b0_ref
+        if not ref:
+            return 2.0 * p.prior_b0
+        if lon_ok:
+            return clamp(b0, 0.5 * ref, 2.0 * ref)
+        return ref
+
+    def _static_wire_cap(self, s_dir):
+        """The wire that HOLDS a speed cannot exceed the wire that
+        measurably breaks the car free -- whatever a fit or a probe says.
+        Before any dead-band evidence: launch floor plus margin."""
+        raw_band = self.deadband.raw(s_dir) if s_dir else None
+        return raw_band if raw_band is not None \
+            else self.policy.launch_floor + self.policy.launch_cap_margin
+
     def _run(self, v, cmd_v, cmd_w, dt):
         """Invert the learned model and add integral trim."""
         p = self.policy
@@ -2558,21 +2793,37 @@ class AdaptiveCore:
         # window's under-fit (0.7 in sim) would triple it. The same bounded
         # number is what full throttle can deliver, so the acceleration
         # demand is clamped to it (it was a typed 2.5 m/s^2).
-        # The loop-gain divisor is anchored to the last fit that passed
-        # every sanity gate (persisted or restored), not the declared
-        # prior: with prior_b0 typed as 2.0 on a car whose measured b0 is
-        # ~4.6, a collapsed live fit floored b0_fb at 1.0 and every PI
-        # correction ran 4.6x too strong -- the wire slammed 0.44/0.06 at
-        # 1 Hz and the car surged 0..0.8 m/s on a 0.32 command (08-30
-        # 23:16). The anchor updates only through state()/load_state,
-        # which lon_sane gates.
-        ref = self._b0_ref if self._b0_ref else p.prior_b0
-        b0_fb = clamp(b0, 0.5 * ref, 2.0 * ref)
+        # The loop-gain divisor is anchored to measurement, never to the
+        # junk a cold fit can be: with prior_b0 typed as 2.0 on a car
+        # whose measured b0 is ~4.6, a collapsed live fit floored b0_fb
+        # at 1.0 and every PI correction ran 4.6x too strong -- the wire
+        # slammed 0.44/0.06 at 1 Hz and the car surged 0..0.8 m/s on a
+        # 0.32 command (08-30 23:16); the same run repeated from-zero on
+        # 08-31 01:08, where no anchor existed at all. See _lon_divisor.
+        lon_ok = (self.ready_lon and p.use_learned_lon
+                  and self.lon_plausible())
+        b0_fb = self._lon_divisor(b0, lon_ok)
         a_des = clamp(self.kp_v * err, -b0_fb, b0_fb)
         # Conditional integration (see _shaped in reset): no winding into
-        # a limit the actuator is already at.
+        # a limit the actuator is already at. During a stall the winding
+        # is deliberate -- it is what escalates the wire from the
+        # bootstrap floor up to a breakaway the dead band has not
+        # measured yet -- but everything wound while stuck is a bid
+        # against stiction, and it is DISCARDED at the rolling latch
+        # (see step): carried into the rolling regime it was the
+        # relaxation oscillator that kept the 08-31 limit cycle going
+        # even with the probe's correct gain and equilibrium wire (~0.2
+        # extra wire at breakaway, ~2 s of overspeed to unwind).
+        # The integral path goes through the SAME gain normalisation as
+        # the proportional one. It used to add wire directly, which
+        # matched a_des/b0_fb only while the divisor sat at ~1: with a
+        # measured divisor of ~4 the integrator was 2.5x the proportional
+        # term at crossover, an extra -90 degrees of phase where the
+        # design ratio ki = kp/(2.8 L) assumed proportionality -- the
+        # 4-6 s hunt the bench showed even after the feedforward and the
+        # divisor were both measured and right.
         if not (self._shaped and sgn(err) == self._shaped):
-            self.iv = clamp(self.iv + self.ki_v * err * dt,
+            self.iv = clamp(self.iv + self.ki_v * err * dt / b0_fb,
                             -p.iv_max, p.iv_max)
         # A MOVING reversal -- the command points against the car's travel
         # while it is still measurably rolling -- is braking, not a launch.
@@ -2594,20 +2845,44 @@ class AdaptiveCore:
         # model's output again drove cruise 37% over the commanded speed,
         # and flooring every output at the static breakaway stick-slipped
         # any vehicle whose cruise level sits below its breakaway.)
-        if not (self.ready_lon and p.use_learned_lon
-                and self.lon_plausible()):
+        if not lon_ok:
             # Not yet earned, or not a vehicle (lon_sane: collapsed or
             # wrong-signed gain, or a fit that accelerates with no
-            # throttle): prior gain through the dead-band map, as prior_a0
-            # does for steering. Same bootstrap either way -- inverting a
-            # fit that is not physically a car is worse than not having
-            # learned yet (08-28 22:19: -0.44 wire of "feedforward" for a
-            # +0.25 cruise, the car never left the launch floor).
-            motion = sgn(v) if abs(v) > self.gate_d else 0.0
-            ud = self.deadband.compensate(a_des / p.prior_b0, motion)
-            # no model feedforward yet: an implausible sample holds the
-            # last wire (see _hold_output)
-            self._ff_wire = None
+            # throttle): inverting a fit that is not physically a car is
+            # worse than not having learned yet (08-28 22:19: -0.44 wire
+            # of "feedforward" for a +0.25 cruise, the car never left the
+            # launch floor).
+            s_dir = sgn(v) if abs(v) > self.gate_d \
+                else (sgn(cmd_v) or sgn(v))
+            eq = self.gain_probe.eq(s_dir) if s_dir else None
+            if eq is not None:
+                # MEASURED bootstrap: the probe's equilibrium wire -- the
+                # wire observed to HOLD a speed -- is the feedforward
+                # itself, applied toward the commanded direction only
+                # while actually traveling that way (the brake-only-
+                # reversal principle, as everywhere). This replaces the
+                # dead-band relay below: compensate()'s offset is the
+                # derated STATIC breakaway, and on a vehicle whose cruise
+                # wire sits below its breakaway (this one: cruise ~0.2,
+                # offset ~0.18) the offset IS the surge and its removal on
+                # overspeed IS the stall -- the discontinuity that carried
+                # the 01:08 limit cycle even at modest loop gain.
+                ud = a_des / b0_fb
+                # Same principle as the model branch: the wire that holds
+                # a speed cannot exceed the wire that measurably breaks
+                # the car free.
+                ff = clamp(eq, 0.0, self._static_wire_cap(s_dir)) * s_dir
+                self._ff_wire = ff if not reversing else 0.0
+                if not reversing and v * s_dir >= 0.0:
+                    ud += ff
+            else:
+                # No measurement of any kind yet: prior gain through the
+                # dead-band map, as prior_a0 does for steering.
+                motion = sgn(v) if abs(v) > self.gate_d else 0.0
+                ud = self.deadband.compensate(a_des / b0_fb, motion)
+                # no model feedforward yet: an implausible sample holds
+                # the last wire (see _hold_output)
+                self._ff_wire = None
         else:
             # Invert the model EXACTLY as fitted: whatever the (partly
             # arbitrary) split between b1, b2 and b3, inverting their sum
@@ -2656,9 +2931,7 @@ class AdaptiveCore:
             # b1 (+0.09 over b0 0.63) leaked 0.14 wire through the same
             # hole (08-31 bench, the 0.58 m/s reversal).
             static = -(b1 + b3 * s_dir) / b0
-            raw_band = self.deadband.raw(s_dir) if s_dir else None
-            cap_w = raw_band if raw_band is not None \
-                else p.launch_floor + p.launch_cap_margin
+            cap_w = self._static_wire_cap(s_dir)
             static = clamp(static, -cap_w, cap_w)
             ff = static - b2 * v_ff * abs(v_ff) / b0
             self._ff_wire = clamp(ff, -1.0, 1.0) if not reversing else 0.0
@@ -2677,6 +2950,7 @@ class AdaptiveCore:
         self._floor = 0.0
         self._floor_dir = 0.0
         self._cap = 0.0
+        self._floor_pinned = False
         if direction and self.rolling and self.now < self._post_latch_until \
                 and err * direction > 0.0:
             # post-breakaway: hold near the launch wire for one delay
@@ -2710,17 +2984,53 @@ class AdaptiveCore:
                 seen = self.deadband.lowest(direction)
                 if seen is not None:
                     floor = min(floor, p.deadband_trust * seen)
+            eq = self.gain_probe.eq(direction)
+            if eq is not None:
+                # With a measured cruise wire, launch by CREEPING from it:
+                # the floor starts at the wire known to hold a cruise and
+                # the integrator (plus the cap's stuck-time ramp) covers
+                # the rest, so the car unsticks at its TRUE breakaway
+                # instead of at a median that reads high by the slew past
+                # it. The in-flight surplus during the sensing delay is
+                # what sizes the launch overshoot: on the bench, flooring
+                # at the 0.31 median with true breakaway 0.26 peaked
+                # 0.5-0.8 on a 0.30 command. A creeping start is also a
+                # SLOW start, so it feeds the dead band its honest median.
+                floor = min(floor, eq)
             if floor > 0.0:
-                ud = direction * max(ud * direction, floor)
-                self._floor, self._floor_dir = floor, direction
-                # Cap rides launch_cap_rate above the floor per second
-                # stuck (see Policy). The integrator keeps winding under
-                # the cap on purpose: its pinning is what the blocked
-                # reflex detects.
+                # Stall escalation belongs to the FLOOR, not the
+                # integrator (whose rate is now gain-normalised and far
+                # too slow to double as a stiction probe): the floor
+                # itself rides launch_cap_rate per second stuck, so a
+                # creeping start crosses from the cruise wire to the true
+                # breakaway in under a second while the wire at the
+                # moment of unstick stays minimal.
                 stuck = (self.now - self._stall_since
                          if self._stall_since is not None else 0.0)
-                self._cap = min(1.0, floor + p.launch_cap_margin
-                                + p.launch_cap_rate * stuck)
+                # The ride starts only after the floor has been given one
+                # full sensing round-trip (transport delay + actuator
+                # constant) to produce motion: a correct floor unsticks
+                # the car before any ride is added, so the dead-band
+                # sample it leaves is the floor itself. Riding from the
+                # first stuck tick RATCHETED the breakaway median -- every
+                # start's sample included the ride, feeding a higher
+                # median, feeding a higher floor (bench: 0.31 -> 0.37
+                # over five starts).
+                stuck = max(0.0, stuck - (self.lon_bank.delay + p.tau_d))
+                # The ride's ceiling is the same escalation authority the
+                # integrator used to hold (base floor + iv_max of extra
+                # wire): enough to unstick every surface this class of
+                # vehicle has, bounded so a wall is not ground into at
+                # full throttle. Hitting the ceiling with still no motion
+                # is what the blocked reflex now detects (it used to
+                # watch the integrator pin, but the integrator is
+                # gain-normalised trim now, not the stall prober).
+                ceiling = min(1.0, floor + p.iv_max)
+                floor = min(ceiling, floor + p.launch_cap_rate * stuck)
+                self._floor_pinned = floor >= ceiling - 1e-9
+                ud = direction * max(ud * direction, floor)
+                self._floor, self._floor_dir = floor, direction
+                self._cap = min(1.0, floor + p.launch_cap_margin)
 
         # A zero speed command means stop, not "servo to zero speed".
         if cmd_v == 0.0 and cmd_w == 0.0:
@@ -2768,7 +3078,8 @@ class AdaptiveCore:
             if self._stall_since is None:
                 self._stall_since = t
             stalled = t - self._stall_since > p.stall_time
-            pinned = abs(self.iv) >= p.iv_max - 1e-9
+            pinned = self._floor_pinned \
+                or abs(self.iv) >= p.iv_max - 1e-9
             if stalled and pinned:
                 if self._capped_since is None:
                     self._capped_since = t
@@ -2970,6 +3281,16 @@ class AdaptiveCore:
         smallest fast-start upper bound), or None."""
         return self.deadband.raw(1.0)
 
+    @property
+    def breakaway(self):
+        """The forward breakaway estimate as logged (flight recorder,
+        /diagnostics, Output). Until 08-31 this was a vestigial FIELD --
+        initialised to 0.0 and never written again -- so the flight log
+        showed 0.000 for every run regardless of what the dead-band
+        learner actually knew. It is now the live estimate."""
+        b = self.deadband.raw(1.0)
+        return b if b is not None else 0.0
+
     def state(self):
         """Everything worth carrying across a reboot.
 
@@ -3002,6 +3323,7 @@ class AdaptiveCore:
                 'qs': [self.qs_lo, self.qs_hi],
             },
             'deadband': self.deadband.state(),
+            'gain_probe': self.gain_probe.state(),
             'sigma_v': self.sigma_v,
             'tick': self.tick,
             # The scale every speed-shaped gate is a fraction of. Restored
@@ -3064,6 +3386,9 @@ class AdaptiveCore:
             qd, vl, qs = (_load_span(spans.get(k)) for k in ('qd', 'vl', 'qs'))
             # Optional: files saved before the dead band was learned lack it.
             if 'deadband' in d and not self.deadband.load(d['deadband']):
+                return False
+            # Optional likewise: the direct gain measurement.
+            if 'gain_probe' in d and not self.gain_probe.load(d['gain_probe']):
                 return False
         else:
             n_lat = n_lon = 0

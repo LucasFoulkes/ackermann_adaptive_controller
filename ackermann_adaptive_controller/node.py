@@ -929,6 +929,15 @@ class AckermannAdaptiveController(Node):
                 f'left={len(self.core.envelope.left.vals)} '
                 f'right={len(self.core.envelope.right.vals)}',
             'breakaway': f'{self.core.breakaway:.3f}',
+            # direct wire-to-acceleration measurement (GainProbe): the
+            # loop divisor and measured-bootstrap source
+            'gain_probe':
+                f'b0={self.core.gain_probe.b0 or 0.0:.2f} '
+                f'eq_fwd={self.core.gain_probe.eq(1.0) or 0.0:.2f} '
+                f'eq_rev={self.core.gain_probe.eq(-1.0) or 0.0:.2f} '
+                f'samples gain={len(self.core.gain_probe.gain.vals)} '
+                f'eq={len(self.core.gain_probe.eq_fwd.vals)}/'
+                f'{len(self.core.gain_probe.eq_rev.vals)}',
             # learned throttle dead band: offset applied per direction and
             # how many starts it rests on (0 until deadband_evidence)
             'deadband':
