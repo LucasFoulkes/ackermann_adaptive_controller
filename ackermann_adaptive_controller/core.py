@@ -1179,9 +1179,42 @@ class DeadBand:
         self.p = policy
         self.fwd = _Window(policy.deadband_evidence, span=4)
         self.rev = _Window(policy.deadband_evidence, span=4)
+        # FAST starts (wheels turning within deadband_slow_start of the
+        # wire coming on) are not measurements -- the wire was already
+        # above the dead zone -- but each IS an upper bound, and their
+        # minimum is the only estimate a vehicle whose launches are all
+        # fast ever gets. The 08-31 00:12 from-zero run drove 6 minutes
+        # with breakaway 0.00: the learned Coulomb feedforward put ~0.26
+        # wire on instantly, every start broke free in 0.2-0.4 s, and the
+        # slow-start rule starved the dead-band learner of every sample --
+        # which in turn disabled the feedforward cap and the learned
+        # launch floor. A slow start remains the real measurement and its
+        # median overrides the bound whenever it exists.
+        self.fwd_ub = _Window(policy.deadband_evidence, span=4)
+        self.rev_ub = _Window(policy.deadband_evidence, span=4)
 
     def _win(self, direction):
         return self.fwd if direction > 0.0 else self.rev
+
+    def _ub(self, direction):
+        return self.fwd_ub if direction > 0.0 else self.rev_ub
+
+    def observe_upper(self, direction, wire):
+        """A fast start: the |wire| at breakaway bounds the band above."""
+        if direction == 0.0 or not finite(wire) or not 0.0 < wire <= 1.0:
+            return False
+        self._ub(direction).add(wire)
+        return True
+
+    def raw(self, direction):
+        """The undereated breakaway estimate: the slow-start median, or
+        the smallest fast-start upper bound once there is evidence."""
+        w = self._win(direction)
+        if w.confirmed:
+            return w.value
+        ub = self._ub(direction)
+        return min(ub.vals) if len(ub.vals) >= self.p.deadband_evidence \
+            else None
 
     def observe(self, direction, wire):
         """The |wire| throttle that was on when the wheels first turned."""
@@ -1195,17 +1228,18 @@ class DeadBand:
 
     def value(self, direction):
         """Offset applied in this direction; 0 until there is evidence."""
-        w = self._win(direction)
-        if not w.confirmed:
+        r = self.raw(direction)
+        if r is None:
             return 0.0
-        return clamp(self.p.deadband_trust * w.value, 0.0, self.p.deadband_max)
+        return clamp(self.p.deadband_trust * r, 0.0, self.p.deadband_max)
 
     def lowest(self, direction):
-        """The lowest breakaway seen in this direction, or None. Every
-        sample reads high by ramp x latency, so this is an UPPER bound on
-        the true breakaway -- what a bootstrap floor must stay under."""
-        w = self._win(direction)
-        return min(w.vals) if w.vals else None
+        """The lowest breakaway seen in this direction (slow starts and
+        fast-start upper bounds alike), or None. Every sample reads high,
+        so this is an UPPER bound -- what a bootstrap floor must stay
+        under."""
+        vals = list(self._win(direction).vals) + list(self._ub(direction).vals)
+        return min(vals) if vals else None
 
     def compensate(self, ud, motion=0.0):
         """Map a controller command onto the live part of the actuator.
@@ -1232,7 +1266,9 @@ class DeadBand:
         return sgn(ud) * (d + abs(ud) * (1.0 - d))
 
     def state(self):
-        return {'fwd': list(self.fwd.vals), 'rev': list(self.rev.vals)}
+        return {'fwd': list(self.fwd.vals), 'rev': list(self.rev.vals),
+                'fwd_ub': list(self.fwd_ub.vals),
+                'rev_ub': list(self.rev_ub.vals)}
 
     def load(self, d):
         if not isinstance(d, dict):
@@ -1243,6 +1279,13 @@ class DeadBand:
                     finite(v) and 0.0 < v <= 1.0 for v in vals):
                 return False
             win.vals = deque(vals[-win.vals.maxlen:], maxlen=win.vals.maxlen)
+        # upper-bound windows: optional, files predate them
+        for key, win in (('fwd_ub', self.fwd_ub), ('rev_ub', self.rev_ub)):
+            vals = d.get(key)
+            if isinstance(vals, list) and all(
+                    finite(v) and 0.0 < v <= 1.0 for v in vals):
+                win.vals = deque(vals[-win.vals.maxlen:],
+                                 maxlen=win.vals.maxlen)
         return True
 
 
@@ -1389,6 +1432,7 @@ class AdaptiveCore:
         self._floor = 0.0
         self._floor_dir = 0.0
         self._cap = 0.0
+        self._post_latch_until = 0.0
         # Anti-windup for the throttle integrator: the direction in which
         # the last published throttle fell short of what the loop asked
         # (+1: less than asked, -1: more), because the +-1 clamp or the
@@ -1594,9 +1638,7 @@ class AdaptiveCore:
             if stamp < window:
                 break
             u_same = max(u_same, ud * direction)
-        w = self.deadband._win(direction)
-        band = w.value if w.confirmed else 0.0
-        u_eff = max(u_same - band, 0.0)
+        u_eff = max(u_same - self.deadband.value(direction), 0.0)
         b0 = clamp(self.rls_lon.theta[0], p.prior_b0, 2.0 * p.prior_b0)
         return p.odom_glitch_margin * b0 * u_eff * since + 5.0 * noise
 
@@ -1862,6 +1904,15 @@ class AdaptiveCore:
             if self._roll_run >= 2:
                 self._roll_run = 0
                 self.rolling = True
+                # For one actuation delay after breakaway, the wire the
+                # car is responding to was set BEFORE it moved: pushing
+                # harder now cannot reach the wheels until after the
+                # overshoot has peaked -- it only deepens it (00:12 run:
+                # the wire rose 0.26 -> 0.38 in the 0.4 s after latch and
+                # the speed peaked at 2-3x the command 1.3 s in). The cap
+                # below holds the wire near the launch level through that
+                # window.
+                self._post_latch_until = self.now + self.lon_bank.delay
                 self._roll_since = self.now
                 self._roll_dir = sgn(self.v_fast)
                 self._dir_since = self.now
@@ -1874,8 +1925,13 @@ class AdaptiveCore:
                 slow = (self._wire_on_since is not None
                         and t - self._wire_on_since
                         > self.policy.deadband_slow_start)
-                if slow and d is not None and sgn(d[1]) == sgn(v):
-                    self.deadband.observe(sgn(v), abs(d[1]))
+                if d is not None and sgn(d[1]) == sgn(v):
+                    if slow:
+                        self.deadband.observe(sgn(v), abs(d[1]))
+                    else:
+                        # a fast start bounds the band from above (see
+                        # DeadBand.observe_upper)
+                        self.deadband.observe_upper(sgn(v), abs(d[1]))
         else:
             if abs(self.v_fast) < 0.3 * self.gate_d:
                 if self._still_since is None:
@@ -2591,13 +2647,27 @@ class AdaptiveCore:
             # wire for friction than the breakaway is the fit, not the car
             # -- b3/b0 0.46 against a 0.22 breakaway launched a 0.15 m/s
             # command to 1.3 m/s (08-30 11:23). Unjudged without evidence.
-            coulomb = -b3 * s_dir / b0
-            w = self.deadband._win(s_dir) if s_dir else None
-            if w is not None and w.confirmed:
-                coulomb = clamp(coulomb, -w.value, w.value)
-            ff = -(b1 + b2 * v_ff * abs(v_ff)) / b0 + coulomb
+            # The whole STATIC part of the feedforward -- bias b1 and
+            # Coulomb b3 together -- is capped at the breakaway estimate
+            # (or the launch floor plus margin, before any dead-band
+            # evidence exists): the wire that holds a speed cannot exceed
+            # the wire that measurably breaks the car free, whatever the
+            # split of a junk fit says. b3 alone was capped and a junk
+            # b1 (+0.09 over b0 0.63) leaked 0.14 wire through the same
+            # hole (08-31 bench, the 0.58 m/s reversal).
+            static = -(b1 + b3 * s_dir) / b0
+            raw_band = self.deadband.raw(s_dir) if s_dir else None
+            cap_w = raw_band if raw_band is not None \
+                else p.launch_floor + p.launch_cap_margin
+            static = clamp(static, -cap_w, cap_w)
+            ff = static - b2 * v_ff * abs(v_ff) / b0
             self._ff_wire = clamp(ff, -1.0, 1.0) if not reversing else 0.0
-            if not reversing:
+            if not reversing and v * s_dir >= 0.0:
+                # ...and none of it while the car still rolls AGAINST
+                # the command at all: braking needs no feedforward (the
+                # brake-only-reversal principle applied to the reversal's
+                # tail -- at half the gate it still landed 0.25 wire on a
+                # car rolling the other way at 0.14 m/s).
                 ud += ff
         if p.enable_dither and self.dither > 0.0:
             ud += self.dither * math.sin(2.0 * math.pi * 0.7 * self.now)
@@ -2607,6 +2677,13 @@ class AdaptiveCore:
         self._floor = 0.0
         self._floor_dir = 0.0
         self._cap = 0.0
+        if direction and self.rolling and self.now < self._post_latch_until \
+                and err * direction > 0.0:
+            # post-breakaway: hold near the launch wire for one delay
+            raw_band = self.deadband.raw(direction)
+            base = raw_band if raw_band is not None else p.launch_floor
+            self._cap = min(1.0, base + p.launch_cap_margin)
+            self._floor_dir = direction
         if direction and not self.rolling and err * direction > 0.0:
             # Not rolling yet, motion is wanted AND the PI agrees it should
             # speed up that way (the last condition keeps this from ever
@@ -2616,8 +2693,18 @@ class AdaptiveCore:
             # evidence, launch_floor is the bootstrap, as prior_a0 is for
             # the envelope -- capped, from the first measured start on, by
             # the lowest breakaway seen (Policy.launch_floor).
-            if self.deadband.confirmed(direction):
-                floor = self.deadband._win(direction).value
+            w = self.deadband._win(direction)
+            if w.confirmed:
+                # a slow-start median is the real measurement: the wire
+                # goes straight to it
+                floor = w.value
+            elif self.deadband.value(direction) > 0.0:
+                # only fast-start upper bounds: they read HIGH by
+                # definition (the wire was already past the band), so the
+                # floor takes the derated value -- flooring at min(upper)
+                # raised a reverse launch's peak from 0.42 to 0.58 on the
+                # bench (08-31)
+                floor = self.deadband.value(direction)
             else:
                 floor = p.launch_floor
                 seen = self.deadband.lowest(direction)
@@ -2729,10 +2816,11 @@ class AdaptiveCore:
         if self._floor > 0.0 and self._floor_dir:
             # the launch floor bypasses the slew: see reset() note
             ud = self._floor_dir * max(ud * self._floor_dir, self._floor)
-            if self._cap > 0.0:
-                # ...and the launch cap bounds it from above: the wire at
-                # the moment of breakaway is what sizes the lunge.
-                ud = clamp(ud, -self._cap, self._cap)
+        if self._cap > 0.0 and self._floor_dir:
+            # the launch cap bounds the wire from above -- while stuck AND
+            # for one actuation delay after breakaway (the wire at the
+            # moment of release is what sizes the lunge)
+            ud = clamp(ud, -self._cap, self._cap)
         self.prev_us, self.prev_ud = us, ud
         # The whole throttle path works in wire units (see _run); the dead-
         # band map is applied inside _run to the bootstrap path only.
@@ -2878,9 +2966,9 @@ class AdaptiveCore:
                         self.policy, self.speed_scale, self._breakaway_median())
 
     def _breakaway_median(self):
-        """The measured forward breakaway wire (raw median), or None."""
-        w = self.deadband.fwd
-        return w.value if w.confirmed else None
+        """The forward breakaway estimate (slow-start median, or the
+        smallest fast-start upper bound), or None."""
+        return self.deadband.raw(1.0)
 
     def state(self):
         """Everything worth carrying across a reboot.

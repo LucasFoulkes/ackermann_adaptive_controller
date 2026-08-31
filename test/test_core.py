@@ -2665,14 +2665,21 @@ def test_a_speed_gain_the_wire_cannot_afford_is_a_glitch():
     n = core.model.n_lon
     up = core._speed_up_limit(0.1)
     assert up is not None and up < 0.16, up
-    # a jump the wire cannot explain: held, not learned from
+    # a jump the wire cannot explain, along the HEADING (an offset along
+    # +x once shrank to nothing when the car ended the cruise pointed
+    # elsewhere -- speed is the displacement projected on the heading)
+    import math as _m
     x, y, psi = plant.observe()
-    out = core.step(t + 0.1, x + 0.05, y, psi, 0.30, 0.0)   # +0.5 m/s
+    # step at exactly t: drive() returns a stamp one tick past its last
+    # sample, and stepping at t+0.1 made a 0.2 s gap that halved the
+    # injected jump under the per-second bounds
+    out = core.step(t, x + 0.05 * _m.cos(psi), y + 0.05 * _m.sin(psi),
+                    psi, 0.30, 0.0)                          # +0.5 m/s
     assert core._glitch_run == 1 and core.model.n_lon == n
     assert out.drive == core.prev_wire                      # rode through
     # ...while a genuine speed-up under real wire is not a glitch
     core._glitch_run = 0
-    _, t = drive(core, plant, lambda s: (0.30, 0.0), 2.0, t0=t + 0.2)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 2.0, t0=t + 0.1)
     _, t = drive(core, plant, lambda s: (0.60, 0.0), 6.0, t0=t)
     assert core.odom_ok and abs(core.v - 0.60) < 0.1
     assert core.model.n_lon > n
