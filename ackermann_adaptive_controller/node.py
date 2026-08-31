@@ -133,14 +133,6 @@ class AckermannAdaptiveController(Node):
             ('estop_joy_topic', '/joy'),
             ('estop_button', 1),
             ('start_active', False),
-            # A vehicle with no learned state (no state file, or just
-            # reset) runs the CAL wiggle once, as soon as it is ACTIVE and
-            # SENSE has measured the noise floor. The wiggle drives the
-            # robot on its own; arming the controller is the consent. It
-            # is what establishes the signs on an unknown vehicle. This
-            # robot restores its state file at every boot, so it never
-            # fires here except after ~/reset.
-            ('calibrate_on_fresh_start', True),
             # Policy (see core.Policy for what each one means).
             *[(name, getattr(_DEFAULTS, name)) for name in POLICY_PARAMS],
             # Learned turning radius -> Nav2. Both plugins accept it live and
@@ -291,8 +283,13 @@ class AckermannAdaptiveController(Node):
                 self.get_logger().info(f'flight log: {path}')
             except OSError as exc:
                 self.get_logger().warn(f'no flight log: {exc}')
-        self._cal_on_fresh = bool(g['calibrate_on_fresh_start'])
-        self._cal_pending = self._cal_on_fresh and not self._load_state()
+        # No autonomous calibration, by the operator's explicit decision
+        # (2026-08-30): a robot must not drive itself unprompted, state
+        # file or none. A fresh vehicle learns from the goals it is given
+        # -- the priors carry the first legs -- and the staged CAL wiggle
+        # exists ONLY behind the ~/calibrate service, where invoking it IS
+        # the consent.
+        self._load_state()
 
         self.active = bool(g['start_active'])
         self.estopped = False
@@ -474,14 +471,6 @@ class AckermannAdaptiveController(Node):
             applied=applied, v_meas=v_meas, psidot_meas=psidot_meas)
         self.out_steer, self.out_drive = out.steer, out.drive
 
-        # Fresh vehicle, armed, noise floor measured: calibrate once.
-        if self._cal_pending and self.active and not self.estopped \
-                and self.core.phase == RUN:
-            self._cal_pending = False
-            self.core.start_cal()
-            self.get_logger().warn(
-                'no learned state: calibration wiggle starting now to '
-                'establish the signs and seed the model; keep the area clear')
         if out.drive_fault and not self._warned_drive_fault:
             self.get_logger().error(
                 f'THROTTLE FAULT from calibration: {out.drive_fault}; '
@@ -620,13 +609,11 @@ class AckermannAdaptiveController(Node):
         self.core.reset()
         self.estopped = False
         self.active = False
-        self._cal_pending = self._cal_on_fresh
         self._zero_burst()
         resp.success = True
-        resp.message = 'learner reset; mode PASSIVE; e-stop cleared'
-        if self._cal_pending:
-            resp.message += ('; the next set_active true runs the '
-                             'calibration wiggle (fresh vehicle)')
+        resp.message = ('learner reset; mode PASSIVE; e-stop cleared '
+                        '(no automatic calibration: the robot learns from '
+                        'the goals it is given, or ~/calibrate on request)')
         self.get_logger().info(resp.message)
         return resp
 
@@ -968,11 +955,10 @@ class AckermannAdaptiveController(Node):
             'steer_sign': ('assumed +' if self.core.steer_sign is None
                            else f'established {self.core.steer_sign:+.0f}'),
             'throttle': self.core.drive_fault or 'ok',
-            'calibration': ('pending (fresh vehicle)' if self._cal_pending
-                            else f'stage {self.core._cal_stage}'
+            'calibration': (f'stage {self.core._cal_stage}'
                             if self.core.phase == CAL
                             else 'done' if self.core.dither > 0.0
-                            else 'not run'),
+                            else 'not run (on request: ~/calibrate)'),
             'model_plausible': str(self.core.plausible()),
             'authority': f'{100.0 * self.core.authority():.0f}%',
             'radius_pushed_to_nav2':

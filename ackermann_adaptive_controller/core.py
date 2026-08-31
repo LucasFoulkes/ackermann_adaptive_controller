@@ -15,9 +15,12 @@ Three phases:
   these numbers rather than guessed, which is what makes the same code work on
   a noisy 10 Hz LiDAR odometry and on clean wheel encoders.
 * ``CAL``    scripted wiggle to excite both axes quickly. It drives the robot
-  on its own, so the CORE never enters it unasked (``enable_calibration``
-  is off); the node starts it on a fresh vehicle -- no state file, or after
-  a reset -- once the operator has armed the controller. Besides seeding
+  on its own, so it NEVER runs unasked (``enable_calibration`` is off and
+  the node only starts it from the explicit ``~/calibrate`` service --
+  autonomous calibration on a fresh vehicle existed for one day and was
+  removed on the operator's decision, 2026-08-30: a robot must not move
+  unprompted; a fresh vehicle learns from the goals it is given, on the
+  declared priors). Besides seeding
   both fits it ESTABLISHES the signs: the steering sign from the learned
   cells (an inverted servo is a vehicle, and is then defended against
   later poison as the prior's sign used to be), and the throttle sign is
