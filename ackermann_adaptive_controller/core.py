@@ -564,6 +564,15 @@ class Policy:
     # harder: a feedback loop between the lunge and the Coulomb term.
     learn_overspeed_ratio: float = 1.5
 
+    # Replayed history: how long a remembered sample may keep teaching, in
+    # t_forget half-lives. The stack (see _learn) exists because the fit
+    # drifts under this sensor's in-regime bias faster than fresh
+    # excitation corrects it -- b0 5.1 -> 0.11 in six minutes of ordinary
+    # segments (08-30 23:16 drive) WITH the lunge and overspeed gates
+    # already in place. Four half-lives: old enough to anchor, young
+    # enough that a real change (carpet, battery) ages out.
+    replay_age: float = 4.0
+
     # -- derived from the two declared priors (not fields, not parameters) --
 
     @property
@@ -1449,6 +1458,20 @@ class AdaptiveCore:
         # to the sign the linkage was ASSUMED to have. Persisted. A reset
         # forgets it: that is what a reset is for.
         self.steer_sign = None
+        self._b0_ref = None      # last persisted-sane b0 (see _run)
+        # Concurrent-learning history stack for the throttle fit: one
+        # remembered (regressor, target, stamp) per excitation bucket of
+        # (direction x wire band x speed half). Each accepted live sample
+        # replays one remembered one into the ACTIVE estimator (lam = 1:
+        # replays never forget), so the fit is pulled toward ALL
+        # remembered excitation, not only the last minute's -- drift
+        # becomes variance. Buckets refresh on recurrence and entries
+        # older than replay_age half-lives are dropped, so a genuinely
+        # changed vehicle still wins.
+        self._cl_lon = {}
+        self._cl_keys = []
+        self._cl_i = 0
+        self._cl_delay = None    # the active delay the stack was built at
         self._cal_stage = None   # 'signs' | 'gains' | 'reverse'
         self._cal_t0 = None      # when the current stage began
         self._cal_sub = None     # reverse: 'brake' | 'pulse' | 'stop'
@@ -1514,6 +1537,30 @@ class AdaptiveCore:
             return None
         i = max(range(len(sums)), key=lambda k: abs(sums[k]))
         return bank.delays[i]
+
+    def _replay_lon(self):
+        """One remembered sample into the active throttle estimator."""
+        p = self.policy
+        for _ in range(len(self._cl_keys)):
+            self._cl_i = (self._cl_i + 1) % len(self._cl_keys)
+            key = self._cl_keys[self._cl_i]
+            phi, y, t = self._cl_lon[key]
+            if self.now - t > p.replay_age * p.t_forget:
+                del self._cl_lon[key]
+                self._cl_keys.remove(key)
+                if not self._cl_keys:
+                    return
+                self._cl_i %= len(self._cl_keys)
+                continue
+            # A quarter-measurement per replay (weight w scales phi and y
+            # by sqrt(w) in least squares): the stack must HOLD the fit
+            # where fresh information is absent, not outweigh fresh data
+            # -- full-weight replays of one stored pair, repeated per live
+            # sample, locked the 4 m/s^2 bench vehicle to its own early
+            # noise (b0 2.25 for a true 4.0).
+            w = 0.5
+            self.rls_lon.update([w * c for c in phi], w * y, 1.0)
+            return
 
     def _establish_sign(self):
         """Lock the servo's direction from the command-curvature witness.
@@ -2142,8 +2189,29 @@ class AdaptiveCore:
                     if 0.0 < abs(d[1]) < thr:
                         return None
                 return [d[1], 1.0, v_reg * abs(v_reg), sgn(v)]
-            if self.lon_bank.update(phi_lon, self.vdot, self.lam, self.dt):
+            accepted_lon = self.lon_bank.update(phi_lon, self.vdot,
+                                                self.lam, self.dt)
+            if accepted_lon:
                 ok = True
+                phi_a = phi_lon(self.lon_bank.delay)
+                if self._cl_delay != self.lon_bank.delay:
+                    # every stored regressor was built at the OLD active
+                    # delay; replaying it into a re-aligned estimator is
+                    # misalignment by construction (the 4 m/s^2 bench
+                    # vehicle fit 1.6 that way after its bank switched)
+                    self._cl_lon.clear()
+                    self._cl_keys.clear()
+                    self._cl_i = 0
+                    self._cl_delay = self.lon_bank.delay
+                if phi_a is not None:
+                    key = (sgn(v),
+                           min(int(abs(phi_a[0])
+                                   / self.policy.ready_lon_qd_span), 5),
+                           int(abs(v) >= 0.5 * max(self.v_op, 1e-6)))
+                    if key not in self._cl_lon:
+                        self._cl_keys.append(key)
+                    self._cl_lon[key] = (list(phi_a), self.vdot, self.now)
+                    self._replay_lon()
                 if self._lon_corr is None:
                     self._lon_corr = [0.0] * len(self.lon_bank.delays)
                 for k, dk in enumerate(self.lon_bank.delays):
@@ -2498,7 +2566,16 @@ class AdaptiveCore:
         # window's under-fit (0.7 in sim) would triple it. The same bounded
         # number is what full throttle can deliver, so the acceleration
         # demand is clamped to it (it was a typed 2.5 m/s^2).
-        b0_fb = clamp(b0, 0.5 * p.prior_b0, 2.0 * p.prior_b0)
+        # The loop-gain divisor is anchored to the last fit that passed
+        # every sanity gate (persisted or restored), not the declared
+        # prior: with prior_b0 typed as 2.0 on a car whose measured b0 is
+        # ~4.6, a collapsed live fit floored b0_fb at 1.0 and every PI
+        # correction ran 4.6x too strong -- the wire slammed 0.44/0.06 at
+        # 1 Hz and the car surged 0..0.8 m/s on a 0.32 command (08-30
+        # 23:16). The anchor updates only through state()/load_state,
+        # which lon_sane gates.
+        ref = self._b0_ref if self._b0_ref else p.prior_b0
+        b0_fb = clamp(b0, 0.5 * ref, 2.0 * ref)
         a_des = clamp(self.kp_v * err, -b0_fb, b0_fb)
         # Conditional integration (see _shaped in reset): no winding into
         # a limit the actuator is already at.
@@ -2879,6 +2956,9 @@ class AdaptiveCore:
         """
         p = self.policy
         lon_ok = self.lon_plausible()
+        if lon_ok:
+            # the loop-gain anchor tracks whatever is good enough to keep
+            self._b0_ref = self.rls_lon.theta[0]
         return {
             # Version 4: the lateral fit is 6 parameters (a0 per travel
             # direction x steering side, then a1, a2). Version 3 carried 4
@@ -3003,6 +3083,7 @@ class AdaptiveCore:
             lon[2] = 0.0
         if lon_sane(lon, vl[0], vl[1], p, judge_v, self._breakaway_median()):
             self.lon_bank.seed(lon, n_lon, p0)
+            self._b0_ref = lon[0]
             self.qd_lo, self.qd_hi = qd
             self.vl_lo, self.vl_hi = vl
         else:

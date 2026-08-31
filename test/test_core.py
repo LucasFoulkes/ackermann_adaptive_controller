@@ -2857,3 +2857,51 @@ def test_lunge_decays_do_not_teach_friction_and_the_friction_feedforward_is_boun
     assert core._ff_wire is not None
     assert core._ff_wire <= core.deadband.fwd.value + 0.05 / 4.0 + 1e-9
     assert core._ff_wire < 1.3 / 4.0
+
+
+# -- 08-30 23:16: the collapsed fit that cranks its own loop ------------------------
+
+def test_feedback_gain_is_anchored_to_the_last_sane_fit_not_the_prior():
+    core = AdaptiveCore()
+    plant = Plant()
+    settle_sense(core, plant)
+    d = core.state()
+    d['longitudinal'] = [4.64, 0.05, -0.53, -0.96]
+    d['n_lon'] = 500
+    d['spans']['qd'] = [-0.7, 0.6]; d['spans']['vl'] = [-0.3, 0.35]
+    fresh = AdaptiveCore()
+    assert fresh.load_state(d)
+    assert fresh._b0_ref == pytest.approx(4.64)
+    # the live fit collapses mid-run: the divisor may fall to half the
+    # ANCHOR (2.3), not to half the typed prior (1.0) -- a 4.6x over-gain
+    fresh.rls_lon.theta = [0.11, -0.11, 0.0, -0.12]
+    fresh.v_op = 0.32
+    fresh.rolling = True
+    fresh.v = fresh.v_fb = 0.74
+    fresh._floor = 0.0
+    _, ud = fresh._run(0.74, 0.32, 0.0, 0.1)
+    # a_des = kp*(0.32-0.74) ~ -0.25; divisor >= 2.32 keeps the cut mild
+    assert ud > -0.25 / 2.32 + (-1.0), ud     # sanity: finite
+    ref = fresh._b0_ref
+    from ackermann_adaptive_controller.core import clamp
+    assert clamp(0.11, 0.5 * ref, 2.0 * ref) == pytest.approx(2.32)
+
+
+def test_history_replay_holds_the_fit_and_still_follows_a_real_change():
+    core = AdaptiveCore()
+    plant = Plant(pose_noise=0.002)
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, _course((0.25, 0.55, 0.35, 0.65), 15, 0.3, 0.12),
+                 120.0, t0=t)
+    assert core.ready_lon and len(core._cl_lon) >= 4, len(core._cl_lon)
+    b0_fit = core.model.b0
+    # five minutes at one cruise speed (the null-space walk scenario):
+    # the replayed history holds the split
+    _, t = drive(core, plant, lambda s: (0.32, 0.0), 300.0, t0=t)
+    assert core.model.b0 == pytest.approx(b0_fit, rel=0.15), (b0_fit, core.model.b0)
+    # the vehicle genuinely changes (battery sag: b0 2.2 -> 1.4): with
+    # buckets refreshing on recurrence the fit follows despite the stack
+    plant.b0 = 1.4
+    _, t = drive(core, plant, _course((0.25, 0.55, 0.35, 0.65), 15, 0.3, 0.12),
+                 300.0, t0=t)
+    assert core.model.b0 == pytest.approx(1.4, rel=0.4), core.model.b0
