@@ -564,15 +564,6 @@ class Policy:
     # harder: a feedback loop between the lunge and the Coulomb term.
     learn_overspeed_ratio: float = 1.5
 
-    # Replayed history: how long a remembered sample may keep teaching, in
-    # t_forget half-lives. The stack (see _learn) exists because the fit
-    # drifts under this sensor's in-regime bias faster than fresh
-    # excitation corrects it -- b0 5.1 -> 0.11 in six minutes of ordinary
-    # segments (08-30 23:16 drive) WITH the lunge and overspeed gates
-    # already in place. Four half-lives: old enough to anchor, young
-    # enough that a real change (carpet, battery) ages out.
-    replay_age: float = 4.0
-
     # -- derived from the two declared priors (not fields, not parameters) --
 
     @property
@@ -1459,19 +1450,6 @@ class AdaptiveCore:
         # forgets it: that is what a reset is for.
         self.steer_sign = None
         self._b0_ref = None      # last persisted-sane b0 (see _run)
-        # Concurrent-learning history stack for the throttle fit: one
-        # remembered (regressor, target, stamp) per excitation bucket of
-        # (direction x wire band x speed half). Each accepted live sample
-        # replays one remembered one into the ACTIVE estimator (lam = 1:
-        # replays never forget), so the fit is pulled toward ALL
-        # remembered excitation, not only the last minute's -- drift
-        # becomes variance. Buckets refresh on recurrence and entries
-        # older than replay_age half-lives are dropped, so a genuinely
-        # changed vehicle still wins.
-        self._cl_lon = {}
-        self._cl_keys = []
-        self._cl_i = 0
-        self._cl_delay = None    # the active delay the stack was built at
         self._cal_stage = None   # 'signs' | 'gains' | 'reverse'
         self._cal_t0 = None      # when the current stage began
         self._cal_sub = None     # reverse: 'brake' | 'pulse' | 'stop'
@@ -1537,30 +1515,6 @@ class AdaptiveCore:
             return None
         i = max(range(len(sums)), key=lambda k: abs(sums[k]))
         return bank.delays[i]
-
-    def _replay_lon(self):
-        """One remembered sample into the active throttle estimator."""
-        p = self.policy
-        for _ in range(len(self._cl_keys)):
-            self._cl_i = (self._cl_i + 1) % len(self._cl_keys)
-            key = self._cl_keys[self._cl_i]
-            phi, y, t = self._cl_lon[key]
-            if self.now - t > p.replay_age * p.t_forget:
-                del self._cl_lon[key]
-                self._cl_keys.remove(key)
-                if not self._cl_keys:
-                    return
-                self._cl_i %= len(self._cl_keys)
-                continue
-            # A quarter-measurement per replay (weight w scales phi and y
-            # by sqrt(w) in least squares): the stack must HOLD the fit
-            # where fresh information is absent, not outweigh fresh data
-            # -- full-weight replays of one stored pair, repeated per live
-            # sample, locked the 4 m/s^2 bench vehicle to its own early
-            # noise (b0 2.25 for a true 4.0).
-            w = 0.5
-            self.rls_lon.update([w * c for c in phi], w * y, 1.0)
-            return
 
     def _establish_sign(self):
         """Lock the servo's direction from the command-curvature witness.
@@ -2189,29 +2143,8 @@ class AdaptiveCore:
                     if 0.0 < abs(d[1]) < thr:
                         return None
                 return [d[1], 1.0, v_reg * abs(v_reg), sgn(v)]
-            accepted_lon = self.lon_bank.update(phi_lon, self.vdot,
-                                                self.lam, self.dt)
-            if accepted_lon:
+            if self.lon_bank.update(phi_lon, self.vdot, self.lam, self.dt):
                 ok = True
-                phi_a = phi_lon(self.lon_bank.delay)
-                if self._cl_delay != self.lon_bank.delay:
-                    # every stored regressor was built at the OLD active
-                    # delay; replaying it into a re-aligned estimator is
-                    # misalignment by construction (the 4 m/s^2 bench
-                    # vehicle fit 1.6 that way after its bank switched)
-                    self._cl_lon.clear()
-                    self._cl_keys.clear()
-                    self._cl_i = 0
-                    self._cl_delay = self.lon_bank.delay
-                if phi_a is not None:
-                    key = (sgn(v),
-                           min(int(abs(phi_a[0])
-                                   / self.policy.ready_lon_qd_span), 5),
-                           int(abs(v) >= 0.5 * max(self.v_op, 1e-6)))
-                    if key not in self._cl_lon:
-                        self._cl_keys.append(key)
-                    self._cl_lon[key] = (list(phi_a), self.vdot, self.now)
-                    self._replay_lon()
                 if self._lon_corr is None:
                     self._lon_corr = [0.0] * len(self.lon_bank.delays)
                 for k, dk in enumerate(self.lon_bank.delays):

@@ -77,7 +77,7 @@ POLICY_PARAMS = (
     'delay_switch_margin', 'iw_freeze_frac',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
     'odom_glitch_hold',
-    'authority_floor', 'learn_overspeed_ratio', 'replay_age',
+    'authority_floor', 'learn_overspeed_ratio',
 )
 _DEFAULTS = Policy()
 

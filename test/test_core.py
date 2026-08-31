@@ -2885,23 +2885,3 @@ def test_feedback_gain_is_anchored_to_the_last_sane_fit_not_the_prior():
     ref = fresh._b0_ref
     from ackermann_adaptive_controller.core import clamp
     assert clamp(0.11, 0.5 * ref, 2.0 * ref) == pytest.approx(2.32)
-
-
-def test_history_replay_holds_the_fit_and_still_follows_a_real_change():
-    core = AdaptiveCore()
-    plant = Plant(pose_noise=0.002)
-    t = settle_sense(core, plant)
-    _, t = drive(core, plant, _course((0.25, 0.55, 0.35, 0.65), 15, 0.3, 0.12),
-                 120.0, t0=t)
-    assert core.ready_lon and len(core._cl_lon) >= 4, len(core._cl_lon)
-    b0_fit = core.model.b0
-    # five minutes at one cruise speed (the null-space walk scenario):
-    # the replayed history holds the split
-    _, t = drive(core, plant, lambda s: (0.32, 0.0), 300.0, t0=t)
-    assert core.model.b0 == pytest.approx(b0_fit, rel=0.15), (b0_fit, core.model.b0)
-    # the vehicle genuinely changes (battery sag: b0 2.2 -> 1.4): with
-    # buckets refreshing on recurrence the fit follows despite the stack
-    plant.b0 = 1.4
-    _, t = drive(core, plant, _course((0.25, 0.55, 0.35, 0.65), 15, 0.3, 0.12),
-                 300.0, t0=t)
-    assert core.model.b0 == pytest.approx(1.4, rel=0.4), core.model.b0
