@@ -1106,7 +1106,10 @@ def test_gain_probe_survives_a_reboot():
     assert fresh.load_state(st)
     assert fresh.gain_probe.eq(1.0) == pytest.approx(0.21)
     assert fresh.gain_probe.eq(-1.0) == pytest.approx(0.21)  # symmetric fallback
-    assert fresh.gain_probe.b0 == pytest.approx(4.8)
+    # the slope window is deliberately NOT restored (it re-measures in
+    # the first launches; a persisted one carried a superseded sampling
+    # rule's bias across the 09-01 21:11 restart)
+    assert fresh.gain_probe.b0 is None
 
 
 # -- regression: understeer from the v_eff floor, stepping at cruise --------
@@ -3125,3 +3128,63 @@ def test_flight_report_scores_a_lunging_session(tmp_path):
     assert fr.verdict(clean) == 'smooth', fr.verdict(clean)
     assert clean['launches'] == 1 and clean['minutes'][-1]['probe_b0'] == 4.6
     assert fr.main([str(path), '--all']) == 0
+
+
+# -- 09-01 21:00 drive: the trim steered wide on every overspeed launch --------
+
+def test_trim_integrates_curvature_error_not_yaw_rate():
+    """At perfect curvature but 1.3x the commanded speed the yaw rate is
+    1.3x the commanded yaw rate. A yaw-rate trim wound the steering OUT
+    on every overspeed launch (the car ran wide on the planner's
+    minimum-radius turns); a curvature trim sees no error."""
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.v_op = 0.30
+    core.lat_bank.set_delay(0.3)
+    kappa = 1.0
+    t = core.now
+    # a steady command; the yaw appears one delay plus the servo constant
+    # later (as on a car), then holds EXACTLY the commanded curvature at
+    # 1.3x the commanded speed
+    for i in range(30):
+        t += 0.1
+        core.now = t
+        core.v = core.v_fb = 0.39
+        core.psidot = kappa * 0.39 if i >= 5 else 0.0
+        core.rolling = True
+        core._run(0.39, 0.30, kappa * 0.30, 0.1)
+    assert abs(core.iw) < 0.01, core.iw
+    # and a genuine curvature shortfall (the car turns at 70% of the
+    # command) winds it the right way: MORE steering
+    for _ in range(20):
+        t += 0.1
+        core.now = t
+        core.psidot = 0.7 * kappa * 0.39
+        core._run(0.39, 0.30, kappa * 0.30, 0.1)
+    assert core.iw > 0.02, core.iw
+
+
+def test_trim_compares_against_the_command_that_caused_the_yaw():
+    """A curvature step is transport delay for one learned delay plus the
+    servo constant: the trim must judge the yaw against the command from
+    THEN, so it neither winds on the step nor needs a freeze that the
+    follower's command jitter kept armed 41% of the 09-01 drive."""
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.v_op = 0.30
+    core.lat_bank.set_delay(0.3)
+    t = core.now
+    core.v = core.v_fb = 0.30
+    core.rolling = True
+    for _ in range(20):              # straight, settled
+        t += 0.1
+        core.now = t
+        core.psidot = 0.0
+        core._run(0.30, 0.30, 0.0, 0.1)
+    assert abs(core.iw) < 1e-6
+    # step to kappa 1.0; the car has not responded yet (psidot still 0)
+    for _ in range(4):               # 0.4 s < delay 0.3 + tau_s 0.18
+        t += 0.1
+        core.now = t
+        core._run(0.30, 0.30, 0.30, 0.1)
+    assert abs(core.iw) < 1e-6, core.iw     # judged against the old command

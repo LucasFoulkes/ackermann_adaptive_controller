@@ -123,7 +123,49 @@ def score_session(s, cmd_min=0.05, gate=0.05):
             'a0lr': e['a0lr'], 'a0rr': e['a0rr'],
             'ready_lon': int(e['ready_lon']), 'ready_lat': int(e['ready_lat']),
         })
+    # steering, per (travel direction x steering side) cell: curvature
+    # achieved over commanded, how often the servo sat at lock, and the
+    # empirical gain (kappa over the steering command one delay earlier,
+    # steady for half a second) against the fitted cell
+    cells = {}
+    for i, r in enumerate(s):
+        vv = r['v']
+        if abs(vv) < 0.2 or abs(r['cmd_v']) < 0.1:
+            continue
+        j = i
+        while j > 0 and s[i]['stamp'] - s[j]['stamp'] < 0.45:
+            j -= 1
+        k = j
+        while k > 0 and s[i]['stamp'] - s[k]['stamp'] < 0.95:
+            k -= 1
+        qs = s[j]['qs']
+        key = ('fwd' if vv > 0 else 'rev',
+               'left' if qs > 0.05 else 'right' if qs < -0.05 else None)
+        if key[1] is None:
+            continue
+        c = cells.setdefault(key, {'ratio': [], 'gain': [], 'sat': 0, 'n': 0})
+        c['n'] += 1
+        c['sat'] += abs(r['qs']) >= 0.9
+        k_cmd = r['cmd_w'] / r['cmd_v']
+        if abs(k_cmd) > 0.3:
+            c['ratio'].append((r['psidot'] / vv) / k_cmd)
+        if abs(qs) > 0.2 and abs(s[k]['qs'] - qs) <= 0.1:
+            c['gain'].append((r['psidot'] / vv) / qs)
+    last = s[-1]
+    fitted = {('fwd', 'left'): last['a0l'], ('fwd', 'right'): last['a0r'],
+              ('rev', 'left'): last['a0lr'], ('rev', 'right'): last['a0rr']}
+    steering = []
+    for key in sorted(cells):
+        c = cells[key]
+        steering.append({
+            'cell': f'{key[0]} {key[1]}', 'n': c['n'],
+            'ratio': statistics.median(c['ratio']) if c['ratio'] else None,
+            'sat': c['sat'] / c['n'],
+            'gain': statistics.median(c['gain']) if c['gain'] else None,
+            'fitted': fitted[key],
+        })
     return {
+        'steering': steering,
         'start': t0, 'end': s[-1]['stamp'], 'rows': len(s),
         'commanded': len(commanded), 'mean_cmd': mean_cmd,
         'err_rms': err_rms,
@@ -175,6 +217,14 @@ def render(sc):
         f"{fmt(sc['launch_over_median'])}x max {fmt(sc['launch_over_max'])}x  "
         f"time-to-command median {fmt(sc['launch_reach_median'], '.1f')} s",
         f"  surge-stall cycles: {sc['cycles']}   stalls: {sc['stalls']}",
+        "  steering   cell      n  achieved/cmd  at-lock  gain measured / fitted",
+    ]
+    for st_ in sc['steering']:
+        out.append(
+            f"             {st_['cell']:9s} {st_['n']:5d}     {fmt(st_['ratio'])}"
+            f"      {st_['sat'] * 100:3.0f}%     {fmt(st_['gain'])} / "
+            f"{st_['fitted']:.2f}")
+    out += [
         "  min  cmd  err_rms |   b0    b1    b3  brk | probe b0  eq | "
         "a0l  a0r  a0lr a0rr | rdy",
     ]

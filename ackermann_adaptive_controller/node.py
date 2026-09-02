@@ -74,7 +74,7 @@ POLICY_PARAMS = (
     'blocked_retries', 'blocked_hold', 'odom_timeout_steps',
     'cal_steer', 'cal_drive', 'cal_reverse',
     'delay_spread', 'delay_min', 'delay_max', 'delay_ew_tau',
-    'delay_switch_margin', 'iw_freeze_frac',
+    'delay_switch_margin',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
     'odom_glitch_hold',
     'authority_floor', 'learn_overspeed_ratio',

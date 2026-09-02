@@ -509,7 +509,6 @@ class Policy:
     # the envelope, the yaw-rate error is pure transport delay for one
     # (learned) delay + servo constant -- integrating it is what kept the
     # trim pinned on every transient. Risk constant; the window is learned.
-    iw_freeze_frac: float = 0.1
 
     # Odometry plausibility. The bounds come from the vehicle's own learned
     # physics -- acceleration from b0 + |b3|, yaw rate from the envelope --
@@ -1412,8 +1411,11 @@ class GainProbe:
         # File-corruption guard only: live samples are already gated by
         # the acceleration plausibility bound at observation time, so the
         # windows never legitimately hold anything near these limits.
-        for key, win in (('eq_fwd', self.eq_fwd), ('eq_rev', self.eq_rev),
-                         ('gain', self.gain)):
+        # The slope window is NOT restored: it re-measures within the
+        # first launches, and a persisted one carried a superseded
+        # sampling rule's bias straight across a restart (09-01 21:11:
+        # 10.8 restored, the fix inert until the window aged out).
+        for key, win in (('eq_fwd', self.eq_fwd), ('eq_rev', self.eq_rev)):
             vals = d.get(key)
             if not isinstance(vals, list) or not all(
                     finite(v) and 0.0 < v < 1000.0 for v in vals):
@@ -1462,6 +1464,7 @@ class DriveScore:
     def __init__(self):
         self._errs = deque()          # (t, err^2) over commanded ticks
         self._cmds = deque()          # (t, |cmd|) same ticks
+        self._curv = deque()          # (t, achieved/commanded curvature)
         self._seg_dir = 0.0
         self._seg_t0 = None
         self._seg_peak = 0.0
@@ -1483,14 +1486,15 @@ class DriveScore:
         self._stamps.setdefault(name, deque()).append(t)
 
     def _prune(self, t):
-        for q in (self._errs, self._cmds):
+        for q in (self._errs, self._cmds, self._curv):
             while q and t - q[0][0] > self.WINDOW:
                 q.popleft()
         for q in self._stamps.values():
             while q and t - q[0] > self.RATE_WINDOW:
                 q.popleft()
 
-    def observe(self, t, cmd_v, v, stalled, cmd_min, gate, horizon):
+    def observe(self, t, cmd_v, v, stalled, cmd_min, gate, horizon,
+                cmd_w=0.0, psidot=0.0, kappa_max=0.0):
         """One tick. ``cmd_min`` is the command below which nothing is
         asked (stall_cmd_min), ``gate`` the motion gate (gate_d),
         ``horizon`` how long after reaching the command the launch
@@ -1516,6 +1520,12 @@ class DriveScore:
         err = cmd_v - v
         self._errs.append((t, err * err))
         self._cmds.append((t, c))
+        # steering: curvature achieved over curvature commanded, on real
+        # turns (a fifth of the envelope or more) while moving
+        if kappa_max > 0.0 and a > gate:
+            k_cmd = cmd_w / cmd_v
+            if abs(k_cmd) >= 0.2 * kappa_max:
+                self._curv.append((t, (psidot / v) / k_cmd))
         self._seg_peak = max(self._seg_peak, a)
         if self._launch is not None:
             L = self._launch
@@ -1562,6 +1572,14 @@ class DriveScore:
         mean = sum(c for _, c in self._cmds) / len(self._cmds)
         return r / mean if mean > 0.0 else None
 
+    @property
+    def curv_ratio(self):
+        """Median achieved/commanded curvature over the window, or None."""
+        if not self._curv:
+            return None
+        vals = sorted(r for _, r in self._curv)
+        return vals[len(vals) // 2]
+
     def per_minute(self, name):
         q = self._stamps.get(name)
         return len(q) if q else 0
@@ -1571,6 +1589,9 @@ class DriveScore:
         r, rel = self.err_rms, self.err_rel
         track = ('idle' if r is None
                  else f'err_rms={r:.3f} ({rel * 100:.0f}% of cmd)')
+        cr = self.curv_ratio
+        if cr is not None:
+            track += f' curv={cr:.2f}'
         if self.last_launch:
             over, t_r = self.last_launch
             launch = (f'last over={over:.2f}x reach={t_r:.1f}s '
@@ -1721,8 +1742,7 @@ class AdaptiveCore:
                                   absorber=1, gain_idx=(0,),
                                   min_count=p.ready_lon_samples)
         self.lon_bank.set_delay(p.lon_delay)
-        self._kappa_prev = 0.0
-        self._kappa_changed_t = None
+        self._kappa_hist = deque()   # (t, kappa_des) for the delayed trim
         self.odom_ok = True
         self._glitch_run = 0
         self._glitch_since = 0.0
@@ -2080,7 +2100,9 @@ class AdaptiveCore:
                 self.gate_d,
                 # the overshoot has peaked within a few actuation delays
                 # of reaching the command; three covers a 1 s vehicle
-                3.0 * (self.lon_bank.delay + self.policy.tau_d))
+                3.0 * (self.lon_bank.delay + self.policy.tau_d),
+                cmd_w=cmd_w, psidot=out.psidot,
+                kappa_max=self.envelope.max_curvature(self.model))
         return out
 
     def _step(self, t, x, y, psi, cmd_v, cmd_w, applied=None,
@@ -2588,8 +2610,12 @@ class AdaptiveCore:
                 # 21:00 drive (steps >= 3 sigma: 4.7). On a quiet sensor
                 # the floor is half the launch floor, the smallest wire
                 # that provably moves a car.
-                b_ref = (self.gain_probe.b0 or self._b0_ref
-                         or 2.0 * self.policy.prior_b0)
+                # the SMALLEST available gain scale, never the probe's own
+                # reading alone: a probe biased high shrank its own step
+                # and kept admitting the noise that biased it (09-01
+                # 21:11, 10.8 with the fix live)
+                b_ref = min(x for x in (self.gain_probe.b0, self._b0_ref,
+                                        2.0 * self.policy.prior_b0) if x)
                 step_min = max(0.5 * self.policy.launch_floor,
                                3.0 * math.sqrt(2.0) * sig_a / b_ref)
                 self.gain_probe.observe(self.now, sgn(v), d[1], self.vdot,
@@ -2866,25 +2892,34 @@ class AdaptiveCore:
         kappa_max = self.envelope.max_curvature(self.model, v_eff,
                                                 derate=False)
         kappa_des = clamp(cmd_w / v_eff, -kappa_max, kappa_max)
-        # A meaningful change in demanded curvature starts a settling window
-        # of one LEARNED delay plus the servo constant: during it the yaw
-        # error is transport delay, not trim, and integrating it is what had
-        # the trim pinned on 19-30% of every flight log.
-        if abs(kappa_des - self._kappa_prev) > p.iw_freeze_frac * kappa_max:
-            self._kappa_changed_t = self.now
-        self._kappa_prev = kappa_des
-        settling = (self._kappa_changed_t is not None
-                    and self.now - self._kappa_changed_t
-                    < self.lat_bank.delay + p.tau_s)
-        # psidot = v * kappa, so a yaw error converts to a curvature
-        # correction by dividing by SIGNED v. Dividing by |v| (as the original
-        # spec did) winds the trim the wrong way whenever the robot reverses:
-        # the steering correction inverts exactly while driving backward.
-        # Floored at the operating speed so the trim gain never exceeds
-        # ki_w / v_op (Policy.ki_w); v_op is at least |cmd_v|, so in normal
-        # driving this IS the divisor and the trim is a fixed-gain yaw-rate
-        # integrator -- which is what the typed 0.5 m/s floor had made it.
-        v_signed = sgn(v_eff) * max(abs(v_eff), self.v_op)
+        # The trim compares the yaw the car shows NOW with the curvature
+        # that was commanded one learned delay plus the servo constant
+        # AGO -- the command that caused it. That replaces the settling
+        # freeze (integrate nothing for a delay after a "meaningful" step):
+        # the follower's command jitters by more than the freeze
+        # threshold on 16% of ticks, which held the trim frozen 41% of
+        # the 09-01 21:00 drive, and the rest of the time it integrated
+        # an error that was transport delay.
+        L_lat = self.lat_bank.delay + p.tau_s
+        self._kappa_hist.append((self.now, kappa_des))
+        while self._kappa_hist \
+                and self.now - self._kappa_hist[0][0] > 2.0 * L_lat + 1.0:
+            self._kappa_hist.popleft()
+        kappa_delayed = None
+        for stamp, k in reversed(self._kappa_hist):
+            if stamp <= self.now - L_lat:
+                kappa_delayed = k
+                break
+        # ...and it is a CURVATURE error, psidot/v against kappa, not a
+        # yaw-rate error. The car ran 1.24x its commanded speed (median)
+        # while turning on 09-01: at perfect curvature that is 24% more
+        # yaw than commanded, and a yaw-rate trim wound the steering OUT
+        # on every overspeed launch -- the car ran wide on the very turns
+        # the planner drew at its minimum radius. Speed error is the
+        # throttle loop's problem; the steering's is curvature. Signed v,
+        # so the correction does not invert in reverse; weighted by
+        # |v| / v_op below the operating speed so the gain never exceeds
+        # ki_w (as the yaw-rate form's v_op floor did).
         # Standstill steering authority (applied below); computed here because
         # the anti-windup has to know what "saturated" means right now: a
         # command pinned at the standstill clamp is just as unable to act on
@@ -2896,10 +2931,13 @@ class AdaptiveCore:
         # log had it pinned 90% of the time, biasing every turn one way and
         # unwinding slowly when the demand flipped -- "all left, all right".
         saturated = abs(self.prev_us) >= 0.95 * lim
-        if not saturated and not settling and abs(v) > 0.5 * self.gate_d:
+        if not saturated and kappa_delayed is not None \
+                and abs(v) > 0.5 * self.gate_d:
+            kappa_meas = self.psidot / (sgn(v_eff) * abs(v))
+            weight = min(1.0, abs(v) / max(self.v_op, 1e-3))
             self.iw = clamp(
-                self.iw + self.ki_w * (cmd_w - self.psidot)
-                / v_signed * dt, -p.iw_max, p.iw_max)
+                self.iw + self.ki_w * weight * (kappa_delayed - kappa_meas)
+                * dt, -p.iw_max, p.iw_max)
         # Physically impossible coefficients are clamped HERE rather than in
         # the estimator: projecting every RLS update biases the fit, but a
         # wrong-signed coefficient must never reach an actuator.
