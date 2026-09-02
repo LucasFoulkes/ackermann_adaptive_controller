@@ -1412,6 +1412,170 @@ class GainProbe:
         return True
 
 
+class DriveScore:
+    """How well the car follows its commands -- the score a self-tuning
+    controller keeps of itself. A MONITOR only: nothing here feeds back
+    into control. Until 08-31 none of these numbers existed anywhere but
+    in offline reads of the flight log, so the node could limit-cycle
+    for six minutes without anything on /diagnostics changing.
+
+    Tracked at odometry rate over commanded ticks:
+
+      err_rms   RMS speed error over the last WINDOW seconds
+      launch    per start from rest: overshoot ratio (peak |v| over the
+                command within a few actuation delays of reaching it) and
+                time to reach the command; medians kept in a window
+      cycles    surge-stall events: |v| went beyond SURGE x the command
+                and then fell under STALL_FRAC x the command while the
+                command persisted -- the lunge signature, counted
+      stalls    stall-detector rising edges
+      events    named counters the node feeds (direction holds, glitch
+                holds, implausible episodes, dead-man trips, command
+                timeouts), each with a per-minute rate
+    """
+
+    # Risk constants, all about what counts as an event -- none shape
+    # the wire.
+    # One cusp segment on the 08-31 drives lasts 6-11 s: the tracking
+    # window is about one segment, so a bad segment shows and a good one
+    # clears it.
+    WINDOW = 10.0
+    RATE_WINDOW = 60.0      # per-minute rates
+    # 30% over the command is beyond anything a converged loop overshoots
+    # by; a third of the command is not following, it is stalling.
+    SURGE = 1.3
+    STALL_FRAC = 0.3
+    # A launch has "reached" the command at 80% of it: the last 20% is
+    # where the loop hands over from feedforward to trim.
+    REACHED = 0.8
+
+    def __init__(self):
+        self._errs = deque()          # (t, err^2) over commanded ticks
+        self._cmds = deque()          # (t, |cmd|) same ticks
+        self._seg_dir = 0.0
+        self._seg_t0 = None
+        self._seg_peak = 0.0
+        self._surged = False
+        self._launch = None           # dict while a launch is being scored
+        self.launches = 0
+        self.last_launch = None       # (overshoot, t_reach)
+        self.launch_over = _Window(3, span=4)
+        self.launch_time = _Window(3, span=4)
+        self.cycles = 0
+        self.stalls = 0
+        self._was_stalled = False
+        self._stamps = {'cycle': deque(), 'stall': deque()}
+        self.events = {}
+
+    def count(self, name, t):
+        """An externally observed event (see class note)."""
+        self.events[name] = self.events.get(name, 0) + 1
+        self._stamps.setdefault(name, deque()).append(t)
+
+    def _prune(self, t):
+        for q in (self._errs, self._cmds):
+            while q and t - q[0][0] > self.WINDOW:
+                q.popleft()
+        for q in self._stamps.values():
+            while q and t - q[0] > self.RATE_WINDOW:
+                q.popleft()
+
+    def observe(self, t, cmd_v, v, stalled, cmd_min, gate, horizon):
+        """One tick. ``cmd_min`` is the command below which nothing is
+        asked (stall_cmd_min), ``gate`` the motion gate (gate_d),
+        ``horizon`` how long after reaching the command the launch
+        overshoot may still peak (a few actuation delays)."""
+        self._prune(t)
+        d = sgn(cmd_v) if abs(cmd_v) > cmd_min else 0.0
+        a, c = abs(v), abs(cmd_v)
+        if d != self._seg_dir:
+            # a new commanded segment (from rest, or a reversal)
+            self._seg_dir = d
+            self._seg_t0 = t
+            self._seg_peak = 0.0
+            self._surged = False
+            self._close_launch()
+            if d and a < gate:
+                self._launch = {'t0': t, 'peak': 0.0, 'reached': None}
+        if stalled and not self._was_stalled:
+            self.stalls += 1
+            self._stamps['stall'].append(t)
+        self._was_stalled = bool(stalled)
+        if not d:
+            return
+        err = cmd_v - v
+        self._errs.append((t, err * err))
+        self._cmds.append((t, c))
+        self._seg_peak = max(self._seg_peak, a)
+        if self._launch is not None:
+            L = self._launch
+            L['peak'] = max(L['peak'], a)
+            if L['reached'] is None and a >= self.REACHED * c:
+                L['reached'] = t - L['t0']
+                L['cmd'] = c
+                L['until'] = t + horizon
+            elif L['reached'] is not None and t >= L['until']:
+                self._close_launch()
+        if a >= self.SURGE * c:
+            self._surged = True
+        elif self._surged and a < self.STALL_FRAC * c:
+            self._surged = False
+            self.cycles += 1
+            self._stamps['cycle'].append(t)
+
+    def _close_launch(self):
+        L, self._launch = self._launch, None
+        if L is None or L['reached'] is None:
+            return
+        over = L['peak'] / L['cmd'] if L['cmd'] > 0.0 else 0.0
+        self.launches += 1
+        self.last_launch = (over, L['reached'])
+        self.launch_over.add(over)
+        self.launch_time.add(L['reached'])
+
+    @property
+    def err_rms(self):
+        if not self._errs:
+            return None
+        return math.sqrt(sum(e for _, e in self._errs) / len(self._errs))
+
+    @property
+    def err_rel(self):
+        """RMS error as a fraction of the mean commanded speed."""
+        r = self.err_rms
+        if r is None or not self._cmds:
+            return None
+        mean = sum(c for _, c in self._cmds) / len(self._cmds)
+        return r / mean if mean > 0.0 else None
+
+    def per_minute(self, name):
+        q = self._stamps.get(name)
+        return len(q) if q else 0
+
+    def summary(self):
+        """Plain-text pairs for /diagnostics."""
+        r, rel = self.err_rms, self.err_rel
+        track = ('idle' if r is None
+                 else f'err_rms={r:.3f} ({rel * 100:.0f}% of cmd)')
+        if self.last_launch:
+            over, t_r = self.last_launch
+            launch = (f'last over={over:.2f}x reach={t_r:.1f}s '
+                      f'median over={self.launch_over.value:.2f}x '
+                      f'reach={self.launch_time.value:.1f}s n={self.launches}')
+        else:
+            launch = 'none yet'
+        ev = ' '.join(f'{k}={v}({self.per_minute(k)}/min)'
+                      for k, v in sorted(self.events.items()))
+        return {
+            'drive_score': (f'{track} cycles={self.cycles}'
+                            f'({self.per_minute("cycle")}/min) '
+                            f'stalls={self.stalls}'
+                            f'({self.per_minute("stall")}/min)'),
+            'launch': launch,
+            'events': ev or 'none',
+        }
+
+
 @dataclass
 class Output:
     """One control step's result."""
@@ -1574,6 +1738,12 @@ class AdaptiveCore:
         self._dir_since = None
         self.deadband = DeadBand(p)
         self.gain_probe = GainProbe(p)
+        self.score = DriveScore()
+        # odometry-health counters (see DriveScore.count): a glitch hold
+        # is a tick answered with the holding wire, an implausible
+        # episode a stream distrusted for odom_glitch_hold
+        self.n_glitch_holds = 0
+        self.n_implausible = 0
 
         # Launch/rolling latch for the breakaway kick, with hysteresis so
         # odometry noise cannot flicker it.
@@ -1886,6 +2056,21 @@ class AdaptiveCore:
 
     def step(self, t, x, y, psi, cmd_v, cmd_w, applied=None,
              v_meas=None, psidot_meas=None):
+        """One odometry sample in, one actuator command out (see _step).
+        Every path through it -- held, zeroed, published -- is scored."""
+        out = self._step(t, x, y, psi, cmd_v, cmd_w, applied=applied,
+                         v_meas=v_meas, psidot_meas=psidot_meas)
+        if self.phase == RUN:
+            self.score.observe(
+                t, cmd_v, out.v, out.stalled, self.stall_cmd_min,
+                self.gate_d,
+                # the overshoot has peaked within a few actuation delays
+                # of reaching the command; three covers a 1 s vehicle
+                3.0 * (self.lon_bank.delay + self.policy.tau_d))
+        return out
+
+    def _step(self, t, x, y, psi, cmd_v, cmd_w, applied=None,
+             v_meas=None, psidot_meas=None):
         """Advance one odometry sample. Returns an :class:`Output`.
 
         ``t`` is seconds from the odometry stamp; the whole loop is driven by
@@ -1972,9 +2157,14 @@ class AdaptiveCore:
                 self._sane_run = 0
                 if self._glitch_run == 0:
                     self._glitch_since = t
+                    self.n_glitch_holds += 1
+                    self.score.count('glitch', t)
                 self._glitch_run += 1
                 if self._glitch_run >= self.policy.odom_glitch_trip \
                         and t - self._glitch_since >= self.policy.odom_glitch_hold:
+                    if self.odom_ok:
+                        self.n_implausible += 1
+                        self.score.count('implausible', t)
                     self.odom_ok = False
                 if not self.odom_ok:
                     # Once the stream is distrusted, judge it on its own
@@ -3275,6 +3465,42 @@ class AdaptiveCore:
         m = self.model
         return lon_sane((m.b0, m.b1, m.b2, m.b3), self.vl_lo, self.vl_hi,
                         self.policy, self.speed_scale, self._breakaway_median())
+
+    def agreement(self):
+        """Do the independent estimators of the throttle plant agree?
+
+        The control law ranks them (probe, then the sane fit, then the
+        prior) and switches silently; their DISAGREEMENT is the earliest
+        sign that one has gone wrong -- every poisoned-model incident of
+        08-28..08-31 would have shown here first. Returns (ok, text):
+        ok is False when a plausible fit and the probe differ by more
+        than the factor-two trust band the divisor grants a measured
+        anchor.
+        """
+        m = self.model
+        pb, eq, brk = self.gain_probe.b0, self.gain_probe.eq(1.0), \
+            self.deadband.raw(1.0)
+        lon_ok = self.ready_lon and self.lon_plausible()
+        parts, ok = [], True
+        if pb and m.b0 > 0.0:
+            ratio = max(pb / m.b0, m.b0 / pb)
+            parts.append(f'b0 probe/fit {pb:.2f}/{m.b0:.2f} ({ratio:.1f}x)')
+            if lon_ok and ratio > 2.0:
+                ok = False
+        if eq is not None and m.b0 > 0.0:
+            ff = -(m.b1 + m.b3) / m.b0
+            parts.append(f'eq probe/fit {eq:.2f}/{ff:.2f}')
+            if lon_ok and eq > 0.0 and ff > 0.0 \
+                    and max(eq / ff, ff / eq) > 2.0:
+                ok = False
+        if brk is not None and m.b0 > 0.0 and m.b3 < 0.0:
+            parts.append(f'breakaway/fit {brk:.2f}/{-m.b3 / m.b0:.2f}')
+        source = ('model inverted' if lon_ok else
+                  'bootstrap: probe' if pb else 'bootstrap: prior')
+        text = source + (' | ' + ', '.join(parts) if parts else '')
+        if not ok:
+            text += ' | DISAGREE'
+        return ok, text
 
     def _breakaway_median(self):
         """The forward breakaway estimate (slow-start median, or the

@@ -261,7 +261,7 @@ class AckermannAdaptiveController(Node):
                       'qs,qd,us,ud,iw,iv,a0l,a0r,a0lr,a0rr,a1,a2,'
                       'b0,b1,b2,b3,breakaway,'
                       'ready_lon,ready_lat,stalled,blocked,fault,'
-                      'x,y,yaw\n')
+                      'x,y,yaw,probe_b0,probe_eq,err_rms,cycles\n')
             try:
                 os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
                 # Rotate a log whose columns no longer match, so one file
@@ -297,6 +297,8 @@ class AckermannAdaptiveController(Node):
         self.cmd_w = 0.0
         self.last_cmd_t = None
         self.last_odom_t = None
+        self._deadman_tripped = False
+        self._cmd_timed_out = False
         self.out_steer = 0.0
         self.out_drive = 0.0
 
@@ -417,6 +419,7 @@ class AckermannAdaptiveController(Node):
                     f'direction ({self.segment_dir:+d}); holding instead',
                     throttle_duration_sec=5.0)
                 self._dir_held = True
+                self.core.score.count('hold', self._now())
                 if self.pub_held is not None:
                     self.pub_held.publish(Bool(data=True))
             v, w = 0.0, 0.0
@@ -496,7 +499,10 @@ class AckermannAdaptiveController(Node):
                 f'{int(c.ready_lon)},{int(c.ready_lat)},'
                 f'{int(out.stalled)},{int(c.blocked)},'
                 f'{int(out.steering_fault)},'
-                f'{pose.position.x:.4f},{pose.position.y:.4f},{psi:.4f}\n')
+                f'{pose.position.x:.4f},{pose.position.y:.4f},{psi:.4f},'
+                f'{c.gain_probe.b0 or 0.0:.3f},'
+                f'{c.gain_probe.eq(1.0) or 0.0:.3f},'
+                f'{c.score.err_rms or 0.0:.3f},{c.score.cycles}\n')
 
         if out.steering_fault and not self._warned_fault:
             self.get_logger().error(
@@ -535,6 +541,9 @@ class AckermannAdaptiveController(Node):
         if not self.active or self.estopped:
             return
         if not self._odom_fresh() or not self._lidar_fresh():
+            if not self._deadman_tripped:
+                self._deadman_tripped = True
+                self.core.score.count('deadman', self._now())
             # Blind: stop. Either the control odometry stalled, or -- with
             # the EKF masking a LiDAR blackout by dead-reckoning off the
             # gyro -- the raw LiDAR odometry went stale while the fused
@@ -559,9 +568,16 @@ class AckermannAdaptiveController(Node):
             m.twist.covariance[35] = 2.5e-3  # vyaw
             self.pub_halt.publish(m)
             return
+        self._deadman_tripped = False
         if self.core.phase != CAL and not self._cmd_fresh():
+            if not self._cmd_timed_out and self.last_cmd_t is not None:
+                # a command stream that was flowing and stopped -- not
+                # the idle between goals, which never had one
+                self._cmd_timed_out = True
+                self.core.score.count('cmd_timeout', self._now())
             self._zero_burst()
             return
+        self._cmd_timed_out = False
         self.pub_steer.publish(Float32(data=float(self.out_steer)))
         self.pub_drive.publish(Float32(data=float(self.out_drive)))
 
@@ -892,6 +908,12 @@ class AckermannAdaptiveController(Node):
         else:
             status.level = DiagnosticStatus.OK
             status.message = 'ACTIVE' if self.active else 'PASSIVE'
+        agree_ok, agree_text = self.core.agreement()
+        if status.level == DiagnosticStatus.OK and not agree_ok:
+            # the estimators of the throttle plant disagree beyond the
+            # trust band: the earliest sign of a poisoned model
+            status.level = DiagnosticStatus.WARN
+            status.message += ' - throttle estimators disagree'
         pairs = {
             'phase': self.core.phase,
             'active': str(self.active),
@@ -929,6 +951,15 @@ class AckermannAdaptiveController(Node):
                 f'left={len(self.core.envelope.left.vals)} '
                 f'right={len(self.core.envelope.right.vals)}',
             'breakaway': f'{self.core.breakaway:.3f}',
+            # how well the car is following (DriveScore): tracking error,
+            # launch overshoot, surge-stall cycles, stalls, and the event
+            # counters with per-minute rates
+            **self.core.score.summary(),
+            # which estimator the throttle law is running on, and whether
+            # the independent ones agree (core.agreement)
+            'learning': agree_text,
+            'odom_health': (f'glitch_holds={self.core.n_glitch_holds} '
+                            f'implausible={self.core.n_implausible}'),
             # direct wire-to-acceleration measurement (GainProbe): the
             # loop divisor and measured-bootstrap source
             'gain_probe':

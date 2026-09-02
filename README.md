@@ -269,6 +269,36 @@ envelope. `/diagnostics` reports `deadband`.
   the prediction stays right but the split is arbitrary. A cruise teaches the
   learner much less than a varied run. The same applies to `a0`/`a2`.
 
+## What it reports about itself
+
+The controller keeps a score of its own driving (`core.DriveScore`), so
+"is it learning?" and "how well does it drive?" are answered by the
+node, not by a theory. On `/diagnostics` (1 Hz):
+
+| key | meaning |
+|---|---|
+| `drive_score` | RMS speed error over the last 10 s (and as a % of the command), surge-stall cycles (|v| beyond 1.3× the command then under 0.3× it — the lunge signature) and stalls, each with a per-minute rate |
+| `launch` | the last start from rest: peak/command overshoot and time to reach the command, plus running medians |
+| `events` | counters with per-minute rates: `hold` (direction handshake held a command), `glitch` (a tick answered with the holding wire), `implausible` (odometry distrusted), `deadman` (odometry or LiDAR stale, actuators zeroed), `cmd_timeout` (a flowing command stream stopped) |
+| `learning` | which estimator the throttle law runs on (`bootstrap: prior` → `bootstrap: probe` → `model inverted`) and whether the independent ones agree: probe b0 vs fitted b0, measured cruise wire vs the fit's, measured breakaway vs `b3/b0`. A plausible fit that differs from the probe by more than the factor-two trust band raises the status to WARN with `DISAGREE` — the earliest sign of a poisoned model |
+| `gain_probe`, `odom_health` | the direct measurements (b0, cruise wire per direction, sample counts) and the odometry counters |
+
+The flight recorder (`~/.ros/ackermann_flight.csv`, every odometry tick)
+carries the same numbers as columns, and the report tool scores any run
+from it, ROS-free:
+
+```bash
+ros2 run ackermann_adaptive_controller ackermann_flight_report        # last session
+python3 -m ackermann_adaptive_controller.flight_report --all          # every session
+```
+
+Per session: a one-line verdict (`smooth`, `rough: …`, `LUNGING: n cycles/min`),
+tracking error, launches with overshoot and time-to-command, cycles and
+stalls, then the model minute by minute (`b0 b1 b3`, breakaway, probe
+b0/eq, the four steering cells, readiness). The two from-zero runs of
+2026-08-31 both score LUNGING at 5–7 cycles/min with launches at 1.8–2.3×
+the command; that is the baseline the gain probe is measured against.
+
 ## Tests
 
 The mathematics is ROS-free and tested against a synthetic plant:

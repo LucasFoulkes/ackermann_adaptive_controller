@@ -33,6 +33,8 @@ setup(
         'console_scripts': [
             'ackermann_adaptive_controller = '
             'ackermann_adaptive_controller.node:main',
+            'ackermann_flight_report = '
+            'ackermann_adaptive_controller.flight_report:main',
         ],
     },
 )

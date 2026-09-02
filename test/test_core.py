@@ -3006,3 +3006,122 @@ def test_feedback_gain_is_anchored_to_the_last_sane_fit_not_the_prior():
     ref = fresh._b0_ref
     from ackermann_adaptive_controller.core import clamp
     assert clamp(0.11, 0.5 * ref, 2.0 * ref) == pytest.approx(2.32)
+
+
+# -- monitors: the score the controller keeps of itself ------------------------
+
+def test_drive_score_scores_a_clean_launch_and_cruise():
+    from ackermann_adaptive_controller.core import DriveScore
+    sc = DriveScore()
+    t = 0.0
+    # from rest, ramp to 0.3 in 1 s, mild 0.34 peak, then hold 0.30 long
+    # enough that the tracking window holds only cruise
+    for i in range(250):
+        t += 0.1
+        v = min(0.34, 0.34 * i / 10) if i < 14 else 0.30
+        sc.observe(t, 0.30, v, False, cmd_min=0.05, gate=0.05, horizon=2.0)
+    assert sc.launches == 1
+    over, reach = sc.last_launch
+    assert over == pytest.approx(0.34 / 0.30, abs=0.02)
+    assert 0.5 < reach < 1.2, reach
+    assert sc.cycles == 0 and sc.stalls == 0
+    assert sc.err_rms is not None and sc.err_rms < 0.02
+    assert 'cycles=0' in sc.summary()['drive_score']
+
+
+def test_drive_score_counts_surge_stall_cycles():
+    from ackermann_adaptive_controller.core import DriveScore
+    sc = DriveScore()
+    t = 0.0
+    # the 01:08 gait: 0.30 command, |v| swinging 0.05 <-> 0.5 every 1.7 s
+    for i in range(170):
+        t += 0.1
+        phase = (i % 17) / 17.0
+        v = 0.05 + 0.45 * math.sin(math.pi * phase)
+        sc.observe(t, 0.30, v, False, cmd_min=0.05, gate=0.05, horizon=2.0)
+    assert 8 <= sc.cycles <= 10, sc.cycles
+    assert sc.per_minute('cycle') >= 3
+    assert sc.err_rel is not None and sc.err_rel > 0.4
+    assert 'cycles=' in sc.summary()['drive_score']
+
+
+def test_drive_score_event_counters_and_rates():
+    from ackermann_adaptive_controller.core import DriveScore
+    sc = DriveScore()
+    for t_hold in (0.0, 10.0, 50.0):
+        sc.count('hold', t_hold)
+    sc.count('deadman', 100.0)
+    sc.observe(100.0, 0.0, 0.0, False, 0.05, 0.05, 2.0)   # prunes at t=100
+    assert sc.events == {'hold': 3, 'deadman': 1}      # totals never prune
+    assert sc.per_minute('hold') == 1          # only the one inside 60 s
+    assert 'deadman=1(1/min)' in sc.summary()['events']
+
+
+def test_score_is_fed_by_every_step_on_the_plant():
+    core = AdaptiveCore()
+    plant = Sticky(breakaway=0.26, b=(5.0, 0.0, -0.35))
+    plant.kinetic = 1.0
+    plant.delay = 0.45
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 30.0, t0=t)
+    assert core.score.launches >= 1
+    assert core.score.err_rms is not None
+    # the learned cruise: no surge-stall gait in the last window
+    assert core.score.per_minute('cycle') <= 1
+
+
+def test_agreement_flags_a_fit_the_probe_contradicts():
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    ok, text = core.agreement()
+    assert ok and text.startswith('bootstrap: prior'), text
+    for _ in range(core.policy.deadband_evidence):
+        core.gain_probe.gain.add(4.6)
+        core.gain_probe.eq_fwd.add(0.20)
+    ok, text = core.agreement()
+    assert ok and text.startswith('bootstrap: probe'), text
+    # a plausible, ready fit that says b0 0.63 against a probe of 4.6
+    core.rls_lon.theta = [0.63, 0.0, 0.0, -0.13]
+    core.rls_lon.count = 10_000
+    core.qd_lo, core.qd_hi = 0.0, 0.5
+    core.vl_lo, core.vl_hi = 0.1, 0.6
+    core.v_op = 0.32
+    assert core.ready_lon and core.lon_plausible()
+    ok, text = core.agreement()
+    assert not ok and 'DISAGREE' in text and '7.3x' in text, text
+
+
+def test_flight_report_scores_a_lunging_session(tmp_path):
+    from ackermann_adaptive_controller import flight_report as fr
+    header = ('stamp,phase,active,cmd_v,cmd_w,v,vdot,psidot,qs,qd,us,ud,iw,iv,'
+              'a0l,a0r,a0lr,a0rr,a1,a2,b0,b1,b2,b3,breakaway,ready_lon,'
+              'ready_lat,stalled,blocked,fault,x,y,yaw,probe_b0,probe_eq,'
+              'err_rms,cycles\n')
+    path = tmp_path / 'flight.csv'
+    with open(path, 'w') as fh:
+        fh.write(header)
+        t = 1000.0
+        # session 1: 60 s of the gait; session 2 (after a gap): a clean cruise
+        for i in range(600):
+            t += 0.1
+            v = 0.05 + 0.45 * math.sin(math.pi * ((i % 17) / 17.0))
+            fh.write(f'{t:.3f},RUN,1,0.30,0,{v:.3f},0,0,0,0,0,0.2,0,0,'
+                     f'2,2,2,2,0,0,0.63,0.15,0,0.28,0,1,1,0,0,0,0,0,0,'
+                     f'0,0,0.2,{i // 17}\n')
+        t += 300.0
+        for i in range(600):
+            t += 0.1
+            v = min(0.3, 0.3 * i / 10)
+            fh.write(f'{t:.3f},RUN,1,0.30,0,{v:.3f},0,0,0,0,0,0.2,0,0,'
+                     f'2,2,2,2,0,0,4.6,0,0,-0.9,0.26,1,1,0,0,0,0,0,0,'
+                     f'4.6,0.20,0.01,0\n')
+        fh.write('\x00\x00garbage\n')          # a power-cut hole
+    _, rows = fr.read_log(str(path))
+    ss = fr.sessions(rows)
+    assert len(ss) == 2
+    lunge, clean = (fr.score_session(s) for s in ss)
+    assert fr.verdict(lunge).startswith('LUNGING'), fr.verdict(lunge)
+    assert lunge['cycles'] >= 30
+    assert fr.verdict(clean) == 'smooth', fr.verdict(clean)
+    assert clean['launches'] == 1 and clean['minutes'][-1]['probe_b0'] == 4.6
+    assert fr.main([str(path), '--all']) == 0
