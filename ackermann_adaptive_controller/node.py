@@ -176,6 +176,15 @@ class AckermannAdaptiveController(Node):
             # The follower's approach speed, pushed as approach_speed_frac
             # x v_op (see Policy). Empty disables.
             ('approach_speed_param', 'FollowPath.min_approach_linear_velocity'),
+            # The goal checker's position tolerance, pushed as the car's
+            # MEASURED stopping distance at the approach speed: the wire
+            # is cut when the checker fires, the car keeps going for one
+            # learned delay plus the actuator constant, then stops on its
+            # own friction (b3). A typed 0.20 m had every cusp leg ending
+            # 0.17-0.20 m short of its turn point (09-02 leg log, 37
+            # legs, median 0.19). Never looser than the launch value.
+            ('goal_tolerance_param', 'goal_checker.xy_goal_tolerance'),
+            ('goal_tolerance_max', 0.20),
             ('collision_horizon_param',
              'FollowPath.max_allowed_time_to_collision_up_to_carrot'),
             # Direction of the single-direction segment the navigator handed
@@ -239,6 +248,9 @@ class AckermannAdaptiveController(Node):
         self.lookahead_max_ratio = float(g['lookahead_max_ratio'])
         self.approach_param = str(g['approach_speed_param'])
         self.pushed_approach = None
+        self.goal_tol_param = str(g['goal_tolerance_param'])
+        self.goal_tol_max = float(g['goal_tolerance_max'])
+        self.pushed_goal_tol = None
         self.collision_horizon_param = str(g['collision_horizon_param'])
         self.pushed_lookahead = None
         self.pushed_horizon = None
@@ -715,6 +727,20 @@ class AckermannAdaptiveController(Node):
             self.get_logger().info(
                 f'approach speed -> {v_ap:.2f} m/s ({self.follower_server})')
             self._set_remote(self.follower_server, self.approach_param, v_ap)
+        # Goal tolerance: the stopping distance from the approach speed.
+        c = self.core
+        if v_ap > 0.0 and self.follower_server and self.goal_tol_param \
+                and c.ready_lon and c.lon_plausible() and c.model.b3 < 0.0:
+            d_stop = (v_ap * (c.lon_bank.delay + c.policy.tau_d)
+                      + v_ap * v_ap / (2.0 * -c.model.b3))
+            tol = min(self.goal_tol_max, d_stop)
+            if self.pushed_goal_tol is None or \
+                    abs(tol - self.pushed_goal_tol) >= self.radius_rel * self.pushed_goal_tol:
+                self.pushed_goal_tol = tol
+                self.get_logger().info(
+                    f'goal tolerance -> {tol:.2f} m (stopping distance from '
+                    f'{v_ap:.2f} m/s; {self.follower_server})')
+                self._set_remote(self.follower_server, self.goal_tol_param, tol)
         # Collision projection horizon: learned, independent of the envelope.
         h = self.core.stop_horizon()
         if h is not None and self.follower_server and (
@@ -970,6 +996,10 @@ class AckermannAdaptiveController(Node):
                 f'left={len(self.core.envelope.left.vals)} '
                 f'right={len(self.core.envelope.right.vals)}',
             'breakaway': f'{self.core.breakaway:.3f}',
+            # per-cell steering trims (curvature, 1/m), persisting across legs
+            'trim': ' '.join(f'{k}={v:+.3f}'
+                             for k, v in sorted(self.core.trim_cells().items()))
+                    or 'none',
             # how well the car is following (DriveScore): tracking error,
             # launch overshoot, surge-stall cycles, stalls, and the event
             # counters with per-minute rates

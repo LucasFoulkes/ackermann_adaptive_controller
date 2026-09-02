@@ -1804,7 +1804,16 @@ class AdaptiveCore:
         self._cmd_hist = deque(maxlen=1024)
         # Sane raw speeds, for the held-speed span (see _held_speed).
         self._v_hist = deque(maxlen=1024)
-        self.iw = self.iv = 0.0
+        # Steering trim, ONE INTEGRATOR PER CELL (travel direction x
+        # steering side) that persists across stops and reversals. A single
+        # integrator zeroed at every zero command could never trim a
+        # per-cell bias out of a 3 s cusp leg: 09-02 17:33, the fit sat
+        # 10-23% above the measured gain in every cell, worst reverse-right
+        # (delivered 0.73 of the commanded curvature, at lock 49% of its
+        # time), and the trim restarted from nothing on every leg.
+        self._iw_cells = {}
+        self._iw_key = (1.0, 1.0)
+        self.iv = 0.0
         self.prev_us = self.prev_ud = 0.0
         # Last throttle actually put on the wire (after dead-band compensation),
         # its sign, and when that sign last came on (for the slow-start test).
@@ -1949,7 +1958,7 @@ class AdaptiveCore:
                 and self.now - self._roll_since
                 >= self.lon_bank.delay + self.policy.tau_d)
 
-    def _speed_up_limit(self, since):
+    def _speed_up_limit(self, since, v_new=None):
         """Largest plausible gain in |v| since the last accepted sample
         (``since`` seconds ago), or None while the launch transient is
         exempt. margin x b0 (prior-bounded) x the largest effective wire
@@ -1966,9 +1975,11 @@ class AdaptiveCore:
         noise = max(self.sigma_v, self.tick)
         if noise <= 0.0:
             return None     # no measured noise floor: no scale for "impossible"
-        direction = sgn(self.v_prev)
-        # From near rest anything can happen (stiction): no bound.
-        if not direction or abs(self.v_prev) < self.gate_d:
+        # Judged in the direction of the NEW sample: the wire that could
+        # have produced this speed is the wire pushing that way.
+        direction = (sgn(v_new) if v_new is not None else 0.0) \
+            or sgn(self.v_prev)
+        if not direction:
             return None
         window = self.now - (self.lon_bank.delay + p.tau_d) - since
         u_same = 0.0
@@ -1977,6 +1988,15 @@ class AdaptiveCore:
                 break
             u_same = max(u_same, ud * direction)
         u_eff = max(u_same - self.deadband.value(direction), 0.0)
+        # From near rest anything can happen (stiction release): no bound
+        # -- but only with a wire pushing THAT way to release it. Without
+        # the wire condition one plausible dip below the gate switched the
+        # bound off for the rest of the stream, and a +0.18 -> -0.49 m/s
+        # phantom on a car driving forward on 0.02 wire passed (bench,
+        # 09-02); a MOLA phantom of the "+0.10 while reversing" kind is
+        # exactly this shape.
+        if abs(self.v_prev) < self.gate_d and u_eff > 0.0:
+            return None
         b0 = clamp(self.rls_lon.theta[0], p.prior_b0, 2.0 * p.prior_b0)
         return p.odom_glitch_margin * b0 * u_eff * since + 5.0 * noise
 
@@ -2195,8 +2215,15 @@ class AdaptiveCore:
             # later sample failed against it -- a chain to a fault that only
             # the old 0.3 s trip had hidden (08-29 bench, 2 m/s cruise).
             since = max(t - self._v_prev_t, dt)
-            up_lim = self._speed_up_limit(since)
-            gained = abs(v) - abs(self.v_prev)
+            up_lim = self._speed_up_limit(since, v)
+            # A sign REVERSAL within one sample is a speed-up from zero in
+            # the new direction, not a slow-down: judged as the whole new
+            # speed. Without this a +0.26 -> -0.32 m/s reading on a car
+            # cruising forward on 0.02 wire passed the gate ("slowing down
+            # is free"), the reversing rule then zeroed the feedforward,
+            # and every held tick after it held zero (09-02 bench).
+            gained = (abs(v) - abs(self.v_prev)
+                      if sgn(v) == sgn(self.v_prev) else abs(v))
             if abs(v - self.v_prev) > a_lim * since or abs(psidot_raw) > w_lim \
                     or (up_lim is not None and gained > up_lim):
                 self._sane_run = 0
@@ -2930,14 +2957,22 @@ class AdaptiveCore:
         # the 09-01 21:00 drive, and the rest of the time it integrated
         # an error that was transport delay.
         L_lat = self.lat_bank.delay + p.tau_s
-        self._kappa_hist.append((self.now, kappa_des))
+        # the trim cell: travel direction by v_eff, steering side by the
+        # commanded curvature (straight keeps the last side)
+        self._iw_key = (sgn(v_eff) or 1.0,
+                        sgn(kappa_des) or self._iw_key[1])
+        self._kappa_hist.append((self.now, kappa_des, self._iw_key))
         while self._kappa_hist \
                 and self.now - self._kappa_hist[0][0] > 2.0 * L_lat + 1.0:
             self._kappa_hist.popleft()
         kappa_delayed = None
-        for stamp, k in reversed(self._kappa_hist):
+        for stamp, k, key in reversed(self._kappa_hist):
             if stamp <= self.now - L_lat:
-                kappa_delayed = k
+                # ...and from the SAME cell: for one delay after a moving
+                # reversal the yaw still answers the previous leg's
+                # command, which would be integrated into the new cell
+                if key == self._iw_key:
+                    kappa_delayed = k
                 break
         # ...and it is a CURVATURE error, psidot/v against kappa, not a
         # yaw-rate error. The car ran 1.24x its commanded speed (median)
@@ -3321,7 +3356,8 @@ class AdaptiveCore:
         # A zero speed command means stop, not "servo to zero speed".
         if cmd_v == 0.0 and cmd_w == 0.0:
             self.iv = 0.0
-            self.iw = 0.0
+            # the steering trim is NOT zeroed: it is per cell and persists
+            # (see reset)
             return 0.0, 0.0
         return us, ud
 
@@ -3598,6 +3634,20 @@ class AdaptiveCore:
             text += ' | DISAGREE'
         return ok, text
 
+    @property
+    def iw(self):
+        """The steering trim of the active cell (see reset)."""
+        return self._iw_cells.get(self._iw_key, 0.0)
+
+    @iw.setter
+    def iw(self, value):
+        self._iw_cells[self._iw_key] = value
+
+    def trim_cells(self):
+        """All four trims, keyed 'fwd_left' etc., for diagnostics/state."""
+        return {f"{'fwd' if d > 0 else 'rev'}_{'left' if sd > 0 else 'right'}": v
+                for (d, sd), v in self._iw_cells.items()}
+
     def _breakaway_median(self):
         """The forward breakaway estimate (slow-start median, or the
         smallest fast-start upper bound), or None."""
@@ -3646,6 +3696,7 @@ class AdaptiveCore:
             },
             'deadband': self.deadband.state(),
             'gain_probe': self.gain_probe.state(),
+            'trim': self.trim_cells(),
             'sigma_v': self.sigma_v,
             'tick': self.tick,
             # The scale every speed-shaped gate is a fraction of. Restored
@@ -3712,6 +3763,19 @@ class AdaptiveCore:
             # Optional likewise: the direct gain measurement.
             if 'gain_probe' in d and not self.gain_probe.load(d['gain_probe']):
                 return False
+            # Optional: the per-cell steering trims (bounded like live ones)
+            trim = d.get('trim')
+            if isinstance(trim, dict):
+                for key, val in trim.items():
+                    try:
+                        dname, sname = key.split('_')
+                        cell = (1.0 if dname == 'fwd' else -1.0,
+                                1.0 if sname == 'left' else -1.0)
+                    except ValueError:
+                        continue
+                    if finite(val):
+                        self._iw_cells[cell] = clamp(float(val), -p.iw_max,
+                                                     p.iw_max)
         else:
             n_lat = n_lon = 0
             qd = vl = qs = (None, None)

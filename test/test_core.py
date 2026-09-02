@@ -3232,3 +3232,57 @@ def test_delay_candidates_never_look_back_before_the_wheels_turned():
         _, t = drive(core, plant, lambda s: (0.0, 0.0), 2.0, t0=t)
         plant.v = 0.0
     assert core.lon_bank.delay <= 2.0 * max(d0, plant.delay), core.lon_bank.delay
+
+
+# -- 09-02 17:33: the trim restarted from nothing on every leg ----------------
+
+def test_steering_trim_is_per_cell_and_survives_stops_and_reversals():
+    """Reverse-right delivered 0.73 of the commanded curvature with the
+    servo at lock half the time, and a single trim integrator zeroed at
+    every zero command could never carry a correction across 3 s cusp
+    legs. One integrator per (travel direction x steering side), kept."""
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.v_op = 0.30
+    core.lat_bank.set_delay(0.3)
+    t = core.now
+
+    def sgn(x):
+        return 1.0 if x > 0 else -1.0 if x < 0 else 0.0
+
+    def run(v, kappa, ticks, short=1.0):
+        nonlocal t
+        for i in range(ticks):
+            t += 0.1
+            core.now = t
+            core.v = core.v_fb = v
+            core.rolling = True
+            # the car delivers `short` of the commanded curvature, one
+            # delay late
+            core.psidot = short * kappa * v if i >= 5 else 0.0
+            core._run(v, 0.30 * sgn(v), kappa * 0.30 * sgn(v), 0.1)
+
+    run(-0.30, -1.0, 60, short=0.7)          # reverse, steering right, weak
+    rev_right = core.iw
+    # wound toward MORE steering: the commanded curvature is negative, so
+    # the trim that adds to it is negative too
+    assert rev_right < -0.05, rev_right
+    # a stop (zero command, seconds long as at a cusp) must not erase it
+    for _ in range(30):
+        t += 0.1
+        core.now = t
+        core.v = core.v_fb = 0.0
+        core.rolling = False
+        core._run(0.0, 0.0, 0.0, 0.1)
+    run(0.30, 1.0, 60, short=1.0)            # forward-left, accurate: no trim
+    assert abs(core.iw) < 0.02, core.iw
+    cells = core.trim_cells()
+    assert cells['rev_right'] == pytest.approx(rev_right)
+    assert abs(cells.get('fwd_left', 0.0)) < 0.02
+    # back in reverse-right the trim is still there
+    run(-0.30, -1.0, 6, short=0.7)
+    assert core.iw <= rev_right * 0.9, (core.iw, rev_right)
+    # and it rides in the state file
+    fresh = AdaptiveCore()
+    assert fresh.load_state(core.state())
+    assert fresh.trim_cells()['rev_right'] == pytest.approx(core.trim_cells()['rev_right'])
