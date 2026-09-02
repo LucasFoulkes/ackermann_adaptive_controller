@@ -91,9 +91,9 @@ def score_session(s, cmd_min=0.05, gate=0.05):
             continue
         a, c = abs(v[i]), abs(cmd[i])
         seg['peak'] = max(seg['peak'], a)
+        seg['cmd'] = max(seg.get('cmd', 0.0), c)   # largest command seen
         if seg['from_rest'] and seg['reached'] is None and a >= REACHED * c:
             seg['reached'] = s[i]['stamp'] - s[seg['i0']]['stamp']
-            seg['cmd'] = c
         if a >= SURGE * c:
             surged = True
         elif surged and a < STALL_FRAC * c:

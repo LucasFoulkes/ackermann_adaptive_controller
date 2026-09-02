@@ -1342,17 +1342,24 @@ class GainProbe:
 
     @property
     def b0(self):
-        """Median measured wire gain (m/s^2 per wire), or None."""
-        return self.gain.value if self.gain.confirmed else None
+        """Median measured wire gain (m/s^2 per wire), or None -- also
+        None while the median itself is not positive (a car does not
+        slow under throttle; a window that says so is noise)."""
+        if not self.gain.confirmed:
+            return None
+        b = self.gain.value
+        return b if b > 0.0 else None
 
-    def observe(self, t, direction, ud_delayed, vdot, dt, at_eq):
+    def observe(self, t, direction, ud_delayed, vdot, dt, at_eq, step_min):
         """One rolling, settled, physics-plausible tick.
 
         ``ud_delayed`` is what the wire carried one estimated transport
         delay ago; the first-order lag below turns it into the actuator
         state the plant is actually responding to, so a mid-ramp tick
         pairs the acceleration with the torque that caused it rather
-        than with a command still in flight.
+        than with a command still in flight. ``step_min`` is the
+        smallest actuator step a slope may be taken over -- the caller
+        sizes it from the measured acceleration noise (see _learn).
         """
         p = self.p
         if self._t is not None and t - self._t > 3.0 * dt:
@@ -1380,15 +1387,18 @@ class GainProbe:
         if pair is None:
             return
         _pt, pq, pv = pair
-        # Below half the launch floor (the smallest wire that provably
-        # moves a car) the slope's denominator is mostly noise.
-        if abs(q - pq) < 0.5 * p.launch_floor:
+        if abs(q - pq) < step_min:
             return
         b = (vdot - pv) / (q - pq)
         if b > 0.0:
-            # a negative slope is a mis-paired transient (a stiction
-            # release, an odometry wobble), not a car that slows under
-            # throttle
+            # a negative slope is noise or a mis-paired transient (a
+            # stiction release, an odometry wobble), not a car that slows
+            # under throttle. Keeping only the positive half biases the
+            # median HIGH under noise -- the safe direction: a divisor
+            # too large answers slowly, one too small multiplies the loop
+            # (signed medians sat near zero on a noisy bench and ran a
+            # 2 m/s vehicle unstable). The noise-scaled step_min is what
+            # keeps the bias small (09-01 drive: 5.6 vs 4.7 true).
             self.gain.add(b)
 
     def state(self):
@@ -1510,9 +1520,13 @@ class DriveScore:
         if self._launch is not None:
             L = self._launch
             L['peak'] = max(L['peak'], a)
+            # the follower ramps its command up from a fraction; the
+            # overshoot is judged against the LARGEST command the launch
+            # window saw, not the one first reached (a 0.6 m/s peak on a
+            # 0.07 opening command scored 8x on the 09-01 drive)
+            L['cmd'] = max(L.get('cmd', 0.0), c)
             if L['reached'] is None and a >= self.REACHED * c:
                 L['reached'] = t - L['t0']
-                L['cmd'] = c
                 L['until'] = t + horizon
             elif L['reached'] is not None and t >= L['until']:
                 self._close_launch()
@@ -2563,8 +2577,23 @@ class AdaptiveCore:
                 at_eq = (self._calm_since is not None
                          and self.now - self._calm_since
                          >= self.policy.tau_d)
+                # The smallest actuator step a slope may be taken over:
+                # the plant's response to it must clear the acceleration
+                # noise (three sigma, on the difference of two samples),
+                # at the current gain scale. Any smaller step is a step
+                # the LOOP made in reaction to a noise wobble in the
+                # speed, and the pair is then correlated by the
+                # controller, not the plant -- closed-loop bias, which
+                # read this car's b0 as 9.9 against 4.6 on the 09-01
+                # 21:00 drive (steps >= 3 sigma: 4.7). On a quiet sensor
+                # the floor is half the launch floor, the smallest wire
+                # that provably moves a car.
+                b_ref = (self.gain_probe.b0 or self._b0_ref
+                         or 2.0 * self.policy.prior_b0)
+                step_min = max(0.5 * self.policy.launch_floor,
+                               3.0 * math.sqrt(2.0) * sig_a / b_ref)
                 self.gain_probe.observe(self.now, sgn(v), d[1], self.vdot,
-                                        self.dt, at_eq)
+                                        self.dt, at_eq, step_min)
         if settled and in_regime and abs(self.vdot) < a_gate \
                 and abs(v) > self.gate_d:
             def phi_lon(delay):

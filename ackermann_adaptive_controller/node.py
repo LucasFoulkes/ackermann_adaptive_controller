@@ -570,9 +570,12 @@ class AckermannAdaptiveController(Node):
             return
         self._deadman_tripped = False
         if self.core.phase != CAL and not self._cmd_fresh():
-            if not self._cmd_timed_out and self.last_cmd_t is not None:
-                # a command stream that was flowing and stopped -- not
-                # the idle between goals, which never had one
+            if not self._cmd_timed_out and self.last_cmd_t is not None \
+                    and (self.cmd_v != 0.0 or self.cmd_w != 0.0):
+                # a command stream that died MID-MOTION (its last message
+                # was still asking for speed) -- not the normal end of a
+                # segment, where the follower stops publishing after a
+                # zero (21 of those per 4 min on the 09-01 drive)
                 self._cmd_timed_out = True
                 self.core.score.count('cmd_timeout', self._now())
             self._zero_burst()
