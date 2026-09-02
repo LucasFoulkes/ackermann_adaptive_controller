@@ -77,7 +77,7 @@ POLICY_PARAMS = (
     'delay_switch_margin',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
     'odom_glitch_hold',
-    'authority_floor', 'learn_overspeed_ratio',
+    'authority_floor', 'learn_overspeed_ratio', 'approach_speed_frac',
 )
 _DEFAULTS = Policy()
 
@@ -173,6 +173,9 @@ class AckermannAdaptiveController(Node):
             ('lookahead_min_param', 'FollowPath.min_lookahead_dist'),
             ('lookahead_max_param', 'FollowPath.max_lookahead_dist'),
             ('lookahead_max_ratio', 2.0),
+            # The follower's approach speed, pushed as approach_speed_frac
+            # x v_op (see Policy). Empty disables.
+            ('approach_speed_param', 'FollowPath.min_approach_linear_velocity'),
             ('collision_horizon_param',
              'FollowPath.max_allowed_time_to_collision_up_to_carrot'),
             # Direction of the single-direction segment the navigator handed
@@ -234,6 +237,8 @@ class AckermannAdaptiveController(Node):
         self.lookahead_min_param = str(g['lookahead_min_param'])
         self.lookahead_max_param = str(g['lookahead_max_param'])
         self.lookahead_max_ratio = float(g['lookahead_max_ratio'])
+        self.approach_param = str(g['approach_speed_param'])
+        self.pushed_approach = None
         self.collision_horizon_param = str(g['collision_horizon_param'])
         self.pushed_lookahead = None
         self.pushed_horizon = None
@@ -699,6 +704,17 @@ class AckermannAdaptiveController(Node):
             else:
                 self.lookahead_filt += self.radius_alpha * (
                     raw_fwd - self.lookahead_filt)
+        # Approach speed: a fraction of the learned operating speed (see
+        # Policy.approach_speed_frac), so the last stretch of a leg is not
+        # crawled in the stall zone.
+        v_ap = self.core.policy.approach_speed_frac * self.core.v_op
+        if v_ap > 0.0 and self.follower_server and self.approach_param and (
+                self.pushed_approach is None
+                or abs(v_ap - self.pushed_approach) >= self.radius_rel * self.pushed_approach):
+            self.pushed_approach = v_ap
+            self.get_logger().info(
+                f'approach speed -> {v_ap:.2f} m/s ({self.follower_server})')
+            self._set_remote(self.follower_server, self.approach_param, v_ap)
         # Collision projection horizon: learned, independent of the envelope.
         h = self.core.stop_horizon()
         if h is not None and self.follower_server and (

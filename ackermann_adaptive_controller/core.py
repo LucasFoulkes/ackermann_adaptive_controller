@@ -555,6 +555,15 @@ class Policy:
     # lower this; it stays a risk constant, not a vehicle property.
     authority_floor: float = 1.0
 
+    # The follower's approach speed for the last stretch of every leg,
+    # pushed to Nav2 as a fraction of the learned operating speed. It was
+    # typed (min_approach_linear_velocity 0.15) and sat in this car's
+    # stall-attraction zone: 5 stalls in 9 min on 09-02 00:54, all at leg
+    # ends. Below ~0.6 of v_op the car sits between breakaway and cruise
+    # (08-29: stall attraction under ~0.3 m/s at v_op 0.32); a fraction
+    # rather than a speed so a crawler and a fast car get the same rule.
+    approach_speed_frac: float = 0.6
+
     # Samples faster than this multiple of the operating speed do not
     # teach: they are lunges or scan-matcher excursions, not the regime
     # the model is inverted in. (Control is deliberately NOT gated on it;
