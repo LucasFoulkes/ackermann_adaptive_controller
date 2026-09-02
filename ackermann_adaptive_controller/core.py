@@ -1987,15 +1987,26 @@ class AdaptiveCore:
             if stamp < window:
                 break
             u_same = max(u_same, ud * direction)
-        u_eff = max(u_same - self.deadband.value(direction), 0.0)
+        reversal = (v_new is not None and sgn(v_new)
+                    and sgn(v_new) != sgn(self.v_prev) and self.v_prev != 0.0)
+        # The torque-producing wire: beyond the dead band for a speed-up
+        # in the direction of travel; the RAW wire for a reversal, because
+        # braking on an H-bridge is retarding torque from the first count
+        # (see DeadBand.compensate) -- subtracting the band there bounded
+        # a braking cusp reversal at five sigma while the reverse wire
+        # was still ramping, held honest -0.15 m/s readings, and zeroed
+        # the outputs mid-cusp: 3 implausible episodes, 11 holds, 8
+        # stalled legs in 45 s (09-02 18:00).
+        u_eff = u_same if reversal \
+            else max(u_same - self.deadband.value(direction), 0.0)
         # From near rest anything can happen (stiction release): no bound
-        # -- but only with a wire pushing THAT way to release it. Without
-        # the wire condition one plausible dip below the gate switched the
+        # -- but only with SOME wire that way to release it. Without the
+        # wire condition one plausible dip below the gate switched the
         # bound off for the rest of the stream, and a +0.18 -> -0.49 m/s
         # phantom on a car driving forward on 0.02 wire passed (bench,
         # 09-02); a MOLA phantom of the "+0.10 while reversing" kind is
-        # exactly this shape.
-        if abs(self.v_prev) < self.gate_d and u_eff > 0.0:
+        # exactly this shape. Parked with no wire, the bound stays.
+        if abs(self.v_prev) < self.gate_d and u_same > 0.0:
             return None
         b0 = clamp(self.rls_lon.theta[0], p.prior_b0, 2.0 * p.prior_b0)
         return p.odom_glitch_margin * b0 * u_eff * since + 5.0 * noise
@@ -2298,7 +2309,15 @@ class AdaptiveCore:
             # at 10 Hz) latched "rolling" on noise -- which suppressed the
             # launch floor, silenced the stall detector, and left the robot
             # shivering at a standstill it believed was motion.
-            if abs(self.v_fast) > 0.6 * self.gate_d:
+            # ...and only with a wire on or a command asking: a car does
+            # not start rolling by itself. Parked for 20 min on 09-02
+            # 17:38 the LiDAR odometry read 0.14-0.23 m/s on 1.6% of ticks
+            # (the car moved 6 cm), the latch fired on them, and the
+            # throttle fit took 118 "zero wire, half a g" samples: b0
+            # 4.67 -> -3.56 before the sanity gate threw it out.
+            driven = (abs(cmd_v) > self.stall_cmd_min
+                      or (self._cmd_hist and self._cmd_hist[-1][2] != 0.0))
+            if abs(self.v_fast) > 0.6 * self.gate_d and driven:
                 self._roll_run += 1
             else:
                 self._roll_run = 0
@@ -2878,11 +2897,11 @@ class AdaptiveCore:
 
         Ranked by how directly the number was measured:
 
-        1. The gain probe's live wire-to-acceleration quotient -- a direct
-           measurement of the plant as it is right now.
-        2. The last fitted b0 that passed every sanity gate (persisted or
-           restored) -- vetted, but a fit, and possibly from another
-           battery or floor.
+        1. The last fitted b0 that passed every sanity gate (persisted or
+           restored) -- vetted.
+        2. The gain probe's live wire-to-acceleration slope -- a direct
+           measurement, but on this sensor it has twice read 2-3x high
+           while its window filled (closed-loop bias, 09-01/02).
         3. Nothing measured yet: TWICE the declared prior, the top of the
            same factor-two band a measured anchor is granted. kp is
            derived to put the loop at half its delay margin when this
@@ -2898,7 +2917,13 @@ class AdaptiveCore:
         junk INTO the band still dragged the divisor to its floor).
         """
         p = self.policy
-        ref = self.gain_probe.b0 or self._b0_ref
+        # The sanity-gated fit outranks the probe once it exists: on this
+        # sensor the probe has read 9.9 and 11.2 against a trace of ~4.6
+        # at the start of two drives (closed-loop bias while its window
+        # fills), while the vetted fit sat at 4.3-4.7 -- and a divisor
+        # twice too large merely answers slowly, but the point of the
+        # anchor is to be the number that has passed every gate.
+        ref = self._b0_ref or self.gain_probe.b0
         if not ref:
             return 2.0 * p.prior_b0
         if lon_ok:

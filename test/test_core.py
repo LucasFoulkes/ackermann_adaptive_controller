@@ -603,13 +603,8 @@ def test_learning_from_own_output_would_be_wrong_when_someone_else_drives():
             plant.step(us, 0.55, 0.02)
         x, y, psi = plant.observe()
         core.step(t, x, y, psi, 0.0, 0.0)      # no applied -> wrong regressor
-    # samples were accepted, so this is not simply "nothing ran"
-    assert core.model.n_lat > 100 and core.model.n_lon > 100
-    # ...yet neither gain moved off its prior, because qs and qd stayed zero
-    assert core.model.a0 == pytest.approx(prior_a0, abs=1e-9)
-    assert core.model.b0 == pytest.approx(prior_b0, abs=1e-9)
-    # and the throttle bias absorbed motion it did not cause
-    assert abs(core.model.b1 - plant.b1) > 0.5
+    # ...and nothing was dumped into the bias terms either
+    assert core.model.b1 == 0.0 and core.model.a1 == 0.0
     assert not core.envelope.confirmed
 
 
@@ -3286,3 +3281,53 @@ def test_steering_trim_is_per_cell_and_survives_stops_and_reversals():
     fresh = AdaptiveCore()
     assert fresh.load_state(core.state())
     assert fresh.trim_cells()['rev_right'] == pytest.approx(core.trim_cells()['rev_right'])
+
+
+# -- 09-02 17:38: parked for 20 min, the odometry taught the throttle fit ------
+
+def test_a_parked_car_does_not_latch_rolling_or_learn_on_odometry_jitter():
+    """Wire 0, command 0, 20 minutes: LiDAR odometry jitter of up to 0.23
+    m/s on 1.6% of ticks latched `rolling` and fed the throttle fit 118
+    samples of "zero wire, half a g". A car does not start rolling by
+    itself: no wire and no command, no latch, no sample."""
+    import random
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 20.0, t0=t)   # a real drive first
+    _, t = drive(core, plant, lambda s: (0.0, 0.0), 3.0, t0=t)
+    plant.v = 0.0
+    n0 = core.model.n_lon
+    b0 = core.model.b0
+    rng = random.Random(3)
+    x, y, psi = plant.observe()
+    for i in range(1200):                    # 2 minutes parked, jittering
+        t += 0.1
+        j = 0.02 if rng.random() < 0.05 else 0.002   # 5% of ticks jump 2 cm
+        core.step(t, x + rng.uniform(-j, j), y + rng.uniform(-j, j),
+                  psi + rng.uniform(-0.01, 0.01), 0.0, 0.0)
+    assert not core.rolling
+    assert core.model.n_lon == n0, (n0, core.model.n_lon)
+    assert core.model.b0 == pytest.approx(b0)
+
+
+def test_a_braking_cusp_reversal_is_not_a_glitch():
+    """Braking through zero into reverse under a small, still-ramping
+    reverse wire: the readings crossing zero are honest. Bounding them
+    by the wire beyond the dead band (zero while ramping) held them,
+    chained to an implausible stream and zeroed the outputs mid-cusp
+    (09-02 18:00, 8 stalled legs)."""
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.kinetic = 0.3
+    t = settle_sense(core, plant)
+    for _ in range(core.policy.deadband_evidence):     # a known dead band
+        core.deadband.observe(1.0, 0.22)
+        core.deadband.observe(-1.0, 0.22)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 15.0, t0=t)
+    held_before = core.n_glitch_holds
+    # the follower flips to reverse; the car brakes through zero
+    _, t = drive(core, plant, lambda s: (-0.30, 0.0), 6.0, t0=t)
+    assert plant.v < -0.15, plant.v                      # it reversed
+    assert core.odom_ok
+    assert core.n_glitch_holds - held_before <= 1, core.n_glitch_holds - held_before
