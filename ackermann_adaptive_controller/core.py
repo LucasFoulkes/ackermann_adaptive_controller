@@ -2632,6 +2632,18 @@ class AdaptiveCore:
         if settled and in_regime and abs(self.vdot) < a_gate \
                 and abs(v) > self.gate_d:
             def phi_lon(delay):
+                # A candidate whose regressor reaches back BEFORE the
+                # wheels turned pairs this acceleration with the launch
+                # ramp -- wire that produced no motion (stiction), not
+                # gain. On a stop-go drive every launch then correlates
+                # best at "delay = time since the ramp", and the bank
+                # switched 0.30 -> 1.01 s fourteen seconds into the 09-02
+                # 01:18 drive (kp halved, the fit inverted to b0 -2.4).
+                # The settling gate excludes the SAMPLE times; this
+                # excludes the candidate's LOOKBACK.
+                if self._roll_since is not None \
+                        and self.now - delay < self._roll_since:
+                    return None
                 d = self._delayed_cmd(delay)
                 if d is None:
                     return None
@@ -2656,6 +2668,9 @@ class AdaptiveCore:
                 if self._lon_corr is None:
                     self._lon_corr = [0.0] * len(self.lon_bank.delays)
                 for k, dk in enumerate(self.lon_bank.delays):
+                    if self._roll_since is not None \
+                            and self.now - dk < self._roll_since:
+                        continue            # same lookback rule as phi_lon
                     dd = self._delayed_cmd(dk)
                     if dd is not None:
                         self._lon_corr[k] += dd[1] * self.vdot
@@ -2687,6 +2702,11 @@ class AdaptiveCore:
                 else v
             kappa = self.psidot / v_k
             def phi_lat(delay):
+                # NO lookback guard here (unlike phi_lon): the lateral
+                # transient gate re-arms at every heading reversal, and a
+                # guard keyed to it starved the long candidates on the
+                # 1 s-delay bench vehicle (peak 1.52 -> 0.68 s). The
+                # steering command has no stiction ramp to mis-pair with.
                 d = self._delayed_cmd(delay)
                 if d is None:
                     return None
