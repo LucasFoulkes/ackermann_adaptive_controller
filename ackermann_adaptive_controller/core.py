@@ -2629,7 +2629,8 @@ class AdaptiveCore:
         # 01:08). The physics bound (a_gate) still applies: an ICP jump is
         # not a transient. `settled` too: a stiction release is energy the
         # wire did not put in, for the probe as for the fit.
-        if settled and abs(v) > self.gate_d and abs(self.vdot) < a_gate:
+        if settled and abs(v) > self.gate_d and abs(self.vdot) < a_gate \
+                and not (self._stall_since is not None or self.blocked):
             d = self._delayed_cmd(self.lon_bank.delay)
             if d is not None:
                 # "Holding a speed" judged against the measurement noise
@@ -2675,7 +2676,15 @@ class AdaptiveCore:
                                3.0 * math.sqrt(2.0) * sig_a / b_ref)
                 self.gain_probe.observe(self.now, sgn(v), d[1], self.vdot,
                                         self.dt, at_eq, step_min)
-        if settled and in_regime and abs(self.vdot) < a_gate \
+        # A STUCK car teaches nothing: wire on, no motion is the stall
+        # detector's territory (a wall, a low obstacle the LiDAR cannot
+        # see, a wheel against a box), and with `rolling` kept latched by
+        # the jerks of pushing, those "0.6 wire, zero acceleration" ticks
+        # were settled, in-regime samples -- b0 3.1 and a throttle delay
+        # of 1.52 s learned in the 09-02 22:50 stuck episode (the
+        # regressor reaching 1.5 s back into the push).
+        stuck = self._stall_since is not None or self.blocked
+        if settled and in_regime and not stuck and abs(self.vdot) < a_gate \
                 and abs(v) > self.gate_d:
             def phi_lon(delay):
                 # A candidate whose regressor reaches back BEFORE the

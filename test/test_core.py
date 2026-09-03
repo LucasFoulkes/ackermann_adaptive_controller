@@ -3331,3 +3331,34 @@ def test_a_braking_cusp_reversal_is_not_a_glitch():
     assert plant.v < -0.15, plant.v                      # it reversed
     assert core.odom_ok
     assert core.n_glitch_holds - held_before <= 1, core.n_glitch_holds - held_before
+
+
+# -- 09-02 22:50: a car pushing against something it cannot see ---------------
+
+def test_a_stuck_car_teaches_the_throttle_learner_nothing():
+    """Wire ramping to the ceiling against a wall, odometry jittering:
+    the stall detector owns those ticks. Before this the jerks kept
+    `rolling` latched and the throttle fit and delay bank took "0.6 wire,
+    zero acceleration" as settled cruise (b0 3.1, delay 1.52 s learned
+    in one stuck minute)."""
+    import random
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (0.30, 0.0), 20.0, t0=t)   # a real drive first
+    n0, d0 = core.model.n_lon, core.lon_bank.delay
+    b0 = core.model.b0
+    plant.b0 = 0.0                       # against a wall from here on
+    plant.b1 = 0.0
+    plant.v = 0.0
+    rng = random.Random(5)
+    x, y, psi = plant.observe()
+    for _ in range(600):                 # a stuck minute, commanding 0.32
+        t += 0.1
+        j = 0.03 if rng.random() < 0.1 else 0.002
+        core.step(t, x + rng.uniform(-j, j), y + rng.uniform(-j, j),
+                  psi + rng.uniform(-0.01, 0.01), 0.32, 0.0)
+    # a couple of ticks may land before the stall detector arms
+    assert core.model.n_lon <= n0 + 5, (n0, core.model.n_lon)
+    assert core.lon_bank.delay == d0
+    assert core.model.b0 == pytest.approx(b0, rel=0.05)
