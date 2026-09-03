@@ -385,9 +385,17 @@ class Policy:
     # prior until ready_lon (count AND spans), and wrong-signed terms are
     # clamped before they can reach the wheels.
     use_learned_lon: bool = True
-    # Steering authority at standstill (fraction of full lock); full
-    # authority once rolling at gate_d. See the note in _run.
-    steer_standstill: float = 0.45
+    # The planner is quoted the learned radius x this margin (the node
+    # pushes it): planned arcs then sit inside the car's lock by 1 - 1/margin
+    # of the envelope, and that band is all the slack the follower has for
+    # tracking error. Quoted exactly the learned radius, any tracking error
+    # made RPP's recovery chord tighter than the car could do (08-23: 35% of
+    # turning ticks past the envelope, steering clamp saturated 17%). The
+    # same band sizes the launch wait (steer_wait_tol, _run): from rest the
+    # throttle is released once the modeled servo is within 1 - 1/margin of
+    # full lock from its command, so a leg starts ON its planned arc instead
+    # of 0.3 m straight ahead of it.
+    radius_push_margin: float = 1.2
     # Slew limits, per second. Without these a single sample can swing the
     # throttle full scale, which is what "violent" looks like from outside.
     # Lower them if the robot still feels abrupt; raise them if it feels
@@ -1641,6 +1649,7 @@ class Output:
     drive_fault: str = ''
     deadband_fwd: float = 0.0
     deadband_rev: float = 0.0
+    steer_wait: bool = False      # throttle held while the wheels turn
 
 
 class AdaptiveCore:
@@ -1793,6 +1802,7 @@ class AdaptiveCore:
         self.rolling = False
         self._roll_run = 0
         self._roll_since = None
+        self._steer_wait = False
         self._below_gate = False
         self._still_since = None
         self._calm_since = None    # |vdot| within noise since (gain probe eq)
@@ -2083,6 +2093,16 @@ class AdaptiveCore:
     @property
     def ki_w(self):
         return self.policy.kw_delay_product / self.L_lat
+
+    @property
+    def steer_wait_tol(self):
+        """Servo error (fraction of full lock) a launch from rest may start
+        with: the curvature band the planner's radius margin leaves below
+        the lock (radius_push_margin). Floored at 2% of lock, below any
+        servo's resolution, so a margin of 1 cannot wait forever on the
+        modeled servo's exponential tail."""
+        return max(0.02, 1.0 - 1.0 / max(self.policy.radius_push_margin,
+                                          1.0))
 
     # -- speed-shaped thresholds, all fractions of the learned v_op --------
 
@@ -3018,17 +3038,11 @@ class AdaptiveCore:
         # so the correction does not invert in reverse; weighted by
         # |v| / v_op below the operating speed so the gain never exceeds
         # ki_w (as the yaw-rate form's v_op floor did).
-        # Standstill steering authority (applied below); computed here because
-        # the anti-windup has to know what "saturated" means right now: a
-        # command pinned at the standstill clamp is just as unable to act on
-        # a yaw error as one pinned at full lock.
-        lim = p.steer_standstill + (1.0 - p.steer_standstill) \
-            * clamp(abs(v) / max(self.gate_d, 1e-3), 0.0, 1.0)
         # Anti-windup. Integrating a yaw error the servo cannot act on (at
         # lock, or stationary) only winds the trim to its clamp; the flight
         # log had it pinned 90% of the time, biasing every turn one way and
         # unwinding slowly when the demand flipped -- "all left, all right".
-        saturated = abs(self.prev_us) >= 0.95 * lim
+        saturated = abs(self.prev_us) >= 0.95
         if not saturated and kappa_delayed is not None \
                 and abs(v) > 0.5 * self.gate_d:
             kappa_meas = self.psidot / (sgn(v_eff) * abs(v))
@@ -3103,14 +3117,18 @@ class AdaptiveCore:
                 self.get_fault_reset()
             self.steering_fault = True
         us = clamp(knet / den, -1.0, 1.0)
-        # No full lock while stationary. At standstill the curvature request
-        # w/v blows up, the servo goes to lock before the car rolls, and a
-        # car cannot START with its front wheels cranked: it sits, the
-        # integrator winds up, and it breaks free at 3x the throttle it
-        # needed -- the lunge. Flight log: stuck-while-pushing ticks were at
-        # lock 63% of the time; launches at lock released at 0.45-0.70,
-        # straight-wheel launches at 0.24. Authority returns with speed.
-        us = clamp(us, -lim, lim)
+        # Full steering authority at standstill -- and the THROTTLE waits
+        # for it (below). A clamp to 0.45 of lock until rolling used to sit
+        # here, from the days the integrator was the stiction prober and a
+        # launch at lock lunged (released at 0.45-0.70 wire against 0.24
+        # straight); the floor ride replaced that prober. What the clamp
+        # cost, 09-02 23:40: every cusp leg left its stop with the wheels
+        # 0.6 of the way to the planned arc and the servo still turning
+        # through the wire delay, so the car ran ~0.3 m nearly straight
+        # (kappa 0.35 measured against 1.5 commanded at 23:43:24), pure
+        # pursuit asked 2.9 to recover, the car ran wide into the wall's
+        # lethal band and RPP's collision veto ("detected collision
+        # ahead", 142 times) failed 15 of the session's legs.
 
         # --- throttle -----------------------------------------------------
         # Deliberately minimal. Everything that used to sit here -- a
@@ -3306,6 +3324,19 @@ class AdaptiveCore:
         self._floor_dir = 0.0
         self._cap = 0.0
         self._floor_pinned = False
+        # Wheels first, then throttle. From rest the servo turns while the
+        # car sits -- free, the car is stopped at every cusp anyway -- and
+        # the throttle is released once the modeled servo (qs: the applied
+        # wire through tau_s) is within the planner's margin band of its
+        # command. That band is the slack between the planned arc and the
+        # lock, the only slack the follower has, so a launch inside it
+        # starts on the arc. A dead servo cannot deadlock this: qs models
+        # the wire, not the servo's answer.
+        self._steer_wait = (bool(direction) and not self.rolling
+                            and abs(us - self.qs) > self.steer_wait_tol)
+        if self._steer_wait:
+            self.iv = 0.0
+            return us, 0.0
         if direction and self.rolling and self.now < self._post_latch_until \
                 and err * direction > 0.0:
             # post-breakaway: hold near the launch wire for one delay
@@ -3430,6 +3461,13 @@ class AdaptiveCore:
                 self._cap = 0.0
                 return us, 0.0, True
 
+        if self._steer_wait:
+            # parked on purpose while the wheels turn (see _run): not a
+            # stall, so neither the floor ride nor the blocked clock runs
+            self._stall_since = None
+            self._capped_since = None
+            return us, 0.0, False
+
         if want and not moving:
             if self._stall_since is None:
                 self._stall_since = t
@@ -3511,7 +3549,8 @@ class AdaptiveCore:
                       steering_fault=self.steering_fault,
                       drive_fault=self.drive_fault,
                       deadband_fwd=self.deadband.value(1.0),
-                      deadband_rev=self.deadband.value(-1.0))
+                      deadband_rev=self.deadband.value(-1.0),
+                      steer_wait=self._steer_wait)
 
     @staticmethod
     def _slew(prev, target, limit):

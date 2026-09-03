@@ -244,6 +244,14 @@ envelope. `/diagnostics` reports `deadband`.
   shortens the integrator's climb, which at Nav2's approach speed was 5–8 s
   per launch. From the first measured start it is capped at `deadband_trust`
   × the lowest breakaway seen, so another vehicle lunges at most once.
+- **Wheels first, then throttle.** From rest the servo gets its full command
+  at standstill and the throttle is held (`wait` in the flight log, no stall
+  clock) until the modeled servo is within `1 - 1/radius_push_margin` of
+  full lock from it: the band the planner leaves between its arcs and the
+  lock, so the leg starts on the planned arc. A standstill clamp (0.45 of
+  lock until rolling) used to do the opposite; on 09-02 every cusp leg then
+  ran ~0.3 m straight, pure pursuit asked 2.9 to recover and RPP's collision
+  veto failed 15 legs. The wait is ~0.3-0.5 s on this servo.
 - **Loop gains are derived, not typed.** `kp_v = kp_delay_product / L_lon`
   with `L_lon` = learned throttle delay + `tau_d` + `v_fb_tau`; `ki_v =
   kp_v / (ti_delay_ratio · L_lon)`; `ki_w = kw_delay_product / L_lat` with
@@ -255,7 +263,7 @@ envelope. `/diagnostics` reports `deadband`.
 - **Anti-windup.** The throttle integrator holds whenever the last published
   wire was shaped by the slew limit or the ±1 clamp in the direction the
   error would wind it (it may always unwind); the steering trim already holds
-  at the standstill clamp, at lock, and during the settling window after a
+  at lock and during the settling window after a
   curvature change. The launch floor and cap are exempt on purpose: the
   blocked reflex reads the integrator pinning under the cap.
 - **Authority is earned.** While either fit is still a prior (not ready to be

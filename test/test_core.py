@@ -1280,19 +1280,47 @@ def test_blocked_fires_against_an_obstacle_and_releases_on_time():
     assert blocked_ticks < 100
 
 
-def test_no_full_lock_while_stationary():
-    """A car cannot start with its wheels cranked; the servo may not go to
-    lock until the car is rolling. Flight log: launches at lock needed
-    0.45-0.70 throttle and lunged; straight-wheel launches needed 0.24."""
+def test_wheels_turn_before_the_car_moves_from_rest():
+    """A leg from rest starts ON its arc: the servo gets its full command at
+    standstill and the throttle waits until the modeled servo is within the
+    planner's margin band of it. 09-02 23:40: legs left every stop with the
+    wheels 0.6 of the way there (the old standstill clamp) and the servo
+    still turning, the car ran 0.3 m straight, pure pursuit asked 2.9 to
+    recover and RPP's collision veto failed 15 legs."""
     core = AdaptiveCore()
-    settle_sense(core, Plant())
-    core.v = core.v_fb = 0.0
-    us, _ = core._run(0.0, 0.32, 2.0, 0.1)           # hard turn requested, stationary
-    assert abs(us) <= core.policy.steer_standstill + 1e-9, us
-    core.v = core.v_fb = 0.3                           # rolling: authority back
-    us, _ = core._run(0.3, 0.32, 2.0, 0.1)
-    # (the learned-envelope clamp still bounds it, so not necessarily 1.0)
-    assert abs(us) > core.policy.steer_standstill + 0.2, us
+    plant = Plant()
+    plant.delay = 0.3
+    t = settle_sense(core, plant)
+    tol = core.steer_wait_tol
+    assert 0.1 < tol < 0.25                    # 1 - 1/1.2
+    waited = released = None
+    for k in range(1, 40):
+        t += 0.1
+        x, y, psi = plant.observe()
+        out = core.step(t, x, y, psi, 0.30, 0.45)      # kappa 1.5 from rest
+        for _ in range(5):
+            plant.step(out.steer, out.drive, 0.02)
+        if out.steer_wait:
+            assert out.drive == 0.0 and not out.stalled
+            waited = k
+        elif waited and released is None:
+            released = k
+            # the wheels were inside the band when the throttle came on,
+            # and no standstill clamp held them short of the arc
+            assert abs(out.steer - core.qs) <= tol + 0.05
+            assert abs(out.steer) > 0.5, out.steer
+    assert waited and released
+    assert released - waited <= 10             # a short wait, not a stall
+    assert core.rolling
+
+
+def test_a_straight_launch_does_not_wait():
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    x, y, psi = plant.observe()
+    out = core.step(t + 0.1, x, y, psi, 0.30, 0.0)
+    assert not out.steer_wait and out.drive > 0.0
 
 
 def test_ready_throttle_model_is_inverted_and_unready_is_not():

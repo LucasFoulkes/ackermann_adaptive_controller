@@ -85,10 +85,13 @@ def score_session(s, cmd_min=0.05, gate=0.05):
             if seg and seg.get('reached') is not None:
                 launches.append(seg)
             seg = {'dir': d, 'i0': i, 'peak': 0.0, 'reached': None,
-                   'from_rest': abs(v[i]) < gate}
+                   'from_rest': abs(v[i]) < gate, 'wait': 0.0}
             surged = False
         if not d:
             continue
+        if s[i].get('wait') and seg['reached'] is None:
+            # wheels-first: throttle held while the servo turns (core)
+            seg['wait'] = s[i]['stamp'] - s[seg['i0']]['stamp']
         a, c = abs(v[i]), abs(cmd[i])
         seg['peak'] = max(seg['peak'], a)
         seg['cmd'] = max(seg.get('cmd', 0.0), c)   # largest command seen
@@ -103,6 +106,7 @@ def score_session(s, cmd_min=0.05, gate=0.05):
         launches.append(seg)
     overs = [L['peak'] / L['cmd'] for L in launches if L['cmd'] > 0]
     reach = [L['reached'] for L in launches]
+    waits = [L['wait'] for L in launches]
     # model trajectory per minute
     minutes = []
     for m in range(int((s[-1]['stamp'] - t0) / 60.0) + 1):
@@ -175,6 +179,7 @@ def score_session(s, cmd_min=0.05, gate=0.05):
         'launch_over_median': statistics.median(overs) if overs else None,
         'launch_over_max': max(overs) if overs else None,
         'launch_reach_median': statistics.median(reach) if reach else None,
+        'launch_wait_median': statistics.median(waits) if waits else None,
         'cycles': cycles, 'stalls': stalls,
         'minutes': minutes,
     }
@@ -215,7 +220,8 @@ def render(sc):
         f"of the mean command {sc['mean_cmd']:.2f})",
         f"  launches: {sc['launches']}  overshoot median "
         f"{fmt(sc['launch_over_median'])}x max {fmt(sc['launch_over_max'])}x  "
-        f"time-to-command median {fmt(sc['launch_reach_median'], '.1f')} s",
+        f"time-to-command median {fmt(sc['launch_reach_median'], '.1f')} s"
+        f"  wheels-first wait median {fmt(sc['launch_wait_median'], '.2f')} s",
         f"  surge-stall cycles: {sc['cycles']}   stalls: {sc['stalls']}",
         "  steering   cell      n  achieved/cmd  at-lock  gain measured / fitted",
     ]

@@ -60,7 +60,7 @@ POLICY_PARAMS = (
     'tau_s', 'tau_d', 'kp_delay_product', 'ti_delay_ratio',
     'kw_delay_product', 'sensor_tau', 'prior_a0', 'prior_b0',
     'v_eff_floor_frac', 'stall_cmd_frac', 'iv_max', 'iw_max_frac',
-    'v_fb_tau', 'span_floor', 'steer_standstill', 'use_learned_lon',
+    'v_fb_tau', 'span_floor', 'use_learned_lon',
     'lat_delay', 'lon_delay', 'gate_floor_frac', 'gate_cap_frac',
     'launch_floor', 'launch_cap_margin', 'launch_cap_rate',
     'max_steer_rate', 'max_drive_rate', 'blocked_after', 'blocked_release',
@@ -78,6 +78,7 @@ POLICY_PARAMS = (
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
     'odom_glitch_hold',
     'authority_floor', 'learn_overspeed_ratio', 'approach_speed_frac',
+    'radius_push_margin',
 )
 _DEFAULTS = Policy()
 
@@ -200,13 +201,6 @@ class AckermannAdaptiveController(Node):
             ('radius_abs_change', 0.05),
             ('radius_push_period', 5.0),
             ('radius_filter_alpha', 0.25),
-            # The planner is quoted radius * margin, not the raw learned
-            # limit. Pushed exactly the learned radius, planned arcs sit AT
-            # the car's limit, so any tracking error makes RPP's recovery
-            # chord tighter than the car can do -- the 08-23 log had 35% of
-            # turning ticks demanding curvature beyond the envelope, with the
-            # steering clamp saturated 17% of the time.
-            ('radius_push_margin', 1.2),
             ('state_file',
              os.path.expanduser('~/.ros/ackermann_adaptive_controller.yaml')),
             ('save_period', 30.0),
@@ -259,7 +253,8 @@ class AckermannAdaptiveController(Node):
         self.search_param = str(g['search_dist_param'])
         self.radius_rel = float(g['radius_rel_change'])
         self.radius_abs = float(g['radius_abs_change'])
-        self.radius_margin = float(g['radius_push_margin'])
+        # policy-owned: the same margin sizes the core's launch wait
+        self.radius_margin = self.core.policy.radius_push_margin
         self.pushed_radius = None
         self._param_clients = {}
         self._push_warned = False
@@ -278,7 +273,7 @@ class AckermannAdaptiveController(Node):
                       'qs,qd,us,ud,iw,iv,a0l,a0r,a0lr,a0rr,a1,a2,'
                       'b0,b1,b2,b3,breakaway,'
                       'ready_lon,ready_lat,stalled,blocked,fault,'
-                      'x,y,yaw,probe_b0,probe_eq,err_rms,cycles,learn\n')
+                      'x,y,yaw,probe_b0,probe_eq,err_rms,cycles,learn,wait\n')
             try:
                 os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
                 # Rotate a log whose columns no longer match, so one file
@@ -520,7 +515,7 @@ class AckermannAdaptiveController(Node):
                 f'{c.gain_probe.b0 or 0.0:.3f},'
                 f'{c.gain_probe.eq(1.0) or 0.0:.3f},'
                 f'{c.score.err_rms or 0.0:.3f},{c.score.cycles},'
-                f'{int(out.learning)}\n')
+                f'{int(out.learning)},{int(out.steer_wait)}\n')
 
         if out.steering_fault and not self._warned_fault:
             self.get_logger().error(
