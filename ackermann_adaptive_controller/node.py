@@ -202,7 +202,8 @@ class AckermannAdaptiveController(Node):
             # can drive (core.leg_end_reachable) and ~/leg_unreachable
             # tells the navigator to end the leg there instead of letting
             # pure pursuit swing. Empty disables.
-            ('segment_topic', '/cusp_navigator/plan_segment'),
+            # (the navigator publishes it as a plain relative name)
+            ('segment_topic', '/plan_segment'),
             # Hysteresis: republishing on every wobble would make Smac rebuild
             # its primitive table continuously.
             ('radius_rel_change', 0.10),
@@ -259,6 +260,7 @@ class AckermannAdaptiveController(Node):
         self.segment_dir = 0
         self._dir_held = False
         self._leg_end = None
+        self._segment_topic = str(g['segment_topic'])
         self._leg_unreachable = False
         self.pub_unreachable = None
         self.search_param = str(g['search_dist_param'])
@@ -469,6 +471,9 @@ class AckermannAdaptiveController(Node):
     def on_segment(self, msg):
         if msg.poses:
             end = msg.poses[-1].pose.position
+            if self._leg_end is None:
+                self.get_logger().info(
+                    f'segment end poses arriving on {self._segment_topic}')
             self._leg_end = (float(end.x), float(end.y))
             self._set_unreachable(False)
 
