@@ -3390,3 +3390,86 @@ def test_a_stuck_car_teaches_the_throttle_learner_nothing():
     assert core.model.n_lon <= n0 + 5, (n0, core.model.n_lon)
     assert core.lon_bank.delay == d0
     assert core.model.b0 == pytest.approx(b0, rel=0.05)
+
+
+# -- leg-end reachability: the follower's terminal geometry, judged by the --
+# -- learner (09-03 00:03: 8 of 19 reverse legs swung, flipped and held) ----
+
+def _cruising(cmd_v=0.30, seconds=6.0):
+    core = AdaptiveCore()
+    plant = Plant()
+    plant.delay = 0.3
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda s: (cmd_v, 0.0), seconds, t0=t)
+    assert core.rolling
+    return core, plant
+
+
+def _ahead(plant, along, lateral):
+    """A point ``along`` metres ahead of the car and ``lateral`` to its left."""
+    c, s = math.cos(plant.psi), math.sin(plant.psi)
+    return (plant.x + along * c - lateral * s, plant.y + along * s + lateral * c)
+
+
+def test_leg_end_on_the_heading_is_reachable():
+    core, plant = _cruising()
+    ex, ey = _ahead(plant, 0.5, 0.0)
+    unreachable, miss, dist = core.leg_end_reachable(
+        ex, ey, plant.x, plant.y, plant.psi, 0.13)
+    assert not unreachable and miss < 1e-6 and 0.4 < dist < 0.6
+
+
+def test_leg_end_inside_the_lock_circle_is_unreachable():
+    """0.4 m ahead, 0.35 m to the side: pure pursuit would ask 2y/L^2 = 2.5
+    of a car whose lock is ~1.25; the best arc misses by ~0.2 m."""
+    core, plant = _cruising()
+    ex, ey = _ahead(plant, 0.4, 0.35)
+    unreachable, miss, dist = core.leg_end_reachable(
+        ex, ey, plant.x, plant.y, plant.psi, 0.13)
+    assert unreachable and miss > 0.13, (miss, dist)
+
+
+def test_leg_end_behind_the_travel_direction_is_unreachable():
+    """The end passed beside the rear axle: RPP flips its direction sign
+    here (carrot x < 0) -- the hold-and-cancel of 09-03."""
+    core, plant = _cruising()
+    ex, ey = _ahead(plant, -0.3, 0.05)
+    unreachable, miss, dist = core.leg_end_reachable(
+        ex, ey, plant.x, plant.y, plant.psi, 0.13)
+    # the miss is judged from the pose one lateral delay on, further past
+    assert unreachable and miss > dist - 0.01, (miss, dist)
+
+
+def test_leg_end_beyond_the_lookahead_or_at_rest_is_not_judged():
+    core, plant = _cruising()
+    ex, ey = _ahead(plant, 3.0, 1.0)
+    assert core.leg_end_reachable(ex, ey, plant.x, plant.y, plant.psi,
+                                  0.13) is None
+    core.v_fb = 0.0                      # parked: no opinion either
+    ex, ey = _ahead(plant, 0.4, 0.35)
+    assert core.leg_end_reachable(ex, ey, plant.x, plant.y, plant.psi,
+                                  0.13) is None
+
+
+def test_leg_end_reachability_holds_in_reverse():
+    """Backing up, 'ahead' is behind the car: an end 0.5 m behind on the
+    heading is reachable, one 0.3 m in FRONT of a reversing car is not."""
+    core, plant = _cruising(cmd_v=-0.30, seconds=8.0)
+    assert plant.v < -0.1
+    ex, ey = _ahead(plant, -0.5, 0.0)
+    unreachable, miss, _ = core.leg_end_reachable(
+        ex, ey, plant.x, plant.y, plant.psi, 0.13)
+    assert not unreachable and miss < 1e-6
+    ex, ey = _ahead(plant, 0.3, 0.0)
+    unreachable, miss, _ = core.leg_end_reachable(
+        ex, ey, plant.x, plant.y, plant.psi, 0.13)
+    assert unreachable
+
+
+def test_stopping_distance_matches_the_goal_tolerance_push():
+    core, plant = _cruising(seconds=20.0)
+    d = core.stopping_distance()
+    if d is None:                        # friction not yet identified
+        return
+    v_ap = core.policy.approach_speed_frac * core.v_op
+    assert 0.0 < d < 1.0 and d > v_ap * core.lon_bank.delay

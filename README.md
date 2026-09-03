@@ -252,6 +252,15 @@ envelope. `/diagnostics` reports `deadband`.
   lock until rolling) used to do the opposite; on 09-02 every cusp leg then
   ran ~0.3 m straight, pure pursuit asked 2.9 to recover and RPP's collision
   veto failed 15 legs. The wait is ~0.3-0.5 s on this servo.
+- **The leg's end is judged, not chased.** Given the navigator's current
+  segment (`segment_topic`), once the car is inside the follower's last
+  lookahead the core asks whether any arc within the lock, after one lateral
+  delay on the current arc, still lands inside the goal tolerance
+  (`core.leg_end_reachable`: the miss to the lock circle, the whole distance
+  for an end already behind). If not, `~/leg_unreachable` goes true and the
+  navigator ends the leg there: pure pursuit's demand to a pinned carrot is
+  2y/L² and only grows, and on 09-03 it swung 8 of 19 reverse legs 20-33°
+  off, flipped its direction sign and got held. Flight log column `unreach`.
 - **Loop gains are derived, not typed.** `kp_v = kp_delay_product / L_lon`
   with `L_lon` = learned throttle delay + `tau_d` + `v_fb_tau`; `ki_v =
   kp_v / (ti_delay_ratio · L_lon)`; `ki_w = kw_delay_product / L_lat` with

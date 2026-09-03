@@ -39,7 +39,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import (Twist, TwistStamped,
                                TwistWithCovarianceStamped)
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from nav2_msgs.msg import SpeedLimit
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Bool, Float32, Int8
@@ -195,6 +195,14 @@ class AckermannAdaptiveController(Node):
             # shuffle; held as a stop, the progress checker fails the leg in
             # 8 s and the navigator replans from where the car is.
             ('segment_direction_topic', '/cusp_navigator/segment_direction'),
+            # The navigator's current single-direction segment. Its end pose
+            # is what the follower's carrot pins to inside the last
+            # lookahead; the core judges each tick whether that end is
+            # still reachable inside the goal tolerance on an arc the car
+            # can drive (core.leg_end_reachable) and ~/leg_unreachable
+            # tells the navigator to end the leg there instead of letting
+            # pure pursuit swing. Empty disables.
+            ('segment_topic', '/cusp_navigator/plan_segment'),
             # Hysteresis: republishing on every wobble would make Smac rebuild
             # its primitive table continuously.
             ('radius_rel_change', 0.10),
@@ -250,6 +258,9 @@ class AckermannAdaptiveController(Node):
         self.pushed_horizon = None
         self.segment_dir = 0
         self._dir_held = False
+        self._leg_end = None
+        self._leg_unreachable = False
+        self.pub_unreachable = None
         self.search_param = str(g['search_dist_param'])
         self.radius_rel = float(g['radius_rel_change'])
         self.radius_abs = float(g['radius_abs_change'])
@@ -273,7 +284,7 @@ class AckermannAdaptiveController(Node):
                       'qs,qd,us,ud,iw,iv,a0l,a0r,a0lr,a0rr,a1,a2,'
                       'b0,b1,b2,b3,breakaway,'
                       'ready_lon,ready_lat,stalled,blocked,fault,'
-                      'x,y,yaw,probe_b0,probe_eq,err_rms,cycles,learn,wait\n')
+                      'x,y,yaw,probe_b0,probe_eq,err_rms,cycles,learn,wait,unreach\n')
             try:
                 os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
                 # Rotate a log whose columns no longer match, so one file
@@ -382,8 +393,14 @@ class AckermannAdaptiveController(Node):
                                  durability=DurabilityPolicy.TRANSIENT_LOCAL,
                                  history=HistoryPolicy.KEEP_LAST, depth=1)
             self.create_subscription(
-                Int8, str(g['segment_direction_topic']),
-                lambda m: setattr(self, 'segment_dir', int(m.data)), latched)
+                Int8, str(g['segment_direction_topic']), self.on_segment_dir,
+                latched)
+            if str(g['segment_topic']):
+                self.create_subscription(Path, str(g['segment_topic']),
+                                         self.on_segment, 1)
+                self.pub_unreachable = self.create_publisher(
+                    Bool, '~/leg_unreachable', latched)
+                self.pub_unreachable.publish(Bool(data=False))
             # Tell the navigator when a hold is in force, so it can replan
             # instead of waiting for Nav2's progress checker.
             self.pub_held = self.create_publisher(Bool, '~/direction_held',
@@ -442,6 +459,28 @@ class AckermannAdaptiveController(Node):
         self.cmd_v, self.cmd_w = v, w
         self.last_cmd_t = self._now()
 
+    def on_segment_dir(self, msg):
+        self.segment_dir = int(msg.data)
+        if not self.segment_dir:
+            # leg over: the end pose no longer applies
+            self._leg_end = None
+            self._set_unreachable(False)
+
+    def on_segment(self, msg):
+        if msg.poses:
+            end = msg.poses[-1].pose.position
+            self._leg_end = (float(end.x), float(end.y))
+            self._set_unreachable(False)
+
+    def _set_unreachable(self, flag, detail=''):
+        if flag == self._leg_unreachable:
+            return
+        self._leg_unreachable = flag
+        if flag:
+            self.get_logger().info(f'leg end unreachable: {detail}')
+        if self.pub_unreachable is not None:
+            self.pub_unreachable.publish(Bool(data=bool(flag)))
+
     def on_joy(self, msg):
         if self.estop_button < len(msg.buttons) and \
                 msg.buttons[self.estop_button]:
@@ -486,6 +525,18 @@ class AckermannAdaptiveController(Node):
             applied=applied, v_meas=v_meas, psidot_meas=psidot_meas)
         self.out_steer, self.out_drive = out.steer, out.drive
 
+        # Is the current leg's end still reachable? (core.leg_end_reachable)
+        if self._leg_end is not None and self.segment_dir and self.active:
+            tol = self.pushed_goal_tol or self.goal_tol_max
+            judged = self.core.leg_end_reachable(
+                self._leg_end[0], self._leg_end[1],
+                pose.position.x, pose.position.y, psi, tol)
+            if judged is not None and judged[0]:
+                self._set_unreachable(
+                    True, f'{judged[2]:.2f} m from the end, the best arc '
+                    f'within the lock misses it by {judged[1]:.2f} m '
+                    f'(tolerance {tol:.2f})')
+
         if out.drive_fault and not self._warned_drive_fault:
             self.get_logger().error(
                 f'THROTTLE FAULT from calibration: {out.drive_fault}; '
@@ -515,7 +566,8 @@ class AckermannAdaptiveController(Node):
                 f'{c.gain_probe.b0 or 0.0:.3f},'
                 f'{c.gain_probe.eq(1.0) or 0.0:.3f},'
                 f'{c.score.err_rms or 0.0:.3f},{c.score.cycles},'
-                f'{int(out.learning)},{int(out.steer_wait)}\n')
+                f'{int(out.learning)},{int(out.steer_wait)},'
+                f'{int(self._leg_unreachable)}\n')
 
         if out.steering_fault and not self._warned_fault:
             self.get_logger().error(
@@ -724,11 +776,8 @@ class AckermannAdaptiveController(Node):
                 f'approach speed -> {v_ap:.2f} m/s ({self.follower_server})')
             self._set_remote(self.follower_server, self.approach_param, v_ap)
         # Goal tolerance: the stopping distance from the approach speed.
-        c = self.core
-        if v_ap > 0.0 and self.follower_server and self.goal_tol_param \
-                and c.ready_lon and c.lon_plausible() and c.model.b3 < 0.0:
-            d_stop = (v_ap * (c.lon_bank.delay + c.policy.tau_d)
-                      + v_ap * v_ap / (2.0 * -c.model.b3))
+        d_stop = self.core.stopping_distance()
+        if d_stop is not None and self.follower_server and self.goal_tol_param:
             tol = min(self.goal_tol_max, d_stop)
             if self.pushed_goal_tol is None or \
                     abs(tol - self.pushed_goal_tol) >= self.radius_rel * self.pushed_goal_tol:

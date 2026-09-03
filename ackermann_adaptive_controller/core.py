@@ -3638,6 +3638,85 @@ class AdaptiveCore:
                   and self.lon_plausible() and not self.steering_fault)
         return 1.0 if earned else self.policy.authority_floor
 
+    def stopping_distance(self):
+        """How far the car travels from the approach speed before it is at
+        rest: the learned reaction delay at that speed, then coasting on
+        the Coulomb term. The follower's goal tolerance is pushed from it
+        (the typed 0.20 m ended every cusp leg 0.19 m short, 09-02), and
+        leg_end_reachable uses the same number as its miss bound. None
+        until the friction term is identified."""
+        b3 = self.rls_lon.theta[3]
+        v_ap = self.policy.approach_speed_frac * self.v_op
+        if not (v_ap > 0.0 and self.ready_lon and self.lon_plausible()
+                and finite(b3) and b3 < 0.0):
+            return None
+        return (v_ap * (self.lon_bank.delay + self.policy.tau_d)
+                + v_ap * v_ap / (2.0 * -b3))
+
+    def leg_end_reachable(self, end_x, end_y, x, y, psi, tol):
+        """Can the follower still land inside ``tol`` of the leg's end pose
+        on an arc the car can drive?  None while the question does not
+        arise (the car is at rest, or the end is further than the
+        follower's lookahead, so its carrot is still on the path and not
+        pinned to the end); else ``(unreachable, miss, dist)``.
+
+        Pure pursuit steers a single arc to its carrot, and inside the last
+        lookahead the carrot IS the end pose, so its curvature demand is
+        2y/L^2 -- unbounded as L shrinks with any lateral error y. Beyond
+        the car's lock that demand is a swing, not a correction: the
+        wheels saturate, the geometry runs away, the end pose passes beside
+        the rear axle and RPP flips its direction sign (carrot x >= 0 means
+        forward to it). 09-03 00:03 drive: 8 of 19 reverse legs ended that
+        way, 20-33 deg off heading, held and cancelled 0.2 m from the end,
+        while every forward leg was saved by the goal checker firing first.
+
+        The test is the follower's own geometry plus what it does not
+        know: the car keeps its CURRENT curvature for one lateral delay
+        (learned delay + tau_s, 0.6-0.7 s on this car: 0.1-0.2 m of arc at
+        approach speed) before any new demand acts, so the pose is first
+        projected along that arc. From there the points reachable on some
+        arc within the lock are exactly those outside the lock circle on
+        their own side (2y/L^2 <= kappa_lock); a point inside it is missed
+        by at least the gap to that circle, a point behind the direction
+        of travel by its whole distance. A miss beyond the goal tolerance
+        means the leg cannot end where the follower wants it to: stopping
+        here and planning the rest from the actual pose is strictly better
+        than the swing. Every quantity is learned (delay, lock, tolerance)
+        or measured (speed, curvature); nothing is typed.
+        """
+        p = self.policy
+        v = self.v_fb
+        if not (self.rolling and abs(v) > self.gate_d):
+            return None
+        dx, dy = end_x - x, end_y - y
+        dist = math.hypot(dx, dy)
+        window = self.envelope.min_turning_radius(self.model)
+        if dist >= window:
+            return None
+        # the car keeps doing what it is doing for one lateral delay
+        kappa_now = self.psidot / v
+        d = v * (self.lat_bank.delay + p.tau_s)
+        if abs(kappa_now) < 1e-3:
+            px, py, ppsi = x + d * math.cos(psi), y + d * math.sin(psi), psi
+        else:
+            th = kappa_now * d
+            px = x + (math.sin(psi + th) - math.sin(psi)) / kappa_now
+            py = y - (math.cos(psi + th) - math.cos(psi)) / kappa_now
+            ppsi = psi + th
+        dx, dy = end_x - px, end_y - py
+        ex = math.cos(ppsi) * dx + math.sin(ppsi) * dy
+        ey = -math.sin(ppsi) * dx + math.cos(ppsi) * dy
+        direction = sgn(v)
+        if ex * direction < 0.0:
+            miss = math.hypot(ex, ey)
+        else:
+            kappa_lock = self.envelope.max_curvature(self.model, v,
+                                                     derate=False)
+            r_lock = 1.0 / max(kappa_lock, 1e-6)
+            centre = (r_lock if ey >= 0.0 else -r_lock)
+            miss = max(0.0, r_lock - math.hypot(ex, ey - centre))
+        return miss > tol, miss, dist
+
     def stop_horizon(self):
         """How long a follower should project a command for collisions.
 
