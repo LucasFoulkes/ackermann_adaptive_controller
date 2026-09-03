@@ -278,7 +278,7 @@ class AckermannAdaptiveController(Node):
                       'qs,qd,us,ud,iw,iv,a0l,a0r,a0lr,a0rr,a1,a2,'
                       'b0,b1,b2,b3,breakaway,'
                       'ready_lon,ready_lat,stalled,blocked,fault,'
-                      'x,y,yaw,probe_b0,probe_eq,err_rms,cycles\n')
+                      'x,y,yaw,probe_b0,probe_eq,err_rms,cycles,learn\n')
             try:
                 os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
                 # Rotate a log whose columns no longer match, so one file
@@ -519,7 +519,8 @@ class AckermannAdaptiveController(Node):
                 f'{pose.position.x:.4f},{pose.position.y:.4f},{psi:.4f},'
                 f'{c.gain_probe.b0 or 0.0:.3f},'
                 f'{c.gain_probe.eq(1.0) or 0.0:.3f},'
-                f'{c.score.err_rms or 0.0:.3f},{c.score.cycles}\n')
+                f'{c.score.err_rms or 0.0:.3f},{c.score.cycles},'
+                f'{int(out.learning)}\n')
 
         if out.steering_fault and not self._warned_fault:
             self.get_logger().error(
