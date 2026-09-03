@@ -410,6 +410,12 @@ class AckermannAdaptiveController(Node):
             self.pub_held.publish(Bool(data=False))
         else:
             self.pub_held = None
+        # Motion wanted and none happening (stalled), or the blocked reflex
+        # holding the wheels: the floor camera reads this as "the step under
+        # the front wheels is one this car cannot take" (robot/floor_scan.py).
+        self.pub_stalled = self.create_publisher(Bool, '~/stalled', latched)
+        self.pub_stalled.publish(Bool(data=False))
+        self._stalled_flag = False
 
         self.create_service(SetBool, '~/set_active', self.srv_set_active)
         self.create_service(Trigger, '~/calibrate', self.srv_calibrate)
@@ -529,6 +535,10 @@ class AckermannAdaptiveController(Node):
             t, pose.position.x, pose.position.y, psi, cmd_v, cmd_w,
             applied=applied, v_meas=v_meas, psidot_meas=psidot_meas)
         self.out_steer, self.out_drive = out.steer, out.drive
+        stalled_now = bool(out.stalled or self.core.blocked)
+        if stalled_now != self._stalled_flag:
+            self._stalled_flag = stalled_now
+            self.pub_stalled.publish(Bool(data=stalled_now))
 
         # Is the current leg's end still reachable? (core.leg_end_reachable)
         if self._leg_end is not None and self.segment_dir and self.active:
