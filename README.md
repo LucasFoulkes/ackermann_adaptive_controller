@@ -1,13 +1,13 @@
 # Adaptive Ackermann actuator controller
 
-This node tracks requested linear velocity and yaw rate using LiDAR odometry
+This node tracks requested linear velocity and yaw rate using odometry
 feedback. It learns steering response, throttle response, friction/deadband and
 delay; it converts requested motion to normalized steering/throttle commands.
 
 ## Interfaces
 
 - `/cmd_vel` (`Twist`): body motion request; stale or invalid commands stop output.
-- `/lidar_odometry/pose` (`Odometry`): rear-axle pose in `odom`, child `base_link`.
+- `/odom` in the robot launch (`Odometry`): rear-axle pose in `odom`, child `base_link`.
   Acquisition age, frame, orientation and timestamp progression are checked.
 - `/actuators/state` (`robot_interfaces/ActuatorState`): timestamped commands
   successfully written by the Pico driver. Missing/disconnected delivery stops
@@ -22,6 +22,9 @@ Confirmed turning capability updates Nav2's planner radius (and MPPI's radius
 constraint when selected). Updates are acknowledged and retried. The controller
 **does not change** goal tolerance, lookahead, approach speed or collision
 horizon. These belong to Nav2 configuration. `stop_horizon` is informational.
+Reverse turns retain separate limit evidence so later forward driving cannot
+erase a measured reverse limitation. Existing saved profiles remain compatible;
+new reverse evidence accumulates during normal driving.
 
 ## Modes and files
 
@@ -66,6 +69,10 @@ active feedforward model. If a fitted cruising command opposes observed motion,
 the controller uses measured cruising throttle with PI feedback while learning
 continues. It bounds the combined fitted compensation rather than independently
 clipping terms that may cancel each other.
+During isolated implausible odometry samples, settled cruise trim is retained
+with feedforward, bounded by the previous throttle. Acceleration feedback and
+launch windup are excluded. Stop or direction-change requests override the hold;
+a sustained implausible stream still stops output.
 
 A requested direction change while moving brakes toward zero speed, waits for
 stationary odometry across the estimated response delay, then launches the new

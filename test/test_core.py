@@ -1756,7 +1756,9 @@ def test_a_single_odometry_spike_holds_the_wire():
     out = core.step(t + 0.1, x + 0.4, y, psi, 0.4, 0.0)
     # rode through on the holding wire (the feedforward), no jerk to zero
     assert out.drive == pytest.approx(held, abs=0.06)
-    assert out.drive > 0.0 or held <= 0.0
+    # Cruise trim may request coasting when the previous wire was already
+    # effectively zero; an isolated spike must not cut meaningful drive.
+    assert out.drive > 0.0 or held < 0.01
     assert core.model.n_lon == n            # and learned nothing from it
     assert core.odom_ok
     out, _ = drive(core, plant, lambda s: (0.4, 0.0), 3.0, t0=t + 0.2)
@@ -2944,7 +2946,9 @@ def test_an_implausible_stream_is_answered_neutrally_and_fails_only_after_the_ho
     hold = core.policy.odom_glitch_hold
     assert failed_at is not None and failed_at >= int(hold / 0.1) - 1, failed_at
     assert len(held) >= 5
-    assert all(abs(d - f) < 1e-9 and d > 0.0 for d, f in held), held
+    # Cruise trim survives an isolated bad sample; the accelerating P term
+    # does not. A sustained corrupt stream still reaches zero above.
+    assert all(0.0 < d <= max(held[0][0], f + core.policy.iv_max) for d, f in held), held
     assert core.prev_wire == 0.0                                # failed: zero
 
 
@@ -3524,3 +3528,57 @@ def test_recorded_start_model_cruises_without_launch_drop_cycles():
     assert min(speeds) > .10
     assert max(speeds) < .5
     assert sum(speeds) / len(speeds) == pytest.approx(.32, abs=.08)
+
+
+@pytest.mark.parametrize('direction', [1., -1.])
+def test_bad_sample_preserves_cruise_trim_without_holding_acceleration(direction):
+    core = AdaptiveCore()
+    core.now, core._roll_since = 10., 1.
+    core.rolling = True
+    core._cmd_dir = direction
+    core._ff_wire, core.iv = .15 * direction, .07 * direction
+    core.prev_wire = .24 * direction  # .22 cruise plus .02 acceleration
+    out = core._hold_output(.32 * direction)
+    assert out.drive == pytest.approx(.22 * direction)
+    assert core._hold_output(.32 * direction).drive == out.drive
+    # If the previous command was already braking, never increase effort.
+    core.prev_wire = .10 * direction
+    assert core._hold_output(.32 * direction).drive == pytest.approx(.10 * direction)
+    # Wound launch trim is not established cruise effort.
+    core.rolling = False
+    core.iv = .25 * direction
+    assert core._hold_output(.32 * direction).drive == pytest.approx(.15 * direction)
+    assert core._hold_output(0.).drive == 0.
+    core.prev_wire = .24 * direction
+    assert core._hold_output(-.32 * direction).drive == 0.
+
+
+@pytest.mark.parametrize('side', [1., -1.])
+def test_forward_turns_cannot_erase_a_weak_reverse_limit(side):
+    core = AdaptiveCore()
+    env, model = core.envelope, core.model
+    for _ in range(env.p.env_evidence):
+        env.observe(side, .5 * env.predict(model, side, -.3), -.3, model)
+    for _ in range(200):
+        for steer in (1., -1.):
+            env.observe(steer, env.predict(model, steer, .3), .3, model)
+    assert env.confirmed and env.fidelity() == pytest.approx(.5)
+    radius = env.min_turning_radius(model)
+    fresh = AdaptiveCore()
+    assert fresh.envelope.load(env.state())
+    assert fresh.envelope.min_turning_radius(model) == pytest.approx(radius)
+    # Only new reverse evidence can retire the old reverse limit.
+    for _ in range(200):
+        env.observe(side, env.predict(model, side, -.3), -.3, model)
+    assert env.min_turning_radius(model) < radius * .6
+
+
+def test_legacy_envelope_and_zero_response_evidence_load():
+    env = AdaptiveCore().envelope
+    legacy = {'left': [1.] * 40, 'right': [.8] * 40}
+    assert env.load(legacy)
+    assert env.confirmed and env.fidelity() == .8
+    assert not env.left_rev.confirmed and not env.right_rev.confirmed
+    saved = env.state()
+    saved['right_rev'] = [0.] * 40
+    assert env.load(saved) and env.fidelity() == 0.

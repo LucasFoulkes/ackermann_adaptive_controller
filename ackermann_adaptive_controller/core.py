@@ -685,7 +685,7 @@ class AdaptiveCore:
                 # One spike: hold the last command rather than jerk to zero.
                 # A failed stream: stop, and learn nothing from any of it.
                 return self._safe_output() if not self.odom_ok \
-                    else self._hold_output()
+                    else self._hold_output(cmd_v)
             self._glitch_run = 0
             if not self.odom_ok:
                 self._sane_run += 1
@@ -2013,14 +2013,24 @@ class AdaptiveCore:
             return target
         return prev + clamp(target - prev, -limit, limit)
 
-    def _hold_output(self):
-        """An implausible sample: steer as before, and on the throttle put
-        the wire that HOLDS the commanded speed (the model feedforward,
-        _ff_wire) -- neither chase the reading nor keep pushing. Holding
-        the last wire through a genuine overshoot kept the lunge wire on
-        and ran a sticky plant away to 0.9 m/s (08-29 bench)."""
+    def _hold_output(self, cmd_v):
+        """Freeze estimation and retain bounded cruise effort on a bad sample.
+
+        Settled integral trim corrects model bias and belongs to cruise effort.
+        Discarding it caused a throttle dip on every isolated odometry glitch.
+        Drop proportional acceleration effort, never increase the previous
+        throttle, and exclude trim accumulated during launch or reversal.
+        """
+        if abs(cmd_v) <= self.stall_cmd_min or cmd_v * self._cmd_dir <= 0.0:
+            return self._safe_output()
         m = self.model
         drive = self._ff_wire if self._ff_wire is not None else self.prev_wire
+        if (self._ff_wire is not None and self.rolling and not self._reversal_target
+                and self._roll_since is not None
+                and self.now - self._roll_since > self.lon_bank.delay + self.policy.tau_d
+                and drive * cmd_v > 0.0 and self.prev_wire * cmd_v > 0.0):
+            drive = sgn(cmd_v) * clamp((drive + self.iv) * sgn(cmd_v),
+                                       0.0, abs(self.prev_wire))
         self.prev_ud = self.prev_wire = drive
         return Output(steer=self.prev_us, drive=drive,
                       phase=self.phase, v=self.v, psidot=self.psidot,

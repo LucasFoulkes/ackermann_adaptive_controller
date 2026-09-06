@@ -93,6 +93,10 @@ class CurvatureEnvelope:
         self.p = policy
         self.left = _Window(policy.env_evidence)
         self.right = _Window(policy.env_evidence)
+        # Retain reverse evidence independently: frequent forward turns must
+        # not wash a weaker reverse limit out of the shared planning envelope.
+        self.left_rev = _Window(policy.env_evidence)
+        self.right_rev = _Window(policy.env_evidence)
         # The speed the envelope is quoted at when none is given: the
         # learned operating speed, kept current by the core. Zero (nothing
         # driven yet) quotes the kinematic lock, which is the right answer
@@ -120,6 +124,8 @@ class CurvatureEnvelope:
         # A ratio far above 1 is noise, not a car that out-turns its own model.
         ratio = min(ratio, 1.5)
         (self.left if qs >= 0.0 else self.right).add(ratio)
+        if v < 0.0:
+            (self.left_rev if qs >= 0.0 else self.right_rev).add(ratio)
         return True
 
     @property
@@ -130,7 +136,8 @@ class CurvatureEnvelope:
         """Worst-direction model fidelity at full lock, or None."""
         if not self.confirmed:
             return None
-        return min(self.left.value, self.right.value)
+        return min([self.left.value, self.right.value] +
+                   [w.value for w in (self.left_rev, self.right_rev) if w.confirmed])
 
     def max_curvature(self, model, v=None, derate=True, forward=False):
         """Curvature believed reachable at full lock, at the planning speed.
@@ -190,16 +197,23 @@ class CurvatureEnvelope:
         return 1.0 / self.max_curvature(model, v, forward=forward)
 
     def state(self):
-        return {'left': list(self.left.vals), 'right': list(self.right.vals)}
+        return {key: list(getattr(self, key).vals)
+                for key in ('left', 'right', 'left_rev', 'right_rev')}
 
     def load(self, d):
         if not isinstance(d, dict):
             return False
-        for key, win in (('left', self.left), ('right', self.right)):
-            vals = d.get(key)
+        pending = []
+        for key in ('left', 'right', 'left_rev', 'right_rev'):
+            win = getattr(self, key)
+            # Legacy profiles retain their pooled evidence. Its travel
+            # direction is unknown, so do not invent reverse observations.
+            vals = d.get(key, [] if key.endswith('_rev') else None)
             if not isinstance(vals, list) or not all(
-                    finite(v) and v > 0.0 for v in vals):
+                    finite(v) and v >= 0.0 for v in vals):
                 return False
+            pending.append((win, vals))
+        for win, vals in pending:
             win.vals = deque(vals[-win.vals.maxlen:], maxlen=win.vals.maxlen)
         return True
 
