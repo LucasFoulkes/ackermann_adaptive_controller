@@ -23,7 +23,6 @@ setup(
          glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
-    tests_require=['pytest'],
     zip_safe=True,
     maintainer='Lucas Foulkes',
     maintainer_email='lucasfoulkes@gmail.com',
@@ -35,8 +34,6 @@ setup(
             'ackermann_adaptive_controller.node:main',
             'ackermann_flight_report = '
             'ackermann_adaptive_controller.flight_report:main',
-            'ackermann_model_report = '
-            'ackermann_adaptive_controller.model_validation:main',
         ],
     },
 )

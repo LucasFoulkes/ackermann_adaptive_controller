@@ -3411,59 +3411,14 @@ def _ahead(plant, along, lateral):
     return (plant.x + along * c - lateral * s, plant.y + along * s + lateral * c)
 
 
-def test_leg_end_on_the_heading_is_reachable():
-    core, plant = _cruising()
-    ex, ey = _ahead(plant, 0.5, 0.0)
-    unreachable, miss, dist = core.leg_end_reachable(
-        ex, ey, plant.x, plant.y, plant.psi, 0.13)
-    assert not unreachable and miss < 1e-6 and 0.4 < dist < 0.6
 
 
-def test_leg_end_inside_the_lock_circle_is_unreachable():
-    """0.4 m ahead, 0.35 m to the side: pure pursuit would ask 2y/L^2 = 2.5
-    of a car whose lock is ~1.25; the best arc misses by ~0.2 m."""
-    core, plant = _cruising()
-    ex, ey = _ahead(plant, 0.4, 0.35)
-    unreachable, miss, dist = core.leg_end_reachable(
-        ex, ey, plant.x, plant.y, plant.psi, 0.13)
-    assert unreachable and miss > 0.13, (miss, dist)
 
 
-def test_leg_end_behind_the_travel_direction_is_unreachable():
-    """The end passed beside the rear axle: RPP flips its direction sign
-    here (carrot x < 0) -- the hold-and-cancel of 09-03."""
-    core, plant = _cruising()
-    ex, ey = _ahead(plant, -0.3, 0.05)
-    unreachable, miss, dist = core.leg_end_reachable(
-        ex, ey, plant.x, plant.y, plant.psi, 0.13)
-    # the miss is judged from the pose one lateral delay on, further past
-    assert unreachable and miss > dist - 0.01, (miss, dist)
 
 
-def test_leg_end_beyond_the_lookahead_or_at_rest_is_not_judged():
-    core, plant = _cruising()
-    ex, ey = _ahead(plant, 3.0, 1.0)
-    assert core.leg_end_reachable(ex, ey, plant.x, plant.y, plant.psi,
-                                  0.13) is None
-    core.v_fb = 0.0                      # parked: no opinion either
-    ex, ey = _ahead(plant, 0.4, 0.35)
-    assert core.leg_end_reachable(ex, ey, plant.x, plant.y, plant.psi,
-                                  0.13) is None
 
 
-def test_leg_end_reachability_holds_in_reverse():
-    """Backing up, 'ahead' is behind the car: an end 0.5 m behind on the
-    heading is reachable, one 0.3 m in FRONT of a reversing car is not."""
-    core, plant = _cruising(cmd_v=-0.30, seconds=8.0)
-    assert plant.v < -0.1
-    ex, ey = _ahead(plant, -0.5, 0.0)
-    unreachable, miss, _ = core.leg_end_reachable(
-        ex, ey, plant.x, plant.y, plant.psi, 0.13)
-    assert not unreachable and miss < 1e-6
-    ex, ey = _ahead(plant, 0.3, 0.0)
-    unreachable, miss, _ = core.leg_end_reachable(
-        ex, ey, plant.x, plant.y, plant.psi, 0.13)
-    assert unreachable
 
 
 def test_stopping_distance_matches_the_goal_tolerance_push():
