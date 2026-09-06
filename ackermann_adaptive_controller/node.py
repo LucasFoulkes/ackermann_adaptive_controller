@@ -27,6 +27,7 @@ docstring for the reasoning and the stop procedure).
 
 import math
 import os
+import uuid
 import tempfile
 
 import rclpy
@@ -305,6 +306,9 @@ class AckermannAdaptiveController(Node):
                 self._flight = open(path, 'a', buffering=1)
                 if new_file:
                     self._flight.write(header)
+                # A controller restart within one launch also begins a new session.
+                run_id = os.environ.get('LUKUMA_RUN_ID', 'standalone') + ':' + uuid.uuid4().hex
+                self._flight.write(f'# run_id {run_id}\n')
                 self.get_logger().info(f'flight log: {path}')
             except OSError as exc:
                 self.get_logger().warn(f'no flight log: {exc}')
@@ -349,6 +353,7 @@ class AckermannAdaptiveController(Node):
             DiagnosticArray, '/diagnostics', 1)
         self.pub_radius = self.create_publisher(
             Float32, '~/min_turning_radius', 1)
+        self.pub_stop_horizon = self.create_publisher(Float32, '~/stop_horizon', 1)
         self.speed_limit_topic = str(g['speed_limit_topic'])
         self.pub_speed_limit = (
             self.create_publisher(SpeedLimit, self.speed_limit_topic, 1)
@@ -390,10 +395,12 @@ class AckermannAdaptiveController(Node):
         if self.estop_button >= 0:
             self.create_subscription(
                 Joy, g['estop_joy_topic'], self.on_joy, sensor_qos)
+        # Stalled status is also published when native Nav2 disables the
+        # optional cusp handshake; its QoS must not depend on that branch.
+        latched = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
         if str(g['segment_direction_topic']):
-            latched = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
-                                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                                 history=HistoryPolicy.KEEP_LAST, depth=1)
             self.create_subscription(
                 Int8, str(g['segment_direction_topic']), self.on_segment_dir,
                 latched)
@@ -803,6 +810,8 @@ class AckermannAdaptiveController(Node):
                 self._set_remote(self.follower_server, self.goal_tol_param, tol)
         # Collision projection horizon: learned, independent of the envelope.
         h = self.core.stop_horizon()
+        if h is not None and finite(h) and h > 0:
+            self.pub_stop_horizon.publish(Float32(data=float(h)))
         if h is not None and self.follower_server and (
                 self.pushed_horizon is None
                 or abs(h - self.pushed_horizon) >= self.radius_rel * self.pushed_horizon):

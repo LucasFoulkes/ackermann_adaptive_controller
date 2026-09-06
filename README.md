@@ -323,3 +323,32 @@ The mathematics is ROS-free and tested against a synthetic plant:
 ```bash
 cd src/ackermann_adaptive_controller && python3 -m pytest test/ -q
 ```
+
+### Flight session identity
+
+New controller instances append a `# run_id` marker without changing CSV
+columns. The report treats markers as session boundaries, including restarts
+less than 60 seconds apart, and prints the run ID. Managed runs share the
+launch ID with `~/.ros/runs/<run_id>/manifest.json` and the bag directory;
+a unique controller-instance suffix distinguishes node restarts. Legacy files
+still use timestamp gaps.
+
+
+### Offline comparison of proposed response models
+
+`ros2 run ackermann_adaptive_controller ackermann_model_report --last-drive`
+compares curvature-space and yaw-rate-space steering fits, and an acceleration
+model against a velocity-prediction model. It selects delays using the middle
+20% of usable observations after fitting on the first 60%, then scores on the untouched final
+20%. Forward and reverse are separate. Rank-deficient or implausible fits are
+reported as unavailable, not confident vehicle knowledge. Without `--last-drive`
+it reports the latest run, including an idle run with no evidence.
+
+This command never publishes motion or changes the learned profile. Its qs/qd
+inputs are logged reconstructed actuator states, not physical steering sensors.
+Prediction accuracy on a closed-loop recording does not establish control
+stability, and terrain changes can explain apparent changes in drive response.
+The direct-yaw online learner remains an experiment: a 2026-09-05 simulator trial
+failed the long-delay/inverted-steering calibration regression. Production keeps
+the existing gated curvature learner; the odometry estimator now projects each
+interval on its midpoint heading, including reverse and yaw wrap crossings.

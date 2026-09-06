@@ -3128,7 +3128,7 @@ def test_agreement_flags_a_fit_the_probe_contradicts():
         core.gain_probe.gain.add(4.6)
         core.gain_probe.eq_fwd.add(0.20)
     ok, text = core.agreement()
-    assert ok and text.startswith('bootstrap: probe'), text
+    assert ok and text.startswith('bootstrap: measured equilibrium'), text
     # a plausible, ready fit that says b0 0.63 against a probe of 4.6
     core.rls_lon.theta = [0.63, 0.0, 0.0, -0.13]
     core.rls_lon.count = 10_000
@@ -3473,3 +3473,36 @@ def test_stopping_distance_matches_the_goal_tolerance_push():
         return
     v_ap = core.policy.approach_speed_frac * core.v_op
     assert 0.0 < d < 1.0 and d > v_ap * core.lon_bank.delay
+
+
+@pytest.mark.parametrize('direction', [1., -1.])
+@pytest.mark.parametrize('heading', [0., math.pi-.03, -math.pi+.03])
+def test_twist_midpoint_projection_is_symmetric_across_yaw_wrap(direction, heading):
+    est=TwistEstimator()
+    est.update(10.,0.,0.,heading)
+    dt=.13; dpsi=.16*direction; chord=.04*direction
+    middle=heading+dpsi/2
+    out=est.update(10.+dt,chord*math.cos(middle),chord*math.sin(middle),math.atan2(math.sin(heading+dpsi),math.cos(heading+dpsi)))
+    assert out[1] == pytest.approx(chord/dt)
+    assert out[2] == pytest.approx(dpsi/dt)
+
+
+def test_recorded_wrong_sign_feedforward_reports_disagreement():
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.rls_lon.theta = [2.208, .324, -.151, -.190]
+    core.rls_lon.count = 7190
+    core.qd_lo, core.qd_hi = -.31, .36
+    core.vl_lo, core.vl_hi = -.74, .77
+    core.v_op = .30
+    for _ in range(core.policy.deadband_evidence):
+        core.gain_probe.eq_fwd.add(.211)
+        core.gain_probe.eq_rev.add(.20)
+        core.deadband.observe(1., .235)
+        core.deadband.observe(-1., .235)
+    assert core.ready_lon
+    # Generic physical validation intentionally tolerates small fit noise.
+    # Diagnostics must still expose a contradiction with measured cruise.
+    assert core.lon_plausible()
+    ok, text = core.agreement()
+    assert not ok and 'DISAGREE' in text and 'learned feedforward' in text

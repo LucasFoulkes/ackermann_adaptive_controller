@@ -35,7 +35,11 @@ def read_log(path):
     rows = []
     with open(path, errors='replace') as fh:
         header = fh.readline().strip().split(',')
+        run_id = ''
         for line in fh:
+            if line.startswith('# run_id '):
+                run_id = line.strip().split(' ', 2)[2]
+                continue
             if '\x00' in line or '�' in line:
                 continue
             parts = line.rstrip('\n').split(',')
@@ -47,6 +51,7 @@ def read_log(path):
                     row[k] = v if k == 'phase' else float(v)
             except ValueError:
                 continue
+            row['_run_id'] = run_id
             rows.append(row)
     return header, rows
 
@@ -55,7 +60,8 @@ def sessions(rows):
     out, cur = [], []
     for r in rows:
         if cur and (r['stamp'] - cur[-1]['stamp'] > SESSION_GAP
-                    or r['stamp'] < cur[-1]['stamp']):
+                    or r['stamp'] < cur[-1]['stamp']
+                    or r.get('_run_id','') != cur[-1].get('_run_id','')):
             out.append(cur)
             cur = []
         cur.append(r)
@@ -169,6 +175,7 @@ def score_session(s, cmd_min=0.05, gate=0.05):
             'fitted': fitted[key],
         })
     return {
+        'run_id': s[0].get('_run_id','legacy'),
         'steering': steering,
         'start': t0, 'end': s[-1]['stamp'], 'rows': len(s),
         'commanded': len(commanded), 'mean_cmd': mean_cmd,
@@ -214,6 +221,7 @@ def render(sc):
         f"{time.strftime('%H:%M:%S', lt(sc['end']))}  "
         f"({(sc['end'] - sc['start']) / 60:.1f} min, {sc['rows']} ticks, "
         f"{sc['commanded']} commanded)",
+        f"  run: {sc.get('run_id', 'legacy')}",
         f"  verdict: {verdict(sc)}",
         f"  tracking: err_rms {fmt(sc['err_rms'], '.3f')} m/s "
         f"({fmt(None if sc['err_rel'] is None else sc['err_rel'] * 100, '.0f')}% "
