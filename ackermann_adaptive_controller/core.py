@@ -235,6 +235,8 @@ class AdaptiveCore:
         # What was actually on the wire this tick, when someone else drives.
         self._wire = None
         self._cmd_dir = 0.0
+        self._reversal_target = 0.0
+        self._reversal_still = 0.0
         self._stall_since = None
         # Smallest throttle that has actually been seen to move this vehicle.
         # Static friction is not expressible in a linear model, so it is
@@ -764,22 +766,18 @@ class AdaptiveCore:
                 # the direction the car actually moved. Works in PASSIVE too
                 # (the history holds the joystick's commands there).
                 d = self._delayed_cmd(self.policy.lon_delay)
-                # The stall is over: whatever the wire carried at unstick
-                # was a bid against STATIC friction, and carried whole
-                # into the rolling regime it was the relaxation oscillator
-                # that kept the 08-31 limit cycle going (~0.2 extra wire
-                # at breakaway, ~2 s of overspeed to unwind). Once a
-                # MEASURED equilibrium wire exists the feedforward carries
-                # the cruise and the integrator restarts from zero; before
-                # that it restarts from the unstick wire DERATED by
-                # deadband_trust -- the same static-to-kinetic derate the
-                # dead-band offset uses -- because some feedforward must
-                # carry the car until the probe has one (with nothing
-                # carrying, every bootstrap launch collapsed back into a
-                # stall two ticks after the latch).
+                # Replace accumulated launch effort with a cruise estimate.
+                # Preserve the portion not supplied by the active feedforward;
+                # clearing all trim here caused the recorded start/stop loop.
                 d_dir = sgn(self.v_fast) or 1.0
-                if self.gain_probe.eq(d_dir) is not None:
-                    self.iv = 0.0
+                eq = self.gain_probe.eq(d_dir)
+                if eq is not None:
+                    # Seed the trim with the part of measured cruise that
+                    # the ACTIVE feedforward does not provide. Readiness
+                    # alone does not mean the fitted equilibrium is correct.
+                    ff = self._ff_wire or 0.0
+                    correction = d_dir * eq - ff if self.ready_lon and self.lon_plausible() else 0.0
+                    self.iv = clamp(correction, -self.policy.iv_max, self.policy.iv_max)
                 elif d is not None and sgn(d[1]) == d_dir:
                     cap_iv = self._static_wire_cap(d_dir)
                     self.iv = d_dir * min(
@@ -1369,9 +1367,64 @@ class AdaptiveCore:
         return raw_band if raw_band is not None \
             else self.policy.launch_floor + self.policy.launch_cap_margin
 
+    def _lon_feedforward_trusted(self, direction, speed):
+        """Reject fitted braking when observations show positive cruise effort.
+
+        Gain probes can be biased in closed loop, so gain disagreement alone
+        does not discard an otherwise useful equilibrium fit.
+        """
+        if not (self.policy.use_learned_lon and self.ready_lon and self.lon_plausible()):
+            return False
+        b0, b1, b2, b3 = self.rls_lon.theta
+        v = speed if self.vl_lo is None else clamp(speed, self.vl_lo, self.vl_hi)
+        ff = -(b1 + b2 * v * abs(v) + b3 * direction) / b0 * direction
+        eq = self.gain_probe.eq(direction) if direction else None
+        # A contradictory fit falls back to measured cruise plus PI. The
+        # fallback transfers equilibrium changes into trim without a step.
+        return finite(ff) and (eq is None or eq <= 0.0 or ff > 0.0)
+
+    def _reversal_command(self, v, cmd_v, dt):
+        """Brake to rest and drain delayed commands before starting the new leg."""
+        direction = sgn(cmd_v) if abs(cmd_v) > self.stall_cmd_min else 0.0
+        if self._reversal_target and direction != self._reversal_target:
+            self._reversal_target = 0.0
+            self._reversal_still = 0.0
+        changing = bool(direction and self._cmd_dir and direction != self._cmd_dir)
+        if not self._reversal_target and changing and v * direction < -self.gate_d:
+            self._reversal_target = direction
+            self._reversal_still = 0.0
+        if not self._reversal_target:
+            return None
+        self.iv = 0.0
+        self._floor = self._cap = self._floor_dir = 0.0
+        self._ff_wire = 0.0
+        self._steer_wait = False
+        stop_speed = max(0.3 * self.gate_d, 3.0 * self.sigma_v)
+        if abs(v) <= stop_speed:
+            self._reversal_still += dt
+        else:
+            self._reversal_still = 0.0
+        if self._reversal_still >= max(2.0 * dt, self.lon_bank.delay + self.policy.tau_d):
+            self._reversal_target = 0.0
+            self._reversal_still = 0.0
+            self.rolling = False
+            self._roll_run = 0
+            self._cmd_dir = direction
+            return None
+        # Feedback targets ZERO while braking, never the opposite cruise speed.
+        # Hold the steering until stopped; yaw trim must not learn across a cusp.
+        divisor = self._lon_divisor(self.model.b0, self.lon_plausible())
+        brake_time = max(dt, self.lon_bank.delay + self.policy.tau_d)
+        brake = (0.0 if abs(v) <= stop_speed else
+                 clamp(-v / (divisor * brake_time), -1.0, 1.0))
+        return self.prev_us, brake
+
     def _run(self, v, cmd_v, cmd_w, dt):
         """Invert the learned model and add integral trim."""
         p = self.policy
+        reversal = self._reversal_command(v, cmd_v, dt)
+        if reversal is not None:
+            return reversal
         a0l, a0r, a0l_rev, a0r_rev, a1, a2 = self.rls_lat.theta
         b0, b1, b2, b3 = self.rls_lon.theta
 
@@ -1446,7 +1499,7 @@ class AdaptiveCore:
         # unwinding slowly when the demand flipped -- "all left, all right".
         saturated = abs(self.prev_us) >= 0.95
         if not saturated and kappa_delayed is not None \
-                and abs(v) > 0.5 * self.gate_d:
+                and v * v_eff > 0.0 and abs(v) > 0.5 * self.gate_d:
             kappa_meas = self.psidot / (sgn(v_eff) * abs(v))
             weight = min(1.0, abs(v) / max(self.v_op, 1e-3))
             self.iw = clamp(
@@ -1533,26 +1586,9 @@ class AdaptiveCore:
         # ahead", 142 times) failed 15 of the session's legs.
 
         # --- throttle -----------------------------------------------------
-        # Deliberately minimal. Everything that used to sit here -- a
-        # measured "breakaway", a kinetic feedforward seeded from it, a
-        # launch kick, a standstill cap, an anti-stall floor, a rolling
-        # latch -- was built on a breakaway measurement that is biased by
-        # construction (the probe ramps faster than motion can be detected,
-        # so it always records true breakaway plus ramp x latency, ~0.25),
-        # and each layer then over-pushed by that bias: lunge, brake-slam,
-        # stall, re-measure higher. The flight logs show the plain PI
-        # cruising smoothly whenever that machinery was dormant, and the
-        # violent stepping whenever it engaged.
-        #
-        # Stiction is handled by the integrator: it ramps slowly and
-        # bias-free until the wheels turn, and then simply keeps what it
-        # needed. That is all a breakaway probe ever should have been.
-        # A direction reversal starts the integrator from zero. It is a
-        # stiction ramp, and the stiction in the new direction owes nothing
-        # to what the old one needed; left alone it held the robot driving
-        # the WRONG way for up to 4.8 s after a cusp (16 of 71 reversals in
-        # the flight log took more than 2 s to change sign), because the
-        # smoother's ramp through zero rarely lands on exactly 0.0.
+        # Learned or measured feedforward carries cruise; PI corrects tracking.
+        # Launch assistance applies only before motion. Direction changes are
+        # handled above as a stop followed by a new launch.
         direction = sgn(cmd_v) if abs(cmd_v) > self.stall_cmd_min else 0.0
         if direction and self._cmd_dir and direction != self._cmd_dir:
             self.iv = 0.0
@@ -1575,8 +1611,7 @@ class AdaptiveCore:
         # slammed 0.44/0.06 at 1 Hz and the car surged 0..0.8 m/s on a
         # 0.32 command (08-30 23:16); the same run repeated from-zero on
         # 08-31 01:08, where no anchor existed at all. See _lon_divisor.
-        lon_ok = (self.ready_lon and p.use_learned_lon
-                  and self.lon_plausible())
+        lon_ok = self._lon_feedforward_trusted(sgn(cmd_v) or sgn(v), cmd_v)
         b0_fb = self._lon_divisor(b0, lon_ok)
         a_des = clamp(self.kp_v * err, -b0_fb, b0_fb)
         # Conditional integration (see _shaped in reset): no winding into
@@ -1584,11 +1619,8 @@ class AdaptiveCore:
         # is deliberate -- it is what escalates the wire from the
         # bootstrap floor up to a breakaway the dead band has not
         # measured yet -- but everything wound while stuck is a bid
-        # against stiction, and it is DISCARDED at the rolling latch
-        # (see step): carried into the rolling regime it was the
-        # relaxation oscillator that kept the 08-31 limit cycle going
-        # even with the probe's correct gain and equilibrium wire (~0.2
-        # extra wire at breakaway, ~2 s of overspeed to unwind).
+        # against stiction. At the rolling latch it is replaced by the
+        # correction needed to reconcile feedforward with measured cruise.
         # The integral path goes through the SAME gain normalisation as
         # the proportional one. It used to add wire directly, which
         # matched a_des/b0_fb only while the divisor sat at ~1: with a
@@ -1643,10 +1675,19 @@ class AdaptiveCore:
                 # overspeed IS the stall -- the discontinuity that carried
                 # the 01:08 limit cycle even at modest loop gain.
                 ud = a_des / b0_fb
-                # Same principle as the model branch: the wire that holds
-                # a speed cannot exceed the wire that measurably breaks
-                # the car free.
-                ff = clamp(eq, 0.0, self._static_wire_cap(s_dir)) * s_dir
+                # A rejected fit must not also suppress the measured cruise
+                # via an inconsistent start estimate. Ordinary bootstrap
+                # retains its conservative start-based bound.
+                rejected_fit = self.ready_lon and p.use_learned_lon and self.lon_plausible()
+                cap_eq = 1.0 if rejected_fit else self._static_wire_cap(s_dir)
+                ff = clamp(eq, 0.0, cap_eq) * s_dir
+                # A moving equilibrium estimate is not a new speed request.
+                # Transfer its change into integral trim to keep cruise smooth.
+                if (rejected_fit and self.rolling and self._roll_since is not None
+                        and self.now - self._roll_since > self.lon_bank.delay + p.tau_d
+                        and self._ff_wire is not None and self._ff_wire * s_dir > 0.0
+                        and not reversing):
+                    self.iv = clamp(self.iv + self._ff_wire - ff, -p.iv_max, p.iv_max)
                 self._ff_wire = ff if not reversing else 0.0
                 if not reversing and v * s_dir >= 0.0:
                     ud += ff
@@ -1707,8 +1748,11 @@ class AdaptiveCore:
             # hole (08-31 bench, the 0.58 m/s reversal).
             static = -(b1 + b3 * s_dir) / b0
             cap_w = self._static_wire_cap(s_dir)
-            static = clamp(static, -cap_w, cap_w)
-            ff = static - b2 * v_ff * abs(v_ff) / b0
+            # Clamp the SUM: separately clipping collinear static and drag
+            # terms can turn a correct positive equilibrium into braking.
+            drag = -b2 * v_ff * abs(v_ff) / b0
+            cap_ff = cap_w + max(0.0, drag * s_dir)
+            ff = clamp(static + drag, -cap_ff, cap_ff)
             self._ff_wire = clamp(ff, -1.0, 1.0) if not reversing else 0.0
             if not reversing and v * s_dir >= 0.0:
                 # ...and none of it while the car still rolls AGAINST
@@ -1863,12 +1907,12 @@ class AdaptiveCore:
                 self._cap = 0.0
                 return us, 0.0, True
 
-        if self._steer_wait:
-            # parked on purpose while the wheels turn (see _run): not a
-            # stall, so neither the floor ride nor the blocked clock runs
+        if self._steer_wait or self._reversal_target:
+            # A steering wait or controlled reversal is intentional, not a
+            # stall. Preserve the reversal brake while pausing stall clocks.
             self._stall_since = None
             self._capped_since = None
-            return us, 0.0, False
+            return us, ud if self._reversal_target else 0.0, False
 
         if want and not moving:
             if self._stall_since is None:
@@ -2126,7 +2170,8 @@ class AdaptiveCore:
                 ok = False
         if brk is not None and m.b0 > 0.0 and m.b3 < 0.0:
             parts.append(f'breakaway/fit {brk:.2f}/{-m.b3 / m.b0:.2f}')
-        source = ('learned feedforward' if lon_ok else
+        trusted = self._lon_feedforward_trusted(1.0, self.v_op)
+        source = ('learned feedforward' if trusted else
                   'bootstrap: measured equilibrium' if eq is not None else
                   'bootstrap: probe gain' if pb else 'bootstrap: prior')
         text = source + (' | ' + ', '.join(parts) if parts else '')

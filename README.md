@@ -60,3 +60,14 @@ ros2 run ackermann_adaptive_controller ackermann_flight_report --help
 
 Tests use a small numerical vehicle model and isolated ROS initialization.
 They are regression evidence, not proof of real-world navigation performance.
+
+Startup-to-cruise control preserves the throttle correction missing from the
+active feedforward model. If a fitted cruising command opposes observed motion,
+the controller uses measured cruising throttle with PI feedback while learning
+continues. It bounds the combined fitted compensation rather than independently
+clipping terms that may cancel each other.
+
+A requested direction change while moving brakes toward zero speed, waits for
+stationary odometry across the estimated response delay, then launches the new
+leg. Diagnostics report `stopping before changing direction`. Steering trim is
+not updated using measurements from the opposite travel direction.

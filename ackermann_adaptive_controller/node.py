@@ -580,6 +580,8 @@ class AckermannAdaptiveController(Node):
             status.level, status.message = DiagnosticStatus.WARN, 'waiting for velocity command'
         elif self.core.blocked:
             status.level, status.message = DiagnosticStatus.WARN, 'blocked: actuator stall hold'
+        elif self.core._reversal_target:
+            status.level, status.message = DiagnosticStatus.WARN, 'stopping before changing direction'
         elif self.core._steer_wait:
             status.level, status.message = DiagnosticStatus.WARN, 'waiting for steering response'
         elif self.core.phase != RUN:

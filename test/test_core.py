@@ -1445,7 +1445,9 @@ def test_direction_reversal_resets_the_throttle_integrator():
             plant.step(out.steer, out.drive, 0.02)
         x, y, psi = plant.observe()
         out = core.step(t + 0.1, x, y, psi, 0.3, 0.0)
-    assert out.drive > 0.0                  # ...the throttle is forward
+    assert out.drive >= 0.0                 # brake or neutral; never pushes the old direction
+    _, t = drive(core, plant, lambda s: (.3, 0.), 5., t0=t + .2)
+    assert plant.v > .2                     # completes the stop and new launch
 
 
 def test_lateral_gate_is_capped_at_the_operating_speed():
@@ -2158,6 +2160,9 @@ def test_moving_reversal_brakes_without_feedforward_or_integrator():
     core.rolling = False
     core.v = core.v_fb = core.v_fast = 0.0
     _, ud0 = core._run(0.0, -0.30, 0.0, 0.1)
+    assert ud0 == 0.0  # one stationary sample cannot drain delayed braking
+    for _ in range(12):
+        _, ud0 = core._run(0.0, -0.30, 0.0, 0.1)
     assert ud0 <= -core.policy.launch_floor, ud0
 
 
@@ -2204,7 +2209,7 @@ def test_direction_change_rearms_the_settled_gates():
     _, t = drive(core, plant, lambda s: (-0.30, 0.0), 6.0, t0=t)
     assert core.rolling and core._roll_dir == -1.0
     assert core._dir_since > since + 1.0       # lateral gate re-armed
-    assert core._roll_since == roll_since      # longitudinal gate untouched
+    assert core._roll_since > roll_since       # stop/relaunch also rearms longitudinal learning
 
 
 def test_restored_model_is_no_more_gullible_than_a_fresh_one():
@@ -3460,4 +3465,62 @@ def test_recorded_wrong_sign_feedforward_reports_disagreement():
     # Diagnostics must still expose a contradiction with measured cruise.
     assert core.lon_plausible()
     ok, text = core.agreement()
-    assert not ok and 'DISAGREE' in text and 'learned feedforward' in text
+    assert not ok and 'DISAGREE' in text and 'bootstrap: measured equilibrium' in text
+    core.rolling = True
+    _, wire = core._run(.3, .3, 0., .1)
+    assert wire >= .20  # measured cruise replaces the opposing fitted output
+
+
+@pytest.mark.parametrize('direction', [1., -1.])
+def test_reversal_requires_a_settled_stop_before_opposite_launch(direction):
+    core = AdaptiveCore()
+    settle_sense(core, Plant())
+    core.v_op = .3
+    core._cmd_dir = -direction
+    core.rolling = True
+    core.prev_us = .4
+    core.iv = .2
+    _, wire = core._run(-direction * .3, direction * .3, direction * .1, .1)
+    assert wire * direction > 0  # braking the old motion
+    assert core.iv == 0 and core._reversal_target == direction
+    assert core.prev_us == .4
+    _, wire = core._run(0., direction * .3, 0., .1)
+    assert wire == 0
+    # A brief stopped reading followed by renewed motion resets the dwell.
+    core._run(-direction * .15, direction * .3, 0., .1)
+    assert core._reversal_still == 0
+    for _ in range(12):
+        _, wire = core._run(0., direction * .3, 0., .1)
+    assert core._reversal_target == 0 and wire * direction > 0
+    # A stop request always cancels the pending reversal.
+    core._cmd_dir = -direction
+    core._run(-direction * .3, direction * .3, 0., .1)
+    _, wire = core._run(0., 0., 0., .1)
+    assert wire == 0 and core._reversal_target == 0
+
+
+def test_recorded_start_model_cruises_without_launch_drop_cycles():
+    core = AdaptiveCore(Policy(enable_dither=False))
+    plant = Sticky(breakaway=.22, b=(4., 0., -.2), pose_noise=.0005)
+    plant.kinetic = .8
+    t = settle_sense(core, plant)
+    core.rls_lon.theta = [1.935, .262, -.013, -.167]
+    core.rls_lon.count = 7206
+    core.qd_lo, core.qd_hi = -.31, .36
+    core.vl_lo, core.vl_hi = -.74, .77
+    core.v_op = .32
+    for _ in range(core.policy.deadband_evidence):
+        core.gain_probe.eq_fwd.add(.211)
+        core.gain_probe.eq_rev.add(.20)
+        core.deadband.observe(1., .15)  # stale low breakaway must not clip cruise
+    speeds = []
+    for i in range(160):
+        t += .1
+        out = core.step(t, *plant.observe(), .32, 0.)
+        for _ in range(5):
+            plant.step(out.steer, out.drive, .02)
+        if i >= 50:
+            speeds.append(plant.v)
+    assert min(speeds) > .10
+    assert max(speeds) < .5
+    assert sum(speeds) / len(speeds) == pytest.approx(.32, abs=.08)
