@@ -108,3 +108,44 @@ def test_clock_reset_is_latched_until_explicit_reset():
     assert not h.accept(odom(5.),5.)
     assert not h.accept(odom(5.1),5.1)
     assert h.clock_fault
+
+
+def test_radius_poll_reads_without_rebuilding_and_detects_reset():
+    from ackermann_adaptive_controller.nav2_capability import TurningCapability
+    calls=[]
+    def call(req):
+        f=Future();calls.append((req,f));return f
+    client=NS(service_is_ready=lambda:True,call_async=call)
+    n=NS(create_client=lambda *_:client,get_logger=lambda:NS(info=lambda *_:None,warn=lambda *_:None),
+         core=NS(envelope=NS(confirmed=True,min_turning_radius=lambda _:1.),model=None,
+                 stop_horizon=lambda:None,policy=NS(radius_push_margin=1.)),
+         pub_radius=NS(publish=lambda _:None))
+    cap=TurningCapability(n,dict(publish_turning_radius=True,planner_server='/planner',planner_radius_param='radius',
+        controller_server='',controller_radius_param='',radius_filter_alpha=.25,radius_rel_change=.1,radius_abs_change=.05))
+    target=('/planner','radius')
+    cap.confirmed[target]=1.;cap.confirmed_at[target]=0.
+    cap.tick()
+    assert calls[-1][0].names==['radius']
+    calls[-1][1].set_result(NS(values=[NS(type=3,double_value=1.)]))
+    cap.tick();assert len(calls)==1
+    # A lifecycle reconfigure restoring another value must get corrected.
+    cap.confirmed_at[target]=0.;cap.tick()
+    calls[-1][1].set_result(NS(values=[NS(type=3,double_value=.5)]))
+    cap.tick();assert calls[-1][0].parameters[0].value.double_value==1.
+    calls[-1][1].set_result(NS(results=[NS(successful=True)]))
+    cap.tick();assert len(calls)==3
+
+
+def test_follower_gets_physical_radius_and_planner_gets_margin():
+    from ackermann_adaptive_controller.nav2_capability import TurningCapability
+    sent=[]
+    node=NS(core=NS(envelope=NS(confirmed=True,min_turning_radius=lambda _:.8),model=None,
+                   stop_horizon=lambda:None,policy=NS(radius_push_margin=1.2)),
+            pub_radius=NS(publish=lambda _:None))
+    cap=TurningCapability(node,dict(publish_turning_radius=True,
+        planner_server='/planner',planner_radius_param='radius',
+        controller_server='/controller',controller_radius_param='radius',
+        radius_filter_alpha=.25,radius_rel_change=.1,radius_abs_change=.05))
+    cap._send=lambda target,value:sent.append((target,value))
+    cap.tick()
+    assert sent==[(('/planner','radius'),pytest.approx(.96)),(('/controller','radius'),pytest.approx(.8))]

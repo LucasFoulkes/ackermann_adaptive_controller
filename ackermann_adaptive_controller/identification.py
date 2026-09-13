@@ -14,7 +14,9 @@ class RLS:
     estimate permanently.
     """
 
-    def __init__(self, theta0, p0, p_max, bounds=None, absorber=None):
+    def __init__(self, theta0, p0, p_max, bounds=None, absorber=None, valid_theta=None):
+        self.valid_theta = valid_theta
+        self.rejected = 0
         self.n = len(theta0)
         self.theta = list(theta0)
         self.P = [[p0 if i == j else 0.0 for j in range(self.n)]
@@ -81,6 +83,8 @@ class RLS:
         if not finite(y, lam, *phi) or lam <= 0.0:
             return False
 
+        previous_P = [row[:] for row in self.P] if self.valid_theta else None
+
         # DIRECTIONAL forgetting (Kulhavy & Karny 1984, "restricted
         # exponential forgetting"): discount the information only along
         # the direction this sample excites, then add the sample with no
@@ -128,7 +132,14 @@ class RLS:
         theta = [self.theta[i] + gain[i] * err for i in range(self.n)]
         if not finite(*theta):
             return False
-        self.theta = self.project(theta, phi)
+        theta = self.project(theta, phi)
+        if self.valid_theta is not None and not self.valid_theta(theta):
+            # Reject the entire inconsistent update, including forgetting.
+            # Clipping gain and moving the error into bias hides bad evidence.
+            self.P = previous_P
+            self.rejected += 1
+            return False
+        self.theta = theta
 
         # P = (P - gain outer Pphi) / lam, then symmetrize and bound.
         for i in range(self.n):
@@ -187,7 +198,8 @@ class DelayBank:
 
     def __init__(self, theta0, p0, p_max, delays, ew_tau, margin,
                  bounds=None, absorber=None, gain_idx=(0,), min_count=0,
-                 gains=None):
+                 gains=None, fixed_signs=None, valid_theta=None):
+        self.fixed_signs = fixed_signs
         self.delays = list(delays)
         self.prior = list(theta0)
         # ``gains(theta)`` -> per-cell IDENTIFIABLE gains, the veto on a
@@ -201,7 +213,7 @@ class DelayBank:
         # (08-29 bench, recovery test). The lateral bank passes the span
         # a0 + a2 v_op^2 per cell; the default is the bare coefficients.
         self.gains = gains or (lambda th: [th[k] for k in gain_idx])
-        self.bank = [RLS(list(theta0), p0, p_max, bounds, absorber)
+        self.bank = [RLS(list(theta0), p0, p_max, bounds, absorber, valid_theta)
                      for _ in self.delays]
         self.score = [None] * len(self.delays)
         self.active = len(self.delays) // 2
@@ -233,6 +245,8 @@ class DelayBank:
                                          signs))
 
     def _signs(self):
+        if self.fixed_signs is not None:
+            return self.fixed_signs
         # From the BARE cells, not the span: a span's sign flips when a2
         # is large, and signs taken from it hopped the bank between
         # candidates with inverted cells (08-29 bench).

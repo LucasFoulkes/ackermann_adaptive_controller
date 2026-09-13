@@ -245,9 +245,47 @@ class DeadBand:
         # median overrides the bound whenever it exists.
         self.fwd_ub = _Window(policy.deadband_evidence, span=4)
         self.rev_ub = _Window(policy.deadband_evidence, span=4)
+        # The last few starts in time order, slow samples and fast-start
+        # bounds alike: the surface under the wheels RIGHT NOW. The long
+        # medians follow a surface change only after a dozen starts; on
+        # 09-11 grass they still said 0.33 while every start needed 0.6-0.8.
+        # Slow starts (measurements) and fast starts (upper bounds) are
+        # kept apart here too: a floor that launches the car at once says
+        # only "the band is below this", and that bound is what brings the
+        # floor back down on an easier surface.
+        self.fwd_recent = deque(maxlen=policy.deadband_evidence)
+        self.rev_recent = deque(maxlen=policy.deadband_evidence)
+        self.fwd_recent_ub = deque(maxlen=policy.deadband_evidence)
+        self.rev_recent_ub = deque(maxlen=policy.deadband_evidence)
 
     def _win(self, direction):
         return self.fwd if direction > 0.0 else self.rev
+
+    def _recent_win(self, direction):
+        return self.fwd_recent if direction > 0.0 else self.rev_recent
+
+    def _recent_ub(self, direction):
+        return self.fwd_recent_ub if direction > 0.0 else self.rev_recent_ub
+
+    @staticmethod
+    def _median(vals):
+        vals = sorted(vals)
+        n = len(vals)
+        return vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+    def recent(self, direction):
+        """Breakaway on the surface under the wheels: the median of the
+        last few slow starts, lowered by any fast start since (its wire
+        bounds the band from above). None until two starts of either kind
+        exist: one start is a glitch candidate."""
+        slow, fast = self._recent_win(direction), self._recent_ub(direction)
+        if len(slow) + len(fast) < 2:
+            return None
+        estimate = self._median(slow) if slow else None
+        if fast:
+            bound = min(fast)
+            estimate = bound if estimate is None else min(estimate, bound)
+        return estimate
 
     def _ub(self, direction):
         return self.fwd_ub if direction > 0.0 else self.rev_ub
@@ -257,6 +295,13 @@ class DeadBand:
         if direction == 0.0 or not finite(wire) or not 0.0 < wire <= 1.0:
             return False
         self._ub(direction).add(wire)
+        self._recent_ub(direction).append(wire)
+        # A fast start also ends the previous surface's slow-start evidence
+        # above it: those samples cannot describe a floor this easy.
+        win = self._recent_win(direction)
+        for v in list(win):
+            if v > wire:
+                win.remove(v)
         return True
 
     def raw(self, direction):
@@ -274,6 +319,13 @@ class DeadBand:
         if direction == 0.0 or not finite(wire) or not 0.0 < wire <= 1.0:
             return False
         self._win(direction).add(wire)
+        self._recent_win(direction).append(wire)
+        # A slow start that needed more than an earlier fast start's bound
+        # means the surface got harder: that bound no longer applies.
+        ub = self._recent_ub(direction)
+        for v in list(ub):
+            if v < wire:
+                ub.remove(v)
         return True
 
     def confirmed(self, direction):
@@ -321,7 +373,11 @@ class DeadBand:
     def state(self):
         return {'fwd': list(self.fwd.vals), 'rev': list(self.rev.vals),
                 'fwd_ub': list(self.fwd_ub.vals),
-                'rev_ub': list(self.rev_ub.vals)}
+                'rev_ub': list(self.rev_ub.vals),
+                'fwd_recent': list(self.fwd_recent),
+                'rev_recent': list(self.rev_recent),
+                'fwd_recent_ub': list(self.fwd_recent_ub),
+                'rev_recent_ub': list(self.rev_recent_ub)}
 
     def load(self, d):
         if not isinstance(d, dict):
@@ -339,6 +395,15 @@ class DeadBand:
                     finite(v) and 0.0 < v <= 1.0 for v in vals):
                 win.vals = deque(vals[-win.vals.maxlen:],
                                  maxlen=win.vals.maxlen)
+        # recent-surface windows: optional likewise, restored so a reboot on
+        # grass starts from the grass floor, not the long indoor median
+        for key, win in (('fwd_recent', self.fwd_recent), ('rev_recent', self.rev_recent),
+                         ('fwd_recent_ub', self.fwd_recent_ub), ('rev_recent_ub', self.rev_recent_ub)):
+            vals = d.get(key)
+            if isinstance(vals, list) and all(
+                    finite(v) and 0.0 < v <= 1.0 for v in vals):
+                win.clear()
+                win.extend(vals[-win.maxlen:])
         return True
 
 

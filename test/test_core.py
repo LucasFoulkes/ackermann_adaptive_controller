@@ -1773,6 +1773,7 @@ def test_sustained_garbage_odometry_stops_the_robot_and_the_learning():
     _, t = drive(core, plant, lambda s: (0.4, 0.0), 15.0, t0=t)
     theta = list(core.rls_lon.theta) + list(core.rls_lat.theta)
     rng = random.Random(3)
+    steering = core.prev_us
     out = None
     for _ in range(30):                     # 3 s of a jumping scan matcher
         t += 0.1
@@ -1781,7 +1782,7 @@ def test_sustained_garbage_odometry_stops_the_robot_and_the_learning():
                         y + rng.uniform(-0.3, 0.3),
                         psi + rng.uniform(-0.3, 0.3), 0.4, 0.0)
     assert not core.odom_ok
-    assert out.drive == 0.0 and out.steer == 0.0
+    assert out.drive == 0.0 and out.steer == steering
     assert list(core.rls_lon.theta) + list(core.rls_lat.theta) == theta
     # the stream comes back: sane for odom_recover_time, then drives again
     plant.v = 0.0
@@ -3582,3 +3583,62 @@ def test_legacy_envelope_and_zero_response_evidence_load():
     saved = env.state()
     saved['right_rev'] = [0.] * 40
     assert env.load(saved) and env.fidelity() == 0.
+
+
+def test_rolling_below_starting_deadband_has_bounded_acceleration():
+    """Run 472256c2: cruising wire .209, breakaway .252, noise .0052."""
+    core = AdaptiveCore()
+    core.now = 10.0
+    core.rolling = True
+    core._roll_since = 1.0
+    core.v_prev = .247
+    core.gate_d = .1
+    core.sigma_v = .0052
+    for _ in range(30):
+        core.deadband.observe(1., .252 / core.policy.deadband_trust)
+    core.record_command(10., -.628, .209)
+    # A sustained modest increase must become admissible as time passes;
+    # an impossible one-tick jump must still be rejected.
+    assert core._speed_up_limit(.2, .36) > .36 - .247
+    assert core._speed_up_limit(.1, .8) < .8 - .247
+    core._cmd_hist.clear()
+    core.record_command(10., -.628, 0.)
+    assert core._speed_up_limit(.2, .36) < .36 - .247
+
+
+def test_implausible_turn_stops_drive_without_centering_then_recovers():
+    core = AdaptiveCore()
+    plant = Plant()
+    t = settle_sense(core, plant)
+    _, t = drive(core, plant, lambda _: (.3, .2), 10., t0=t)
+    steering = core.prev_us
+    assert abs(steering) > .05
+    # Sustained impossible yaw rate trips the gate but cannot change steering.
+    for _ in range(25):
+        plant.step(steering, 0., .1)
+        x, y, psi = plant.observe()
+        out = core.step(t, x, y, psi, .3, .2, v_meas=.3, psidot_meas=20.)
+        t += .1
+    assert not core.odom_ok
+    assert out.drive == 0.
+    assert out.steer == steering
+    # A zero navigation command still centers; no accidental propulsion.
+    out = core.step(t, x, y, psi, 0., 0., v_meas=.3, psidot_meas=20.)
+    assert out.drive == out.steer == 0.
+    # A consistent stationary stream earns trust and allows a new turn.
+    for _ in range(25):
+        t += .1
+        out = core.step(t, x, y, psi, 0., 0., v_meas=0., psidot_meas=0.)
+    assert core.odom_ok
+    t += .1
+    out = core.step(t, x, y, psi, .3, .2, v_meas=0., psidot_meas=0.)
+    assert out.steer != 0.
+
+
+def test_recorded_cruise_does_not_chain_into_an_odometry_fault():
+    from pathlib import Path
+    from replay_cruise_gate import replay
+    result = replay(Path(__file__).parent / 'fixtures/recorded_cruise_gate.json')
+    assert result['held_samples'] <= 1, result
+    assert result['longest_hold_s'] < .1, result
+    assert result['final_accepted_speed'] > .28, result

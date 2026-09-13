@@ -42,6 +42,10 @@ class Policy:
     cal_drive: float = 0.42
     enable_calibration: bool = False
 
+    # Enable staged throttle-model validation; robot bringup opts in.
+    validate_lon: bool = False
+    validate_lat: bool = False
+
     # Learner.
     p0: float = 10.0          # initial skepticism
     t_forget: float = 170.0   # s half-life: how fast the world changes
@@ -224,6 +228,9 @@ class Policy:
     # vehicle properties: the base the cap rides on is learned.
     launch_cap_margin: float = 0.10
     launch_cap_rate: float = 0.10   # cap growth per second stuck
+    # Explicit bounded start effort, independent of the PI trim budget.
+    # Zero retains the legacy floor + iv_max ceiling for existing profiles.
+    launch_effort_limit: float = 0.0
     # Only sized (and therefore only active) after the CAL wiggle has run.
     enable_dither: bool = True
 

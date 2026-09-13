@@ -20,8 +20,9 @@ from .model_checks import lon_sane
 from .math_utils import finite, clamp, wrap, sgn, sane_gain_cells, _span, _load_span, _stddev
 from .policy import Policy
 from .identification import RLS, DelayBank
+from .validated_identification import ValidatedDelayBank, ValidatedSteeringBank
 from .motion import TwistEstimator
-from .response import Model, CurvatureEnvelope, DeadBand, GainProbe
+from .response import Model, CurvatureEnvelope, DeadBand, GainProbe, _Window
 from .scoring import DriveScore
 
 SENSE = 'SENSE'
@@ -64,6 +65,8 @@ class AdaptiveCore:
 
     def reset(self):
         p = self.policy
+        if not finite(p.launch_effort_limit) or not 0. <= p.launch_effort_limit <= 1.:
+            raise ValueError('launch_effort_limit must be between zero and one')
         self.phase = SENSE
         self.phase_t0 = None
         self.now = 0.0
@@ -127,7 +130,8 @@ class AdaptiveCore:
         # (08-29 bench). The absorber is the cell in play (one of the
         # four has a nonzero regressor per sample): it takes the gain a2
         # may not hold, and the sample's prediction is unchanged.
-        self.lat_bank = DelayBank([p.prior_a0] * 4 + [0.0, 0.0],
+        lat_type = ValidatedSteeringBank if p.validate_lat else DelayBank
+        self.lat_bank = lat_type([p.prior_a0] * 4 + [0.0, 0.0],
                                   p.p0, p.p_max,
                                   _delays(p.lat_delay), p.delay_ew_tau,
                                   p.delay_switch_margin,
@@ -142,6 +146,10 @@ class AdaptiveCore:
                                       th[k] + min(th[5], 0.0) * self.v_op ** 2
                                       for k in range(4)])
         self.lat_bank.set_delay(p.lat_delay)
+        if p.validate_lat:
+            self.lat_bank.published_delay = p.lat_delay
+            self.lat_bank.model_valid = self._candidate_steering_valid
+            self.lat_bank.operating_speed = lambda: self.v_op
         # Drag opposes motion: b2 <= 0 is physics, enforced IN the fit.
         # At one cruise speed b1/b2/b3 are collinear and only their sum is
         # pinned; left free, the split wandered to b2 = +2.74 (2026-08-29
@@ -154,13 +162,19 @@ class AdaptiveCore:
         # was a post-hoc clamp in the inversion, rejected because it moved
         # the equilibrium; the projection here keeps the prediction at the
         # clipping sample exact by moving the excess onto b1.
-        self.lon_bank = DelayBank([p.prior_b0, 0.0, 0.0, 0.0], p.p0, p.p_max,
+        lon_bank_type = ValidatedDelayBank if p.validate_lon else DelayBank
+        self.lon_bank = lon_bank_type([p.prior_b0, 0.0, 0.0, 0.0], p.p0, p.p_max,
                                   _delays(p.lon_delay), p.delay_ew_tau,
                                   p.delay_switch_margin,
                                   bounds=[None, None, (None, 0.0), None],
                                   absorber=1, gain_idx=(0,),
-                                  min_count=p.ready_lon_samples)
+                                  min_count=p.ready_lon_samples, fixed_signs=(1.0,),
+                                  valid_theta=lambda th: th[0] > 0.0)
         self.lon_bank.set_delay(p.lon_delay)
+        if p.validate_lon:
+            self.lon_bank.published_delay = p.lon_delay
+            self.lon_bank.cruise_check = self._candidate_cruise_valid
+            self.lon_bank.clock = lambda: self.now
         self._kappa_hist = deque()   # (t, kappa_des) for the delayed trim
         self.odom_ok = True
         self._glitch_run = 0
@@ -186,11 +200,21 @@ class AdaptiveCore:
         # The feedforward-only throttle for the current command (no PI):
         # what an implausible odometry sample is answered with.
         self._ff_wire = None
+        self._lon_ff_rejected_last = False
         self.envelope = CurvatureEnvelope(p)
         self._roll_dir = 0.0
         self._dir_since = None
         self.deadband = DeadBand(p)
         self.gain_probe = GainProbe(p)
+        # What the robot can do on the surface it is on, measured at every
+        # start and reported to navigation (nav2_capability.SurfaceCapability):
+        # the speed it lunges to when static friction lets go (below that a
+        # follower asking for a creep gets stall-lunge-stall), and how long
+        # a start takes from the first request to the wheels turning.
+        self.lunge = _Window(p.deadband_evidence)
+        self.launch_time = _Window(p.deadband_evidence)
+        self._lunge_until = None
+        self._lunge_peak = 0.0
         self.score = DriveScore()
         # odometry-health counters (see DriveScore.count): a glitch hold
         # is a tick answered with the holding wire, an implausible
@@ -214,6 +238,7 @@ class AdaptiveCore:
         # it was 64 entries, i.e. 1.3 s at the EKF's 50 Hz.
         self._cmd_hist = deque(maxlen=1024)
         self.external_history = False
+        self._learning_after = float("-inf")
         # Sane raw speeds, for the held-speed span (see _held_speed).
         self._v_hist = deque(maxlen=1024)
         # Steering trim, ONE INTEGRATOR PER CELL (travel direction x
@@ -235,6 +260,7 @@ class AdaptiveCore:
         # What was actually on the wire this tick, when someone else drives.
         self._wire = None
         self._cmd_dir = 0.0
+        self._leg_rolled = False
         self._reversal_target = 0.0
         self._reversal_still = 0.0
         self._stall_since = None
@@ -364,6 +390,10 @@ class AdaptiveCore:
             for k in range(4):
                 if abs(r.theta[k] - seed) <= 0.1 * abs(seed):
                     r.theta[k] = signed
+        if self.policy.validate_lat:
+            for k in range(4):
+                if abs(self.lat_bank.published.theta[k]-seed) <= .1*abs(seed):
+                    self.lat_bank.published.theta[k] = signed
         self.lat_bank.prior = [signed] * 4 + list(self.lat_bank.prior[4:])
 
     def _settled(self):
@@ -375,7 +405,7 @@ class AdaptiveCore:
     def _speed_up_limit(self, since, v_new=None):
         """Largest plausible gain in |v| since the last accepted sample
         (``since`` seconds ago), or None while the launch transient is
-        exempt. margin x b0 (prior-bounded) x the largest effective wire
+        exempt. margin x b0 (prior-bounded) x the largest delivered wire
         in the direction of travel over the settling window, plus five
         sigma. The LARGEST wire over the window, not the wire one learned
         delay ago: the true delay is only known to the bank's grid, and a
@@ -401,18 +431,13 @@ class AdaptiveCore:
             if stamp < window:
                 break
             u_same = max(u_same, ud * direction)
-        reversal = (v_new is not None and sgn(v_new)
-                    and sgn(v_new) != sgn(self.v_prev) and self.v_prev != 0.0)
-        # The torque-producing wire: beyond the dead band for a speed-up
-        # in the direction of travel; the RAW wire for a reversal, because
-        # braking on an H-bridge is retarding torque from the first count
-        # (see DeadBand.compensate) -- subtracting the band there bounded
-        # a braking cusp reversal at five sigma while the reverse wire
-        # was still ramping, held honest -0.15 m/s readings, and zeroed
-        # the outputs mid-cusp: 3 implausible episodes, 11 holds, 8
-        # stalled legs in 45 s (09-02 18:00).
-        u_eff = u_same if reversal \
-            else max(u_same - self.deadband.value(direction), 0.0)
+        # Starting stiction is not a lower bound on torque while rolling.
+        # The incident run cruised on 0.209 wire below its 0.252 breakaway
+        # estimate. Subtracting breakaway made the allowed acceleration zero,
+        # so a sustained speed increase never caught up with the frozen sample.
+        # Use raw delivered effort as a conservative upper bound; ignoring
+        # friction here cannot make the bound tighter than the real vehicle.
+        u_eff = u_same
         # From near rest anything can happen (stiction release): no bound
         # -- but only with SOME wire that way to release it. Without the
         # wire condition one plausible dip below the gate switched the
@@ -602,6 +627,9 @@ class AdaptiveCore:
         if not finite(cmd_v, cmd_w):
             cmd_v = cmd_w = 0.0
 
+        if passive or abs(cmd_v) <= self.stall_cmd_min or cmd_v * self._cmd_dir < 0.0:
+            self._leg_rolled = False
+
         step = self.twist.update(t, x, y, psi)
         if step is None:
             return self._safe_output()
@@ -616,6 +644,8 @@ class AdaptiveCore:
             # sensors beats teaching the learner from it. The output is zero,
             # so the slew restarts from rest instead of stepping back to the
             # pre-gap command when odometry returns.
+            self.pause_learning(t)
+            self.vdot = 0.0
             self.now = t
             self.v_prev = self.v_fb = self.v_fast = v
             self._v_prev_t = t
@@ -674,6 +704,7 @@ class AdaptiveCore:
                         self.score.count('implausible', t)
                     self.odom_ok = False
                 if not self.odom_ok:
+                    self.pause_learning(t)
                     # Once the stream is distrusted, judge it on its own
                     # SELF-consistency: track it, so a stream that settles
                     # can re-earn trust, while one that keeps jumping keeps
@@ -684,8 +715,8 @@ class AdaptiveCore:
                 self.now = t
                 # One spike: hold the last command rather than jerk to zero.
                 # A failed stream: stop, and learn nothing from any of it.
-                return self._safe_output() if not self.odom_ok \
-                    else self._hold_output(cmd_v)
+                return self._safe_output(preserve_steering=bool(cmd_v or cmd_w)) \
+                    if not self.odom_ok else self._hold_output(cmd_v)
             self._glitch_run = 0
             if not self.odom_ok:
                 self._sane_run += 1
@@ -696,7 +727,7 @@ class AdaptiveCore:
                     self.odom_ok = True
                     self._sane_run = 0
                 else:
-                    return self._safe_output()
+                    return self._safe_output(preserve_steering=bool(cmd_v or cmd_w))
 
         self.now = t
         # Smooth the measured sample interval; everything rate-dependent below
@@ -712,7 +743,7 @@ class AdaptiveCore:
 
         # ---------- virtual sensors ---------------------------------------
         # Fixed bandwidth in SECONDS, so the smoothing is the same at any rate.
-        vdot_raw = (v - self.v_prev) / dt
+        vdot_raw = (v - self.v_prev) / max(t - self._v_prev_t, dt)
         self.vdot += self.alpha * (vdot_raw - self.vdot)
         self.psidot += self.alpha * (psidot_raw - self.psidot)
         self.v_prev = v
@@ -727,6 +758,11 @@ class AdaptiveCore:
         # Fast filter for the launch latch only: enough smoothing to keep
         # noise from flickering it, little enough lag to catch breakaway.
         self.v_fast += (v - self.v_fast) * (1.0 - math.exp(-dt / 0.08))
+        if self._lunge_until is not None:
+            self._lunge_peak = max(self._lunge_peak, abs(self.v_fast))
+            if self.now >= self._lunge_until:
+                self.lunge.add(self._lunge_peak)
+                self._lunge_until = None
         if not self.rolling:
             # Two consecutive ticks above the threshold, because a single
             # odometry spike through the fast filter (0.71 weight per tick
@@ -757,6 +793,13 @@ class AdaptiveCore:
                 # below holds the wire near the launch level through that
                 # window.
                 self._post_latch_until = self.now + self.lon_bank.delay
+                # Measure the lunge over the window the controller cannot
+                # yet influence (the wire that broke the car free is still
+                # in flight), and how long this start took.
+                self._lunge_until = self.now + self.lon_bank.delay + self.policy.tau_d
+                self._lunge_peak = abs(self.v_fast)
+                if self._stall_since is not None and self.now > self._stall_since:
+                    self.launch_time.add(self.now - self._stall_since)
                 self._roll_since = self.now
                 self._roll_dir = sgn(self.v_fast)
                 self._dir_since = self.now
@@ -777,11 +820,21 @@ class AdaptiveCore:
                     # alone does not mean the fitted equilibrium is correct.
                     ff = self._ff_wire or 0.0
                     correction = d_dir * eq - ff if self.ready_lon and self.lon_plausible() else 0.0
+                    # Repeated low-speed stalls are evidence that the cruise
+                    # estimate is too low. Preserve a bounded amount of PI
+                    # correction while still below the requested speed, rather
+                    # than forgetting it at every breakaway. The launch floor
+                    # is separate and is never transferred into this trim.
+                    if self._leg_rolled and cmd_v * d_dir > 0.0 and abs(self.v_fast) < abs(cmd_v):
+                        correction = d_dir * max(correction * d_dir,
+                                                min(max(self.iv * d_dir, 0.0),
+                                                    self.policy.launch_cap_margin))
                     self.iv = clamp(correction, -self.policy.iv_max, self.policy.iv_max)
                 elif d is not None and sgn(d[1]) == d_dir:
                     cap_iv = self._static_wire_cap(d_dir)
                     self.iv = d_dir * min(
                         self.policy.deadband_trust * abs(d[1]), cap_iv)
+                self._leg_rolled = True
                 slow = (self._wire_on_since is not None
                         and t - self._wire_on_since
                         > self.policy.deadband_slow_start)
@@ -989,8 +1042,62 @@ class AdaptiveCore:
                 break
         return best
 
+    def _candidate_cruise_valid(self, theta):
+        """An accurate transient fit must also agree with observed cruise effort."""
+        if not lon_sane(theta, self.vl_lo, self.vl_hi, self.policy,
+                        self.speed_scale, self._breakaway_median()):
+            return False
+        b0, b1, b2, b3 = theta
+        for direction, window in ((1., self.gain_probe.eq_fwd),
+                                  (-1., self.gain_probe.eq_rev)):
+            if not window.confirmed:
+                return False
+            v = direction * self.speed_scale
+            ff = -(b1 + b2*v*abs(v) + b3*direction)/b0*direction
+            eq = window.value
+            if not finite(ff, eq) or eq <= 0. or not .75*eq <= ff <= 1.25*eq:
+                return False
+        return True
+
+    def pause_learning(self, t):
+        """Discard transient identification evidence after a sensor interruption.
+
+        Keep fitted models and measured cruise/steering evidence. Refill a
+        settling window before pairing output derivatives with old wire inputs.
+        """
+        # Learning is never switched off: only the one sample that straddles
+        # the interruption is skipped. The 09-11 grass runs had an odometry
+        # hiccup every few seconds and a multi-second settling window here
+        # kept the learner silent for entire drives.
+        self._learning_after = max(self._learning_after, t + self.dt)
+        if self.policy.validate_lon:
+            self.lon_bank.interrupt_validation(preserve=True)
+        if self.policy.validate_lat:
+            self.lat_bank.interrupt_validation()
+        self._calm_since = None
+        self.lon_bank._lead = (None, 0)
+        self.gain_probe._hist.clear()
+        self.gain_probe._qd = self.gain_probe._t = None
+
+    def _candidate_steering_valid(self, theta):
+        if len(theta) != 6 or not finite(*theta) or theta[5] > 0:
+            return False
+        sign = self.steer_sign or sgn(self.policy.prior_a0)
+        # Validate signed full-lock geometry, not abs(curvature): the recorded
+        # 14:36:48 fit predicted the wrong direction at reverse-right lock.
+        for speed in (0., self.v_op):
+            for gain in theta[:4]:
+                if sign*gain <= 0:
+                    return False
+                span = sign*(gain+theta[5]*speed*speed)
+                if span <= 0 or abs(theta[4]) >= .5*span:
+                    return False
+        return True
+
     def _learn(self, v):
         """Feed both learners, but only from samples that carry information."""
+        if self.now < self._learning_after:
+            return False
         ok = False
         # Longitudinal. Drag is b2*v*|v| (opposes motion, so it changes sign
         # in reverse); b3*sgn(v) is Coulomb friction, which is what used to
@@ -1122,22 +1229,22 @@ class AdaptiveCore:
                 d = self._delayed_cmd(delay)
                 if d is None:
                     return None
-                # A nonzero wire inside the dead zone produces no torque:
-                # "throttle but no acceleration" samples are what once
-                # taught b0 several times too low. The threshold is the
-                # DERATED breakaway (trust * median): the raw median is the
-                # static breakaway, which sits above the dead-zone offset by
-                # the stiction, and skipping up to it starved the learner of
-                # its legitimate cruise samples. Zero-wire coasting stays:
-                # it identifies drag and Coulomb. A car with no dead-band
-                # evidence is unaffected.
+                # Starting effort is not a rolling dead zone. A measured
+                # cruising effort below the old start threshold proves that
+                # useful rolling data exists there (grass -> indoor replay).
+                # Keep the moving/settled/stall gates above, and keep rejecting
+                # wire well below either established operating measurement.
                 if d[1] != 0.0:
                     w = self.deadband._win(sgn(d[1]))
                     thr = (self.policy.deadband_trust * w.value
                            if w.vals else 0.0)
+                    eq = self.gain_probe.eq(sgn(d[1]))
+                    if self.policy.validate_lon and eq is not None:
+                        thr = min(thr, 0.8 * eq)
                     if 0.0 < abs(d[1]) < thr:
                         return None
                 return [d[1], 1.0, v_reg * abs(v_reg), sgn(v)]
+            generation = getattr(self.lon_bank, 'promotions', 0)
             if self.lon_bank.update(phi_lon, self.vdot, self.lam, self.dt):
                 ok = True
                 if self._lon_corr is None:
@@ -1153,6 +1260,9 @@ class AdaptiveCore:
                                                self.qd)
                 self.vl_lo, self.vl_hi = _span(self.vl_lo, self.vl_hi,
                                                self._held_speed())
+            if getattr(self.lon_bank, 'promotions', 0) != generation:
+                self._lon_ff_rejected_last = True
+                self._b0_ref = self.rls_lon.theta[0]
         # Lateral. psidot/v is curvature; dividing by v amplifies noise, which
         # is why the speed gate is 1.6x the longitudinal one. There is
         # deliberately no lower gate on psidot: straight-line samples are what
@@ -1381,7 +1491,19 @@ class AdaptiveCore:
         eq = self.gain_probe.eq(direction) if direction else None
         # A contradictory fit falls back to measured cruise plus PI. The
         # fallback transfers equilibrium changes into trim without a step.
-        return finite(ff) and (eq is None or eq <= 0.0 or ff > 0.0)
+        if not finite(ff) or (eq is not None and eq > 0.0 and ff <= 0.0):
+            return False
+        # A static friction/bias estimate over twice observed total cruise
+        # effort contradicts this direction's evidence. Do not compare the
+        # quadratic drag term to a median collected at other speeds, or
+        # reject a small static term on a low-friction vehicle.
+        # Opposite-direction evidence is only a bootstrap, not a veto.
+        window = self.gain_probe.eq_fwd if direction > 0.0 else self.gain_probe.eq_rev
+        if direction and window.confirmed and window.value > 0.0:
+            static = -(b1 + b3 * direction) / b0 * direction
+            # Collinear terms can cancel: judge their actual sum too.
+            return min(static, ff) <= 2.0 * window.value
+        return True
 
     def _reversal_command(self, v, cmd_v, dt):
         """Brake to rest and drain delayed commands before starting the new leg."""
@@ -1611,7 +1733,10 @@ class AdaptiveCore:
         # slammed 0.44/0.06 at 1 Hz and the car surged 0..0.8 m/s on a
         # 0.32 command (08-30 23:16); the same run repeated from-zero on
         # 08-31 01:08, where no anchor existed at all. See _lon_divisor.
+        previous_fit_rejected = self._lon_ff_rejected_last
         lon_ok = self._lon_feedforward_trusted(sgn(cmd_v) or sgn(v), cmd_v)
+        self._lon_ff_rejected_last = (not lon_ok and self.policy.use_learned_lon
+                                      and self.ready_lon and self.lon_plausible())
         b0_fb = self._lon_divisor(b0, lon_ok)
         a_des = clamp(self.kp_v * err, -b0_fb, b0_fb)
         # Conditional integration (see _shaped in reset): no winding into
@@ -1753,6 +1878,14 @@ class AdaptiveCore:
             drag = -b2 * v_ff * abs(v_ff) / b0
             cap_ff = cap_w + max(0.0, drag * s_dir)
             ff = clamp(static + drag, -cap_ff, cap_ff)
+            # Returning from measured cruise to the fit must be as smooth as
+            # rejecting it. Transfer the source change into bounded PI trim;
+            # never carry that trim across a launch or direction reversal.
+            if (previous_fit_rejected and self.rolling and self._roll_since is not None
+                    and self.now - self._roll_since > self.lon_bank.delay + p.tau_d
+                    and self._ff_wire is not None and self._ff_wire * s_dir > 0.0
+                    and not reversing):
+                self.iv = clamp(self.iv + self._ff_wire - ff, -p.iv_max, p.iv_max)
             self._ff_wire = clamp(ff, -1.0, 1.0) if not reversing else 0.0
             if not reversing and v * s_dir >= 0.0:
                 # ...and none of it while the car still rolls AGAINST
@@ -1817,7 +1950,20 @@ class AdaptiveCore:
                 if seen is not None:
                     floor = min(floor, p.deadband_trust * seen)
             eq = self.gain_probe.eq(direction)
-            if eq is not None:
+            recent = self.deadband.recent(direction) if eq is not None else None
+            if recent is not None:
+                # The creeping start below assumes the breakaway sits just
+                # above the cruise wire. The surface under the wheels is
+                # the last few starts, not the long median: on 09-11 grass
+                # the median still said 0.33 wire while every start needed
+                # 0.6-0.8, and the launch crept from the indoor cruise wire
+                # at 0.1/s, losing each leg to Nav2's stuck timer. Start
+                # from the DERATED recent breakaway (it cannot move the car
+                # on a floor that has just become easier, and a fast start
+                # there lowers it again within a few starts) but never
+                # below the cruise wire, never above the applied-offset bound.
+                floor = min(max(p.deadband_trust * recent, eq), p.deadband_max)
+            elif eq is not None:
                 # With a measured cruise wire, launch by CREEPING from it:
                 # the floor starts at the wire known to hold a cruise and
                 # the integrator (plus the cap's stuck-time ramp) covers
@@ -1857,12 +2003,20 @@ class AdaptiveCore:
                 # is what the blocked reflex now detects (it used to
                 # watch the integrator pin, but the integrator is
                 # gain-normalised trim now, not the stall prober).
-                ceiling = min(1.0, floor + p.iv_max)
+                ceiling = p.launch_effort_limit or min(1.0, floor + p.iv_max)
+                floor = min(floor, ceiling)
+                # The ride rate stays the slow risk constant: a breakaway
+                # sample reads high by ride rate x detection latency, so a
+                # faster ride would ratchet the learned band (a 0.39 plant
+                # read 0.51 on the bench with a rate sized to the gap). A
+                # harder surface is met by a higher floor (recent starts)
+                # and a navigation stuck window sized from launch time.
                 floor = min(ceiling, floor + p.launch_cap_rate * stuck)
                 self._floor_pinned = floor >= ceiling - 1e-9
                 ud = direction * max(ud * direction, floor)
                 self._floor, self._floor_dir = floor, direction
-                self._cap = min(1.0, floor + p.launch_cap_margin)
+                self._cap = min(p.launch_effort_limit or 1.0,
+                                floor + p.launch_cap_margin)
 
         # A zero speed command means stop, not "servo to zero speed".
         if cmd_v == 0.0 and cmd_w == 0.0:
@@ -2044,10 +2198,15 @@ class AdaptiveCore:
                       deadband_fwd=self.deadband.value(1.0),
                       deadband_rev=self.deadband.value(-1.0))
 
-    def _safe_output(self):
-        self.prev_us = self.prev_ud = self.prev_wire = 0.0
+    def _safe_output(self, preserve_steering=False):
+        # A fresh but implausible odometry sample stops propulsion without
+        # changing the wheel angle while the vehicle coasts. Sensor gaps,
+        # invalid inputs and explicit stops retain the full-zero behavior.
+        steering = self.prev_us if preserve_steering else 0.0
+        self.prev_us = steering
+        self.prev_ud = self.prev_wire = 0.0
         m = self.model
-        return Output(phase=self.phase, v=self.v, psidot=self.psidot,
+        return Output(steer=steering, phase=self.phase, v=self.v, psidot=self.psidot,
                       dt=self.dt, model=m,
                       min_turning_radius=self.envelope.min_turning_radius(m),
                       max_curvature=self.envelope.max_curvature(m),
@@ -2203,6 +2362,18 @@ class AdaptiveCore:
         return {f"{'fwd' if d > 0 else 'rev'}_{'left' if sd > 0 else 'right'}": v
                 for (d, sd), v in self._iw_cells.items()}
 
+    def creep_speed(self):
+        """Slowest speed this surface lets the car hold: the median lunge
+        after breakaway. None until measured."""
+        v = self.lunge.value if self.lunge.confirmed else None
+        return v if v is not None and v > 0.0 else None
+
+    def launch_duration(self):
+        """Median time from a motion request at rest to the wheels turning
+        on this surface. None until measured."""
+        t = self.launch_time.value if self.launch_time.confirmed else None
+        return t if t is not None and t > 0.0 else None
+
     def _breakaway_median(self):
         """The forward breakaway estimate (slow-start median, or the
         smallest fast-start upper bound), or None."""
@@ -2227,7 +2398,7 @@ class AdaptiveCore:
         what the controller inverted after a reboot.
         """
         p = self.policy
-        lon_ok = self.lon_plausible()
+        lon_ok = self.lon_plausible() and (not p.validate_lon or self.ready_lon)
         if lon_ok:
             # the loop-gain anchor tracks whatever is good enough to keep
             self._b0_ref = self.rls_lon.theta[0]
@@ -2236,11 +2407,19 @@ class AdaptiveCore:
             # direction x steering side, then a1, a2). Version 3 carried 4
             # (left/right only); 1 and 2 a symmetric 3.
             'version': 4,
+            'lat_validated': bool(p.validate_lat),
+            'lon_validated': bool(p.validate_lon and lon_ok),
+            'lon_candidate': ({
+                'theta': list(self.lon_bank.bank[self.lon_bank.active].theta),
+                'count': self.lon_bank.bank[self.lon_bank.active].count,
+                'delay': self.lon_bank.delays[self.lon_bank.active],
+                'qd': [self.qd_lo, self.qd_hi], 'vl': [self.vl_lo, self.vl_hi],
+            } if p.validate_lon else None),
             'lateral': list(self.rls_lat.theta),
             'longitudinal': (list(self.rls_lon.theta) if lon_ok
                              else [p.prior_b0, 0.0, 0.0, 0.0]),
             'lat_delay': self.lat_bank.delay,
-            'lon_delay': self.lon_bank.delay,
+            'lon_delay': self.lon_bank.delay if lon_ok else p.lon_delay,
             'envelope': self.envelope.state(),
             'n_lat': int(self.rls_lat.count),
             'n_lon': int(self.rls_lon.count) if lon_ok else 0,
@@ -2251,6 +2430,8 @@ class AdaptiveCore:
             },
             'deadband': self.deadband.state(),
             'gain_probe': self.gain_probe.state(),
+            'lunge': list(self.lunge.vals),
+            'launch_time': list(self.launch_time.vals),
             'trim': self.trim_cells(),
             'sigma_v': self.sigma_v,
             'tick': self.tick,
@@ -2318,6 +2499,11 @@ class AdaptiveCore:
             # Optional likewise: the direct gain measurement.
             if 'gain_probe' in d and not self.gain_probe.load(d['gain_probe']):
                 return False
+            # Optional: surface capability windows (bounded like live ones).
+            for key, win, bound in (('lunge', self.lunge, 5.0), ('launch_time', self.launch_time, 60.0)):
+                vals = d.get(key)
+                if isinstance(vals, list) and all(finite(v) and 0.0 < v <= bound for v in vals):
+                    win.vals = deque(vals[-win.vals.maxlen:], maxlen=win.vals.maxlen)
             # Optional: the per-cell steering trims (bounded like live ones)
             trim = d.get('trim')
             if isinstance(trim, dict):
@@ -2371,7 +2557,8 @@ class AdaptiveCore:
             # judges) is kept.
             lon[1] += lon[2] * min(judge_v, vl[1] or judge_v) ** 2
             lon[2] = 0.0
-        if lon_sane(lon, vl[0], vl[1], p, judge_v, self._breakaway_median()):
+        restored_lon = lon_sane(lon, vl[0], vl[1], p, judge_v, self._breakaway_median())
+        if restored_lon:
             self.lon_bank.seed(lon, n_lon, p0)
             self._b0_ref = lon[0]
             self.qd_lo, self.qd_hi = qd
@@ -2381,8 +2568,44 @@ class AdaptiveCore:
             self.qd_lo = self.qd_hi = self.vl_lo = self.vl_hi = None
         for key, bank in (('lat_delay', self.lat_bank),
                           ('lon_delay', self.lon_bank)):
-            if finite(d.get(key, float('nan'))):
+            if key == 'lon_delay' and (not restored_lon or n_lon == 0):
+                bank.set_delay(p.lon_delay)
+            elif finite(d.get(key, float('nan'))):
                 bank.set_delay(float(d[key]))
+        if p.validate_lat:
+            if not self._candidate_steering_valid(lat):
+                lat = [self.prior_a0]*4+[0.,0.]
+                n_lat = 0
+                self.lat_bank.seed(lat,n_lat,p0)
+                self.envelope = CurvatureEnvelope(p)
+                self.envelope.v_op = self.v_op
+                self.envelope.prior_a0 = self.prior_a0
+            self.lat_bank.restore_working(lat,n_lat,self.lat_bank.delays[self.lat_bank.active])
+        if p.validate_lon:
+            bank = self.lon_bank
+            self._b0_ref = None
+            if d.get('lon_validated') is True and restored_lon and n_lon > 0:
+                bank.published.theta = list(lon)
+                bank.published.count = n_lon
+                bank.published_delay = bank.delays[bank.active]
+                self._b0_ref = lon[0]
+            else:
+                bank.published_delay = p.lon_delay
+            candidate = d.get('lon_candidate')
+            if isinstance(candidate, dict):
+                try:
+                    th = candidate['theta']; n = candidate['count']; delay = candidate['delay']
+                    cqd, cvl = (_load_span(candidate.get(k)) for k in ('qd', 'vl'))
+                    if (len(th) == 4 and finite(*th, delay) and th[0] > 0. and th[2] <= 0.
+                            and isinstance(n, int) and not isinstance(n, bool) and n >= 0
+                            and p.delay_min <= delay <= p.delay_max):
+                        bank.seed(th, n, p0)
+                        bank.set_delay(delay)
+                        self.qd_lo, self.qd_hi = cqd
+                        self.vl_lo, self.vl_hi = cvl
+                except (KeyError, TypeError, ValueError):
+                    pass  # Ignore corrupt training state; never promote it on load.
+            bank.interrupt_validation()
         return True
 
     def _running_sigma(self):

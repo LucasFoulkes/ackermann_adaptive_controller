@@ -13,10 +13,10 @@ import os
 import uuid
 import time
 from .telemetry import BackgroundIO, save_model
-from .nav2_capability import TurningCapability
+from .nav2_capability import TurningCapability, SurfaceCapability
 from .input_health import OdomHealth
 from .delivery import DeliveryHistory
-from robot_interfaces.msg import ActuatorState
+from ackermann_interfaces.msg import ActuatorState
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -50,7 +50,7 @@ POLICY_PARAMS = (
     'v_eff_floor_frac', 'stall_cmd_frac', 'iv_max', 'iw_max_frac',
     'v_fb_tau', 'span_floor', 'use_learned_lon',
     'lat_delay', 'lon_delay', 'gate_floor_frac', 'gate_cap_frac',
-    'launch_floor', 'launch_cap_margin', 'launch_cap_rate',
+    'launch_floor', 'launch_cap_margin', 'launch_cap_rate', 'launch_effort_limit',
     'max_steer_rate', 'max_drive_rate', 'blocked_after', 'blocked_release',
     'env_qs_threshold', 'env_evidence', 'env_derate',
     'radius_floor_ratio', 'radius_ceiling_ratio',
@@ -62,7 +62,7 @@ POLICY_PARAMS = (
     'blocked_retries', 'blocked_hold', 'odom_timeout_steps',
     'cal_steer', 'cal_drive', 'cal_reverse',
     'delay_spread', 'delay_min', 'delay_max', 'delay_ew_tau',
-    'delay_switch_margin',
+    'delay_switch_margin', 'validate_lon', 'validate_lat',
     'odom_glitch_margin', 'odom_glitch_trip', 'odom_recover_time',
     'odom_glitch_hold',
     'authority_floor', 'learn_overspeed_ratio', 'approach_speed_frac',
@@ -121,6 +121,13 @@ class AckermannAdaptiveController(Node):
             ('radius_abs_change', 0.05),
             ('radius_push_period', 5.0),
             ('radius_filter_alpha', 0.25),
+            # Surface capability -> Nav2 (learned floors for the follower's
+            # minimum speeds and the progress checker's stuck window).
+            ('publish_surface_limits', True),
+            ('approach_speed_param', 'FollowPath.min_approach_linear_velocity'),
+            ('regulated_min_speed_param', 'FollowPath.regulated_linear_scaling_min_speed'),
+            ('stuck_allowance_param', 'progress_checker.stuck_time_allowance'),
+            ('movement_allowance_param', 'progress_checker.movement_time_allowance'),
             ('state_file',
              os.path.expanduser('~/.ros/ackermann_adaptive_controller.yaml')),
             ('save_period', 30.0),
@@ -151,6 +158,7 @@ class AckermannAdaptiveController(Node):
 
         self.state_file = str(g['state_file'])
         self.capability = TurningCapability(self, g)
+        self.surface = SurfaceCapability(self, g)
         self.health = OdomHealth(float(g['odom_max_age']), str(g['odom_frame']), str(g['base_frame']))
         self.motion_speed_limit = float(g['motion_speed_limit'])
         self.motion_yaw_rate_limit = float(g['motion_yaw_rate_limit'])
@@ -261,6 +269,7 @@ class AckermannAdaptiveController(Node):
         self.create_timer(1.0, self.on_diagnostics)
         self.create_timer(1.0, self.on_authority_tick)
         self.create_timer(float(g['radius_push_period']), self.capability.tick)
+        self.create_timer(float(g['radius_push_period']), self.surface.tick)
         self.create_timer(float(g['save_period']), self.save_state)
 
         self.get_logger().info(
@@ -314,6 +323,7 @@ class AckermannAdaptiveController(Node):
     def on_odom(self, msg):
         now = self._now()
         if not self.health.accept(msg, now):
+            self.core.pause_learning(now)
             self.out_steer = self.out_drive = 0.0
             return
         stamp = msg.header.stamp
@@ -328,6 +338,7 @@ class AckermannAdaptiveController(Node):
 
         applied = self.delivery.at(t)
         if not self.delivery.fresh(now) or applied is None:
+            self.core.pause_learning(now)
             self.out_steer = self.out_drive = 0.0
             return
         self.core.external_history = True
@@ -409,6 +420,7 @@ class AckermannAdaptiveController(Node):
         if not self.active or self.estopped:
             return
         if not self._odom_fresh() or not self.delivery.fresh(self._now()):
+            self.core.pause_learning(self._now())
             if not self._deadman_tripped:
                 self._deadman_tripped = True
                 self.core.score.count('deadman', self._now())
@@ -566,7 +578,7 @@ class AckermannAdaptiveController(Node):
             status.level, status.message = DiagnosticStatus.ERROR, 'actuator delivery unavailable'
         elif not self.core.odom_ok:
             status.level = DiagnosticStatus.ERROR
-            status.message = ('odometry implausible - outputs zeroed, '
+            status.message = ('odometry implausible - propulsion stopped, '
                               'learning suspended')
         elif self.core.drive_fault:
             status.level = DiagnosticStatus.ERROR
@@ -672,6 +684,25 @@ class AckermannAdaptiveController(Node):
                          f'qs {self.core.qs_lo:+.2f}..{self.core.qs_hi:+.2f}'),
             'blocked': str(self.core.blocked),
             'odom_plausible': str(self.core.odom_ok),
+            'longitudinal_fit_valid': str(self.core.lon_plausible()),
+            'throttle_validation': getattr(self.core.lon_bank, 'status', 'legacy'),
+            'steering_validation': getattr(self.core.lat_bank, 'status', 'legacy'),
+            'steering_promotions': str(getattr(self.core.lat_bank, 'promotions', 0)),
+            'steering_validation_rejections': str(getattr(self.core.lat_bank, 'rejections', 0)),
+            'steering_candidate_samples': str(self.core.lat_bank.bank[self.core.lat_bank.active].count),
+            'throttle_promotions': str(getattr(self.core.lon_bank, 'promotions', 0)),
+            'throttle_validation_rejections': str(getattr(self.core.lon_bank, 'rejections', 0)),
+            'throttle_candidate': str(self.core.lon_bank.bank[self.core.lon_bank.active].theta),
+            'throttle_candidate_delay': str(self.core.lon_bank.delays[self.core.lon_bank.active]),
+            'throttle_candidate_samples': str(self.core.lon_bank.bank[self.core.lon_bank.active].count),
+            'throttle_validation_samples': str(len(getattr(self.core.lon_bank, 'rows', ()))),
+            'longitudinal_rejected_updates': str(sum(r.rejected for r in self.core.lon_bank.bank)),
+            'learning_settling': str(self.core.now < self.core._learning_after),
+            'surface_creep_speed': ('%.3f' % self.core.creep_speed()) if self.core.creep_speed() is not None else 'unmeasured',
+            'surface_launch_time': ('%.2f' % self.core.launch_duration()) if self.core.launch_duration() is not None else 'unmeasured',
+            'surface_recent_breakaway': 'fwd=%s rev=%s' % tuple(
+                ('%.2f' % v) if v is not None else '-' for v in (self.core.deadband.recent(1.0), self.core.deadband.recent(-1.0))),
+            'surface_limits_confirmed': str({k[1]: round(v, 3) for k, v in self.surface.confirmed.items()}),
             'input_status': self.health.reason,
             'actuator_delivery': str(bool(self.delivery.fresh(self._now()))),
             'telemetry_error': self.io.error or 'none',
